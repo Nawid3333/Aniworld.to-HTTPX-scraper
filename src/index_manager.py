@@ -30,9 +30,8 @@ def _is_pid_alive(pid):
                 encoding='utf-8', errors='replace'
             )
             return str(pid) in result.stdout
-        else:
-            os.kill(pid, 0)
-            return True
+        os.kill(pid, 0)
+        return True
     except (OSError, ValueError):
         return False
 
@@ -83,7 +82,7 @@ class FileLock:
                 time.sleep(self.poll_interval)
 
         if self._is_lock_stale():
-            logger.warning(f"Removing stale lock on {self.filepath} (owner process dead)")
+            logger.warning("Removing stale lock on %s (owner process dead)", self.filepath)
             try:
                 os.remove(self.lock_file)
             except OSError:
@@ -97,13 +96,13 @@ class FileLock:
             except (OSError, FileExistsError):
                 pass
 
-        logger.warning(f"Could not acquire lock on {self.filepath} after {self.timeout}s")
+        logger.warning("Could not acquire lock on %s after %ss", self.filepath, self.timeout)
         return False
 
     def _is_lock_stale(self):
         """Check if the lock file was left by a process that is no longer running."""
         try:
-            with open(self.lock_file, 'r') as f:
+            with open(self.lock_file, 'r', encoding='utf-8') as f:
                 pid_str = f.read().strip()
             pid = int(pid_str)
             return not _is_pid_alive(pid)
@@ -154,9 +153,9 @@ def _create_file_backup(filepath):
 
         backup_path = os.path.join(backup_dir, f"{filename}.bak1")
         shutil.copy2(filepath, backup_path)
-        logger.debug(f"Created backup: {backup_path}")
+        logger.debug("Created backup: %s", backup_path)
     except Exception as e:
-        logger.warning(f"Could not create backup of {filepath}: {e}")
+        logger.warning("Could not create backup of %s: %s", filepath, e)
 
 
 def _atomic_write_json(filepath, data):
@@ -183,25 +182,28 @@ def _atomic_write_json(filepath, data):
 def _validate_series_entry(series, title=''):
     """Validate that a series entry has the required structure. Returns True if valid."""
     if not isinstance(series, dict):
-        logger.warning(f"Skipping invalid series entry (not dict): {title}")
+        logger.warning("Skipping invalid series entry (not dict): %s", title)
         return False
     url = series.get('url', '')
     if not url:
-        logger.warning(f"Skipping series '{title}' - missing 'url' field")
+        logger.warning("Skipping series '%s' - missing 'url' field", title)
         return False
     if not _is_valid_series_url(url):
-        logger.warning(f"Skipping series '{title}' - invalid URL scheme/format: {url[:80]}")
+        logger.warning("Skipping series '%s' - invalid URL scheme/format: %s", title, url[:80])
         return False
     seasons = series.get('seasons')
     if seasons is not None and not isinstance(seasons, list):
-        logger.warning(f"Skipping series '{title}' - 'seasons' must be list, got {type(seasons)}")
+        logger.warning("Skipping series '%s' - 'seasons' must be list, got %s", title, type(seasons))
         return False
     for season in (seasons or []):
         if not isinstance(season, dict):
             continue
         episodes = season.get('episodes')
         if episodes is not None and not isinstance(episodes, list):
-            logger.error(f"Rejecting series '{title}' — season '{season.get('season', '?')}' has CORRUPT episodes (type={type(episodes).__name__}, expected list)")
+            logger.error(
+                "Rejecting series '%s' — season '%s' has CORRUPT episodes (type=%s, expected list)",
+                title, season.get('season', '?'), type(episodes).__name__
+            )
             return False
     return True
 
@@ -257,9 +259,6 @@ def paginate_list(items, formatter, page_size=50):
                 break
 
 
-
-
-
 def format_season_ep(season_label, ep_num):
     """Format season/episode for display."""
     match = _SEASON_NUMBER_RE.search(str(season_label))
@@ -312,7 +311,7 @@ def _detect_housekeeping_changes(old_data, new_dict):
         old_map = dict(old_data) if old_data else {}
 
     added = {}   # title -> [season_labels]
-    removed = {} # title -> [season_labels]
+    removed = {}  # title -> [season_labels]
     for title, new_entry in new_dict.items():
         o_entry = old_map.get(title)
         if not o_entry:
@@ -348,8 +347,14 @@ def detect_changes(old_data, new_data):
         "title_eng_changed": [],
     }
 
-    old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in old_data if s.get('title')}
-    new_titles = set(new_data.keys()) if isinstance(new_data, dict) else {s.get('title') for s in new_data if s.get('title')}
+    old_titles = (
+        set(old_data.keys()) if isinstance(old_data, dict)
+        else {s.get('title') for s in old_data if s.get('title')}
+    )
+    new_titles = (
+        set(new_data.keys()) if isinstance(new_data, dict)
+        else {s.get('title') for s in new_data if s.get('title')}
+    )
 
     if isinstance(old_data, list):
         old_data = {s.get('title'): s for s in old_data}
@@ -442,6 +447,7 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
 
     if changes["new_series"]:
         print(f"\n[NEW SERIES] ({len(changes['new_series'])})")
+
         def format_new_series(title):
             if not new_data:
                 return f"  + {title}"
@@ -520,7 +526,7 @@ class IndexManager:
         """Load existing series index from file with corruption detection and file locking."""
         with self.file_lock:
             if not os.path.exists(self.index_file):
-                logger.info(f"No existing index found at {self.index_file}")
+                logger.info("No existing index found at %s", self.index_file)
                 self.series_index = {}
                 return
             try:
@@ -547,18 +553,18 @@ class IndexManager:
                         logger.warning("Loaded index is empty or contains no valid series")
 
                 print(f"[OK] Loaded {len(self.series_index)} series from index")
-                logger.info(f"Loaded index with {len(self.series_index)} series")
+                logger.info("Loaded index with %d series", len(self.series_index))
             except json.JSONDecodeError as e:
                 print(f"[ERROR] Index file corrupted: {e}")
-                logger.error(f"Index file corrupted: {e}")
+                logger.error("Index file corrupted: %s", e)
                 self.series_index = {}
             except OSError as e:
                 print(f"[ERROR] Cannot read index file: {e}")
-                logger.error(f"Cannot read index file: {e}")
+                logger.error("Cannot read index file: %s", e)
                 self.series_index = {}
             except Exception as e:
                 print(f"[WARN] Error loading index: {e}")
-                logger.error(f"Error loading index: {e}")
+                logger.error("Error loading index: %s", e)
                 self.series_index = {}
 
     def save_index(self):
@@ -567,10 +573,10 @@ class IndexManager:
             try:
                 series_list = list(self.series_index.values())
                 _atomic_write_json(self.index_file, series_list)
-                logger.info(f"Saved index with {len(self.series_index)} series")
+                logger.info("Saved index with %d series", len(self.series_index))
             except Exception as e:
                 print(f"[ERROR] Failed to save index: {e}")
-                logger.error(f"Error saving index: {e}")
+                logger.error("Error saving index: %s", e)
                 raise
 
     def get_series_with_progress(self, sort_by='completion', reverse=False):
@@ -827,7 +833,7 @@ def _prompt_change_confirmations(changes, new_dict):
                 lines.append(f"  {prefix} {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
         return lines
 
-    def _show_and_confirm(header, items, formatter, prompt_text, show_full_fn=None):
+    def _show_and_confirm(header, items, formatter, prompt_text):
         print(f"\n{header}")
         print("   (manual confirmation required)")
         print("\n" + "-"*70)
@@ -887,11 +893,11 @@ def _prompt_change_confirmations(changes, new_dict):
             print("  -> Subscription/watchlist changes will be ignored")
 
     if changes['title_ger_changed']:
-        def _fmt_title_change(x):
+        def _fmt_ger_title_change(x):
             return f"  [~] {x[0]}\n      Old: {x[1]}\n      New: {x[2]}"
         if _show_and_confirm(
             f"[~] {len(changes['title_ger_changed'])} German title(s) changed",
-            changes['title_ger_changed'], _fmt_title_change,
+            changes['title_ger_changed'], _fmt_ger_title_change,
             "Allow German title changes?"
         ):
             allowed['title_ger'] = True
@@ -899,11 +905,11 @@ def _prompt_change_confirmations(changes, new_dict):
             print("  -> German title changes will be ignored")
 
     if changes['title_eng_changed']:
-        def _fmt_title_change(x):
+        def _fmt_eng_title_change(x):
             return f"  [~] {x[0]}\n      Old: {x[1]}\n      New: {x[2]}"
         if _show_and_confirm(
             f"[~] {len(changes['title_eng_changed'])} English title(s) changed",
-            changes['title_eng_changed'], _fmt_title_change,
+            changes['title_eng_changed'], _fmt_eng_title_change,
             "Allow English title changes?"
         ):
             allowed['title_eng'] = True
@@ -953,8 +959,10 @@ def _build_merged_data(old_data, new_dict, allowed):
                     validated_eps = []
                     for ep in new_season.get('episodes', []):
                         if ep.get('watched') is None:
-                            logger.error(f"Episode {ep.get('number')} in new season '{season_label}' "
-                                        f"for '{title}' has None watched status — dropping episode")
+                            logger.error(
+                                "Episode %s in new season '%s' for '%s' has None watched status — dropping episode",
+                                ep.get('number'), season_label, title
+                            )
                             continue
                         validated_eps.append(ep)
                     new_season['episodes'] = validated_eps
@@ -970,15 +978,15 @@ def _build_merged_data(old_data, new_dict, allowed):
             if new_url and _is_valid_series_url(new_url):
                 old_entry['url'] = new_url
             elif new_url:
-                logger.warning(f"Rejected invalid URL during merge for '{title}': {new_url[:80]}")
+                logger.warning("Rejected invalid URL during merge for '%s': %s", title, new_url[:80])
             if new_link and _is_valid_series_url(new_link):
                 old_entry['link'] = new_link
             elif new_link:
-                logger.warning(f"Rejected invalid link during merge for '{title}': {new_link[:80]}")
+                logger.warning("Rejected invalid link during merge for '%s': %s", title, new_link[:80])
             if 'subscribed' in new_entry:
                 new_sub = new_entry['subscribed']
                 if new_sub is None:
-                    logger.error(f"Ignoring None subscribed for existing entry '{title}' — keeping old value")
+                    logger.error("Ignoring None subscribed for existing entry '%s' — keeping old value", title)
                 else:
                     old_sub = old_entry.get('subscribed', False)
                     if old_sub != new_sub:
@@ -989,7 +997,7 @@ def _build_merged_data(old_data, new_dict, allowed):
             if 'watchlist' in new_entry:
                 new_wl = new_entry['watchlist']
                 if new_wl is None:
-                    logger.error(f"Ignoring None watchlist for existing entry '{title}' — keeping old value")
+                    logger.error("Ignoring None watchlist for existing entry '%s' — keeping old value", title)
                 else:
                     old_wl = old_entry.get('watchlist', False)
                     if old_wl != new_wl:
@@ -1029,16 +1037,16 @@ def _build_merged_data(old_data, new_dict, allowed):
             }
         else:
             if 'subscribed' not in new_entry:
-                logger.warning(f"New entry '{title}' missing 'subscribed' field — setting to False")
+                logger.warning("New entry '%s' missing 'subscribed' field — setting to False", title)
                 new_entry['subscribed'] = False
             elif new_entry['subscribed'] is None:
-                logger.error(f"Rejecting new entry '{title}': subscribed is None (scrape failed)")
+                logger.error("Rejecting new entry '%s': subscribed is None (scrape failed)", title)
                 continue
             if 'watchlist' not in new_entry:
-                logger.warning(f"New entry '{title}' missing 'watchlist' field — setting to False")
+                logger.warning("New entry '%s' missing 'watchlist' field — setting to False", title)
                 new_entry['watchlist'] = False
             elif new_entry['watchlist'] is None:
-                logger.error(f"Rejecting new entry '{title}': watchlist is None (scrape failed)")
+                logger.error("Rejecting new entry '%s': watchlist is None (scrape failed)", title)
                 continue
             new_entry.setdefault('alt_titles', [])
             new_entry['added_date'] = datetime.now().isoformat()
@@ -1090,7 +1098,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope):
         if slug is None:
             slug = _extract_slug_from_field(entry.get('url', ''))
             if slug is not None:
-                logger.warning(f"Used URL fallback for slug extraction: {title}")
+                logger.warning("Used URL fallback for slug extraction: %s", title)
             else:
                 corrupt_entries.append(title)
                 continue
@@ -1124,7 +1132,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope):
         if len(corrupt_entries) > 10:
             print(f"  ... and {len(corrupt_entries) - 10} more")
         print("  These entries were skipped during vanished-series detection.")
-        logger.warning(f"Corrupt URL data in {len(corrupt_entries)} index entries: {corrupt_entries[:5]}")
+        logger.warning("Corrupt URL data in %d index entries: %s", len(corrupt_entries), corrupt_entries[:5])
 
     if vanished:
         print(f"\n{'─'*70}")
@@ -1136,7 +1144,10 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope):
             print(f"  ... and {len(vanished) - 20} more")
         print(f"{'─'*70}")
         print("  These series are preserved unchanged in the index.")
-        logger.info(f"Vanished series notification: {len(vanished)} series not found in scrape scope '{scrape_scope}'")
+        logger.info(
+            "Vanished series notification: %d series not found in scrape scope '%s'",
+            len(vanished), scrape_scope
+        )
 
     return vanished
 
@@ -1151,7 +1162,7 @@ def confirm_and_save_changes(new_data, description, index_manager):
         new_dict = dict(new_data)
 
     changes = detect_changes(old_data, new_dict)
-    logger.info(f"Detected changes: { {k: len(v) for k, v in changes.items()} }")
+    logger.info("Detected changes: %s", {k: len(v) for k, v in changes.items()})
 
     allowed = _prompt_change_confirmations(changes, new_dict)
 
@@ -1237,17 +1248,17 @@ def confirm_and_save_changes(new_data, description, index_manager):
             index_manager.save_index()
             print(f"✓ Saved {len(merged)} series to index")
             return True
-        else:
-            print(f"\n✓ {description} already up to date.")
-            logger.info(f"No changes to save for {description}.")
-            return True
+
+        print(f"\n✓ {description} already up to date.")
+        logger.info("No changes to save for %s.", description)
+        return True
 
     show_changes(changes, include_unwatched=False, include_watched=False,
                  include_subscribe=False, include_unsubscribe=False,
                  include_watchlist_add=False, include_watchlist_remove=False,
                  new_data=new_dict)
 
-    response = input(f"\nSave these changes? (y/n): ").strip().lower()
+    response = input("\nSave these changes? (y/n): ").strip().lower()
     if response != 'y':
         print("✗ Changes discarded. Nothing saved.")
         logger.info("User discarded changes. Nothing saved.")
@@ -1256,5 +1267,5 @@ def confirm_and_save_changes(new_data, description, index_manager):
     index_manager.series_index = merged
     index_manager.save_index()
     print(f"✓ Saved {len(merged)} series to index")
-    logger.info(f"Saved {len(merged)} series to index")
+    logger.info("Saved %d series to index", len(merged))
     return True

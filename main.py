@@ -37,7 +37,7 @@ def _extract_slug(entry):
     if slug:
         title = entry.get('title', '?')
         print(f"  ⚠ Used URL fallback for slug extraction: {title}")
-        logger.warning(f"Used URL fallback for slug extraction: {title}")
+        logger.warning("Used URL fallback for slug extraction: %s", title)
         return slug
     return None
 
@@ -77,17 +77,17 @@ def _check_checkpoint(expected_mode):
                 pass
             return {'ok': True, 'resume': False}
         return {'ok': False, 'resume': False}
-    else:
-        print(f"\n⚠ A checkpoint exists from a different mode: \"{saved_label}\"")
-        print(f"   You are about to run: \"{expected_label}\"\n")
-        discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
-        if discard == 'y':
-            try:
-                os.remove(checkpoint_file)
-            except OSError:
-                pass
-            return {'ok': True, 'resume': False}
-        return {'ok': False, 'resume': False}
+
+    print(f"\n⚠ A checkpoint exists from a different mode: \"{saved_label}\"")
+    print(f"   You are about to run: \"{expected_label}\"\n")
+    discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
+    if discard == 'y':
+        try:
+            os.remove(checkpoint_file)
+        except OSError:
+            pass
+        return {'ok': True, 'resume': False}
+    return {'ok': False, 'resume': False}
 
 
 # Configure logging with rotation
@@ -159,7 +159,7 @@ def print_completed_series_alerts(index_manager=None):
                 else:
                     print(f"\n→ Rescraping {len(urls)} completed anime...")
                     _run_scrape_and_save(
-                        run_kwargs=dict(url_list=urls, parallel=False),
+                        run_kwargs={"url_list": urls, "parallel": False},
                         description=f"Rescrape completed anime ({len(urls)})",
                         success_msg=f"Rescrape completed! {len(urls)} anime updated.",
                         no_data_msg="No data scraped",
@@ -177,7 +177,7 @@ def print_completed_series_alerts(index_manager=None):
             print("⚠" * 35)
 
     except Exception as e:
-        logger.error(f"Error printing series alerts: {e}")
+        logger.error("Error printing series alerts: %s", e)
 
 
 def check_disk_space(min_mb=100):
@@ -186,13 +186,13 @@ def check_disk_space(min_mb=100):
         stat = shutil.disk_usage(DATA_DIR)
         available_mb = stat.free / (1024 * 1024)
         if available_mb < min_mb:
-            print(f"\n✗ WARNING: Low disk space!")
+            print("\n✗ WARNING: Low disk space!")
             print(f"  Available: {available_mb:.1f} MB (minimum needed: {min_mb} MB)")
-            print(f"  Please free up disk space before scraping.\n")
+            print("  Please free up disk space before scraping.\n")
             return False
         return True
     except Exception as e:
-        logger.warning(f"Could not check disk space: {e}")
+        logger.warning("Could not check disk space: %s", e)
         return True
 
 
@@ -224,7 +224,7 @@ def show_menu():
 
 
 def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg,
-                        pre_save_hook=None, vanished_scope=None):
+                         pre_save_hook=None, vanished_scope=None):
     """Common pattern: create scraper, run, confirm & save, handle errors.
 
     Args:
@@ -264,22 +264,22 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg,
 
         return scraper
     except (KeyboardInterrupt, SystemExit):
-        print(f"\n⚠ Scraping interrupted by Ctrl+C")
+        print("\n⚠ Scraping interrupted by Ctrl+C")
         if 'scraper' in locals() and scraper.series_data:
             index_manager = IndexManager(SERIES_INDEX_FILE)
             if confirm_and_save_changes(scraper.series_data, description, index_manager):
                 print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
-                logger.info(f"{description} interrupted — partial data saved")
+                logger.info("%s interrupted — partial data saved", description)
         if 'scraper' in locals() and scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} anime failed.")
             print("→ Use option 7 (Retry failed series) to rescrape these later.")
         return scraper if 'scraper' in locals() else None
     except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in {description}: {e}")
+        logger.error("Network error in %s: %s", description, e)
     except Exception as e:
         print(f"\n✗ Unexpected error: {str(e)}")
-        logger.error(f"Unexpected error in {description}: {e}")
+        logger.error("Unexpected error in %s: %s", description, e)
     return None
 
 
@@ -308,7 +308,7 @@ def scrape_all_series():
         use_parallel = mode_choice == '2'
 
     _run_scrape_and_save(
-        run_kwargs=dict(resume_only=resume, parallel=use_parallel),
+        run_kwargs={"resume_only": resume, "parallel": use_parallel},
         description="All anime scrape",
         success_msg="Scraping completed and saved!",
         no_data_msg="No anime data scraped",
@@ -326,7 +326,7 @@ def scrape_new_series():
     resume = chk['resume']
 
     _run_scrape_and_save(
-        run_kwargs=dict(new_only=True, resume_only=resume),
+        run_kwargs={"new_only": True, "resume_only": resume},
         description="New anime data",
         success_msg="New anime scraping completed successfully!",
         no_data_msg="No new anime found",
@@ -380,7 +380,11 @@ def scrape_unwatched():
         use_parallel = mode_choice == '2'
 
     _run_scrape_and_save(
-        run_kwargs=dict(url_list=unwatched_urls, resume_only=resume, parallel=use_parallel),
+        run_kwargs={
+            "url_list": unwatched_urls,
+            "resume_only": resume,
+            "parallel": use_parallel,
+        },
         description=f"Unwatched anime scrape ({len(unwatched_urls)} anime)",
         success_msg=f"Unwatched anime scraping completed! ({len(unwatched_urls)} anime)",
         no_data_msg="No data scraped",
@@ -393,10 +397,10 @@ def single_or_batch_add():
     print("\n→ Add single link / batch from file")
     print("  • Paste URL → scrapes single anime")
     print("  • Enter filename → uses that file for batch")
-    print(f"  • Press Enter → uses default (series_urls.txt)")
+    print("  • Press Enter → uses default (series_urls.txt)")
     print("  • Type 0   → back to main menu\n")
 
-    user_input = input(f"Enter [default: series_urls.txt]: ").strip()
+    user_input = input("Enter [default: series_urls.txt]: ").strip()
 
     if user_input == '0':
         return
@@ -421,7 +425,7 @@ def add_single_series(url):
         return
 
     _run_scrape_and_save(
-        run_kwargs=dict(single_url=url, parallel=False),
+        run_kwargs={"single_url": url, "parallel": False},
         description="Single anime",
         success_msg="Anime added/updated successfully!",
         no_data_msg="No data scraped for this anime",
@@ -454,7 +458,7 @@ def batch_add_from_file(file_path):
                 print(f"  ... and {len(skipped) - 5} more")
     except Exception as e:
         print(f"✗ Failed to read file: {str(e)}")
-        logger.error(f"Failed to read file {file_path}: {e}")
+        logger.error("Failed to read file %s: %s", file_path, e)
         return
 
     if not urls:
@@ -481,7 +485,7 @@ def batch_add_from_file(file_path):
 
     print(f"\n→ Starting batch scraper for {len(urls)} anime...\n")
 
-    run_kwargs = dict(url_list=urls, resume_only=resume, parallel=True)
+    run_kwargs = {"url_list": urls, "resume_only": resume, "parallel": True}
 
     _run_scrape_and_save(
         run_kwargs=run_kwargs,
@@ -521,13 +525,13 @@ def _show_ongoing_and_export(report, index_manager):
                 with open(urls_file, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(urls) + '\n')
                 print(f"\n✓ Exported {len(urls)} URLs to series_urls.txt")
-                print(f"  → Use option 5 (Batch add from file) to rescrape these anime")
-                logger.info(f"Exported {len(urls)} URLs to series_urls.txt")
+                print("  → Use option 5 (Batch add from file) to rescrape these anime")
+                logger.info("Exported %d URLs to series_urls.txt", len(urls))
             else:
                 print("\n⚠ Could not extract URLs from ongoing anime")
         except Exception as e:
             print(f"\n✗ Failed to export URLs: {str(e)}")
-            logger.error(f"Failed to export URLs: {e}")
+            logger.error("Failed to export URLs: %s", e)
 
 
 def _print_report_summary(report, report_file, filter_name=None):
@@ -539,7 +543,7 @@ def _print_report_summary(report, report_file, filter_name=None):
     waiting_count = report['categories']['waiting_for_new_episodes']['count']
 
     header = f"REPORT SUMMARY ({filter_name.upper().replace('_', ' ')}):" if filter_name else "REPORT SUMMARY:"
-    print(f"\n" + "-"*70)
+    print("\n" + "-"*70)
     print(header)
     print("-"*70)
     print(f"  Total anime:         {stats['total_series']}")
@@ -562,7 +566,7 @@ def _print_report_summary(report, report_file, filter_name=None):
     dist = stats.get('completion_distribution', {})
     if dist:
         parts = [f"{k}: {v}" for k, v in dist.items()]
-        print(f"\n  Completion Distribution:")
+        print("\n  Completion Distribution:")
         print(f"    {'  |  '.join(parts)}")
 
     most = stats.get('most_completed_series', [])
@@ -639,7 +643,7 @@ def generate_report():
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             _print_report_summary(report, report_file, filter_name)
-            logger.info(f"Filtered report generated: {filter_name}")
+            logger.info("Filtered report generated: %s", filter_name)
             print_completed_series_alerts(index_manager)
             _show_ongoing_and_export(report, index_manager)
 
@@ -648,7 +652,7 @@ def generate_report():
 
     except Exception as e:
         print(f"\n✗ Error generating report: {str(e)}")
-        logger.error(f"Error generating report: {e}")
+        logger.error("Error generating report: %s", e)
 
 
 def _inject_disappeared_series(scraper, pre_index, source):
@@ -707,7 +711,7 @@ def scrape_subscribed_watchlist():
         _inject_disappeared_series(scraper, pre_index, source)
 
     _run_scrape_and_save(
-        run_kwargs=dict(account_source=source, resume_only=chk['resume']),
+        run_kwargs={"account_source": source, "resume_only": chk['resume']},
         description="Account anime",
         success_msg="Account anime scraping completed!",
         no_data_msg="No anime found on account pages",
@@ -735,7 +739,7 @@ def retry_failed_series():
     print("\n→ Starting retry in sequential mode (for reliability)...")
 
     _run_scrape_and_save(
-        run_kwargs=dict(retry_failed=True, parallel=False, resume_only=resume),
+        run_kwargs={"retry_failed": True, "parallel": False, "resume_only": resume},
         description="Retry data",
         success_msg="Retry completed successfully!",
         no_data_msg="No data from retry",
@@ -750,10 +754,10 @@ def pause_scraping():
             f.write('PAUSE')
         print(f"\n✓ Pause file created: {pause_file}")
         print("Workers will pause at next checkpoint.\n")
-        logger.info(f"Pause file created: {pause_file}")
+        logger.info("Pause file created: %s", pause_file)
     except Exception as e:
         print(f"\n✗ Failed to create pause file: {str(e)}")
-        logger.error(f"Failed to create pause file: {e}")
+        logger.error("Failed to create pause file: %s", e)
 
 
 def main():
@@ -772,7 +776,7 @@ def main():
         show_menu()
         choice = input("Enter your choice (1-9): ").strip()
 
-        if not choice.isdigit() or not (1 <= int(choice) <= 9):
+        if not choice.isdigit() or not 1 <= int(choice) <= 9:
             print("✗ Invalid choice. Please enter a number between 1 and 9.")
             continue
 

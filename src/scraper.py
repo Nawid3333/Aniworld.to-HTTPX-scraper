@@ -82,7 +82,7 @@ def _check_error_page(html: str) -> str | None:
 
 # ── HTML helpers ────────────────────────────────────────────────────────────
 
-def _parse_episodes(html: str) -> list[dict]:
+def _parse_episodes(html: str) -> list[dict] | None:
     """Parse episode rows from a season page.
 
     Uses aniworld.to-specific selectors:
@@ -118,13 +118,13 @@ def _parse_episodes(html: str) -> list[dict]:
             # data-episode-season-id
             ep_num = row.get("data-episode-season-id", "")
         if not ep_num:
-            logger.warning(f"Could not determine episode number for row {idx}")
+            logger.warning("Could not determine episode number for row %d", idx)
             return None
 
         try:
             ep_num_int = int(ep_num)
         except ValueError:
-            logger.warning(f"Non-numeric episode number '{ep_num}' in row {idx}")
+            logger.warning("Non-numeric episode number '%s' in row %d", ep_num, idx)
             return None
 
         # German title
@@ -288,9 +288,9 @@ def _detect_subscription_status(html: str) -> tuple[bool | None, bool | None]:
     css_watchlist = soup.select_one("li.setWatchlist.true") is not None
 
     if subscribed is not None and css_subscribed != subscribed:
-        logger.warning(f"Subscribe mismatch: data-attr={subscribed}, CSS={css_subscribed} — trusting data attribute")
+        logger.warning("Subscribe mismatch: data-attr=%s, CSS=%s — trusting data attribute", subscribed, css_subscribed)
     if watchlist is not None and css_watchlist != watchlist:
-        logger.warning(f"Watchlist mismatch: data-attr={watchlist}, CSS={css_watchlist} — trusting data attribute")
+        logger.warning("Watchlist mismatch: data-attr=%s, CSS=%s — trusting data attribute", watchlist, css_watchlist)
 
     # Fallback to CSS if data attributes missing
     if subscribed is None:
@@ -365,7 +365,7 @@ class AniWorldScraper:
                     json.dump(payload, f, ensure_ascii=False)
                 os.replace(tmp, self.checkpoint_file)
             except Exception as e:
-                logger.error(f"Failed to save checkpoint: {e}")
+                logger.error("Failed to save checkpoint: %s", e)
 
     def load_checkpoint(self) -> bool:
         with self._lock:
@@ -384,7 +384,7 @@ class AniWorldScraper:
                     self.completed_links = set(data)
                 return bool(self.completed_links)
             except Exception as e:
-                logger.error(f"Failed to load checkpoint: {e}")
+                logger.error("Failed to load checkpoint: %s", e)
                 return False
 
     def clear_checkpoint(self):
@@ -407,17 +407,17 @@ class AniWorldScraper:
             except Exception:
                 pass
             seen = {e.get('url') for e in existing if isinstance(e, dict)}
-            for f in self.failed_links:
-                if isinstance(f, dict) and f.get('url') not in seen:
-                    existing.append(f)
-                    seen.add(f.get('url'))
+            for item in self.failed_links:
+                if isinstance(item, dict) and item.get('url') not in seen:
+                    existing.append(item)
+                    seen.add(item.get('url'))
             tmp = self.failed_file + '.tmp'
             try:
                 with open(tmp, 'w', encoding='utf-8') as f_out:
                     json.dump(existing, f_out, indent=2, ensure_ascii=False)
                 os.replace(tmp, self.failed_file)
             except Exception as e:
-                logger.error(f"Failed to save failed series: {e}")
+                logger.error("Failed to save failed series: %s", e)
 
     def load_failed_series(self) -> list:
         with self._lock:
@@ -459,7 +459,7 @@ class AniWorldScraper:
                 json.dump(ignored, f, indent=2, ensure_ascii=False)
             os.replace(tmp, self.ignore_file)
         except Exception as e:
-            logger.error(f"Failed to save ignored series: {e}")
+            logger.error("Failed to save ignored series: %s", e)
 
     def get_ignored_slugs(self) -> set[str]:
         return {self.get_series_slug_from_url(s.get('url', '')) for s in self.load_ignored_series()} - {'unknown'}
@@ -484,7 +484,7 @@ class AniWorldScraper:
                 json.dump(ignored, f, indent=2, ensure_ascii=False)
             os.replace(tmp, self.ignored_seasons_file)
         except Exception as e:
-            logger.error(f"Failed to save ignored seasons: {e}")
+            logger.error("Failed to save ignored seasons: %s", e)
 
     def get_ignored_seasons_set(self) -> set[tuple[str, str]]:
         """Return set of (slug, season) tuples that have episode 0 ignored."""
@@ -584,7 +584,7 @@ class AniWorldScraper:
             "autoLogin": "on",
         }
 
-        login_resp = await client.post(
+        await client.post(
             LOGIN_URL,
             data=login_data,
             headers={
@@ -654,7 +654,7 @@ class AniWorldScraper:
         return series
 
     async def _get_account_series(self, client: httpx.AsyncClient,
-                                   source: str = 'both') -> list[dict]:
+                                  source: str = 'both') -> list[dict]:
         """Fetch subscribed/watchlist anime from account pages.
 
         Args:
@@ -677,7 +677,7 @@ class AniWorldScraper:
             try:
                 resp = await client.get(base_url, follow_redirects=True)
             except httpx.HTTPError as e:
-                logger.warning(f"Could not fetch {base_url}: {e}")
+                logger.warning("Could not fetch %s: %s", base_url, e)
                 continue
 
             if not _is_logged_in(resp.text):
@@ -744,12 +744,12 @@ class AniWorldScraper:
         error_code = _check_error_page(html)
         if error_code:
             reason = f"{error_code} server error" if error_code in _SERVER_ERROR_CODES else f"{error_code} error page"
-            logger.warning(f"Error page detected for {url}: {error_code}")
+            logger.warning("Error page detected for %s: %s", url, error_code)
             return self._error_result(info, reason)
 
         # Verify still logged in
         if not _is_logged_in(html):
-            logger.error(f"Session expired while scraping {url}")
+            logger.error("Session expired while scraping %s", url)
             return self._error_result(info, "session expired — not logged in")
 
         title = _extract_title(html) or info.get("title", slug)
@@ -856,12 +856,12 @@ class AniWorldScraper:
         try:
             client = await self._create_logged_in_client()
         except RuntimeError:
-            logger.warning(f"Worker {worker_id} login failed, retrying...")
+            logger.warning("Worker %d login failed, retrying...", worker_id)
             await asyncio.sleep(1)
             try:
                 client = await self._create_logged_in_client()
             except RuntimeError:
-                logger.error(f"Worker {worker_id} login failed permanently")
+                logger.error("Worker %d login failed permanently", worker_id)
                 return
 
         try:
@@ -940,11 +940,22 @@ class AniWorldScraper:
                 ep0_warn = " ⚠ episode 0 detected" if result.get("_has_episode_zero") else ""
 
                 if result["title"].startswith("[ERROR"):
-                    print(f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m | ⚠ {info.get('title', '?')}: Failed")
+                    print(
+                        f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m"
+                        f" | ⚠ {info.get('title', '?')}: Failed"
+                    )
                 elif result["total_episodes"] == 0:
-                    print(f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m | ⚠ {result['title']}{season_info}: No episodes{sub_info}")
+                    print(
+                        f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m"
+                        f" | ⚠ {result['title']}{season_info}: No episodes{sub_info}"
+                    )
                 else:
-                    print(f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched{sub_info}{ep0_warn}")
+                    print(
+                        f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m"
+                        f" | ✓ {result['title']}{season_info}:"
+                        f" {result['watched_episodes']}/{result['total_episodes']}"
+                        f" watched{sub_info}{ep0_warn}"
+                    )
 
                 if done % CHECKPOINT_EVERY == 0:
                     self.series_data = list(results)
@@ -1005,7 +1016,10 @@ class AniWorldScraper:
             return True
 
         if has_stale:
-            print(f"\n⚠ Episode 0 no longer exists for these ignored seasons — consider removing from .ignored_seasons.json:")
+            print(
+                "\n⚠ Episode 0 no longer exists for these ignored seasons"
+                " — consider removing from .ignored_seasons.json:"
+            )
             for w in self._stale_ignored_warnings:
                 print(f"  • {w['title']} (season {w['season']}, slug: {w['slug']})")
 
@@ -1108,9 +1122,11 @@ class AniWorldScraper:
             # Two-phase scraping: ignored-season anime first
             ignored_slugs_set = {slug for slug, _ in self._get_ignored_seasons()}
             ignored_batch = [s for s in account_series
-                            if self.get_series_slug_from_url(s.get('link', '')) in ignored_slugs_set]
+                             if self.get_series_slug_from_url(
+                                 s.get('link', '')) in ignored_slugs_set]
             rest_batch = [s for s in account_series
-                         if self.get_series_slug_from_url(s.get('link', '')) not in ignored_slugs_set]
+                          if self.get_series_slug_from_url(
+                              s.get('link', '')) not in ignored_slugs_set]
 
             if ignored_batch:
                 print(f"→ Phase 1: Scraping {len(ignored_batch)} anime with ignored seasons...")
@@ -1176,9 +1192,11 @@ class AniWorldScraper:
         # Two-phase scraping: ignored-season anime first
         ignored_slugs_set = {slug for slug, _ in self._get_ignored_seasons()}
         ignored_batch = [s for s in all_series
-                        if self.get_series_slug_from_url(s.get('link', '')) in ignored_slugs_set]
+                         if self.get_series_slug_from_url(
+                             s.get('link', '')) in ignored_slugs_set]
         rest_batch = [s for s in all_series
-                     if self.get_series_slug_from_url(s.get('link', '')) not in ignored_slugs_set]
+                      if self.get_series_slug_from_url(
+                          s.get('link', '')) not in ignored_slugs_set]
 
         if ignored_batch:
             print(f"→ Phase 1: Scraping {len(ignored_batch)} anime with ignored seasons...")
