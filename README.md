@@ -54,16 +54,16 @@ python main.py
 
 ### Menu Options
 
-| # | Option | Description |
-|---|--------|-------------|
-| 1 | **Scrape all anime** | Full scrape of all watched anime. Choose sequential or parallel mode. |
-| 2 | **Scrape NEW anime only** | Scrapes only anime not yet in the index (faster). |
-| 3 | **Single link / batch add** | Paste a URL for a single anime, or load URLs from a file. |
-| 4 | **Generate report** | Statistics report saved to JSON, with optional subscription/watchlist filtering. |
-| 5 | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both. |
-| 6 | **Retry failed scrapes** | Bulk retry all anime that failed in previous runs (sequential mode). |
-| 7 | **Pause scraping** | Creates `.pause_scraping` flag file for graceful worker pause. |
-| 8 | **Exit** | Clean exit. |
+| #   | Option                          | Description                                                                      |
+| --- | ------------------------------- | -------------------------------------------------------------------------------- |
+| 1   | **Scrape all anime**            | Full scrape of all watched anime. Choose sequential or parallel mode.            |
+| 2   | **Scrape NEW anime only**       | Scrapes only anime not yet in the index (faster).                                |
+| 3   | **Single link / batch add**     | Paste a URL for a single anime, or load URLs from a file.                        |
+| 4   | **Generate report**             | Statistics report saved to JSON, with optional subscription/watchlist filtering. |
+| 5   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
+| 6   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs (sequential mode).             |
+| 7   | **Pause scraping**              | Creates `.pause_scraping` flag file for graceful worker pause.                   |
+| 8   | **Exit**                        | Clean exit.                                                                      |
 
 ### Scraping Modes (Option 1)
 
@@ -83,12 +83,14 @@ https://aniworld.to/anime/stream/jujutsu-kaisen
 ### Reports (Option 4)
 
 Reports include:
+
 - Total anime, completed, ongoing, not started counts
 - Episode counts and completion percentages
 - Completion distribution and top/bottom completion rankings
 - Subscription and watchlist statistics
 
 Filter options:
+
 - Full report (all anime)
 - Subscribed only
 - Watchlist only
