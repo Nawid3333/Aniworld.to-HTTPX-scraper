@@ -482,21 +482,18 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
         unwatched_lines = group_episodes_by_season(changes["newly_unwatched"], new_data, prefix='[!]')
         paginate_list(unwatched_lines, lambda line: line)
 
+    sub_wl_items = []
     if changes.get("newly_subscribed") and include_subscribe:
-        print(f"\n[NEWLY SUBSCRIBED] ({len(changes['newly_subscribed'])} series)")
-        paginate_list(changes["newly_subscribed"], lambda x: f"  [+] {x}")
-
+        sub_wl_items.extend([(title, "Sub", "✗", "✓") for title in changes["newly_subscribed"]])
     if changes.get("newly_unsubscribed") and include_unsubscribe:
-        print(f"\n[NEWLY UNSUBSCRIBED] ({len(changes['newly_unsubscribed'])} series)")
-        paginate_list(changes["newly_unsubscribed"], lambda x: f"  [-] {x}")
-
+        sub_wl_items.extend([(title, "Sub", "✓", "✗") for title in changes["newly_unsubscribed"]])
     if changes.get("watchlist_added") and include_watchlist_add:
-        print(f"\n[ADDED TO WATCHLIST] ({len(changes['watchlist_added'])} series)")
-        paginate_list(changes["watchlist_added"], lambda x: f"  [+] {x}")
-
+        sub_wl_items.extend([(title, "WL", "✗", "✓") for title in changes["watchlist_added"]])
     if changes.get("watchlist_removed") and include_watchlist_remove:
-        print(f"\n[REMOVED FROM WATCHLIST] ({len(changes['watchlist_removed'])} series)")
-        paginate_list(changes["watchlist_removed"], lambda x: f"  [-] {x}")
+        sub_wl_items.extend([(title, "WL", "✓", "✗") for title in changes["watchlist_removed"]])
+    if sub_wl_items:
+        print(f"\n[SUBSCRIPTION / WATCHLIST CHANGES] ({len(sub_wl_items)})")
+        paginate_list(sub_wl_items, lambda x: f"  ~ {x[0]}: {x[1]}: {x[2]} → {x[3]}")
 
     if changes.get("title_ger_changed"):
         print(f"\n[GERMAN TITLE CHANGED] ({len(changes['title_ger_changed'])} series)")
@@ -862,45 +859,32 @@ def _prompt_change_confirmations(changes, new_dict):
         else:
             print("  -> Unwatched changes will be ignored (episodes stay watched)")
 
+    sub_wl_items = []
     if changes['newly_subscribed']:
-        if _show_and_confirm(
-            f"[+] {len(changes['newly_subscribed'])} series newly SUBSCRIBED",
-            changes['newly_subscribed'], lambda x: f"  [+] {x}",
-            "Allow these series to be marked as SUBSCRIBED?"
-        ):
-            allowed['subscribe'] = True
-        else:
-            print("  -> Subscribe changes will be ignored")
-
+        sub_wl_items.extend([(title, "Sub", "✗", "✓") for title in changes['newly_subscribed']])
     if changes['newly_unsubscribed']:
-        if _show_and_confirm(
-            f"[-] {len(changes['newly_unsubscribed'])} series UNSUBSCRIBED",
-            changes['newly_unsubscribed'], lambda x: f"  [-] {x}",
-            "Allow these series to be marked as UNSUBSCRIBED?"
-        ):
-            allowed['unsubscribe'] = True
-        else:
-            print("  -> Unsubscribe changes will be ignored")
-
+        sub_wl_items.extend([(title, "Sub", "✓", "✗") for title in changes['newly_unsubscribed']])
     if changes['watchlist_added']:
-        if _show_and_confirm(
-            f"[+] {len(changes['watchlist_added'])} series ADDED TO WATCHLIST",
-            changes['watchlist_added'], lambda x: f"  [+] {x}",
-            "Allow these series to be added to WATCHLIST?"
-        ):
-            allowed['watchlist_add'] = True
-        else:
-            print("  -> Watchlist add changes will be ignored")
-
+        sub_wl_items.extend([(title, "WL", "✗", "✓") for title in changes['watchlist_added']])
     if changes['watchlist_removed']:
+        sub_wl_items.extend([(title, "WL", "✓", "✗") for title in changes['watchlist_removed']])
+    if sub_wl_items:
         if _show_and_confirm(
-            f"[-] {len(changes['watchlist_removed'])} series REMOVED FROM WATCHLIST",
-            changes['watchlist_removed'], lambda x: f"  [-] {x}",
-            "Allow these series to be removed from WATCHLIST?"
+            f"[SUBSCRIPTION / WATCHLIST CHANGES] ({len(sub_wl_items)})",
+            sub_wl_items,
+            lambda x: f"  ~ {x[0]}: {x[1]}: {x[2]} → {x[3]}",
+            "Allow subscription/watchlist changes?"
         ):
-            allowed['watchlist_remove'] = True
+            if changes['newly_subscribed']:
+                allowed['subscribe'] = True
+            if changes['newly_unsubscribed']:
+                allowed['unsubscribe'] = True
+            if changes['watchlist_added']:
+                allowed['watchlist_add'] = True
+            if changes['watchlist_removed']:
+                allowed['watchlist_remove'] = True
         else:
-            print("  -> Watchlist remove changes will be ignored")
+            print("  -> Subscription/watchlist changes will be ignored")
 
     if changes['title_ger_changed']:
         def _fmt_title_change(x):
