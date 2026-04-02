@@ -501,6 +501,7 @@ def _show_ongoing_and_export(report, index_manager):
     if ongoing_count == 0:
         return
 
+    print(f"\n{'=' * 70}")
     print(f"ONGOING ANIME ({ongoing_count}):")
     ongoing_titles = report['categories']['ongoing']['titles']
     for title in ongoing_titles[:10]:
