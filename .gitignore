@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Credentials / env files
+config/.env
+.env
+
+# Project local data (generated at runtime)
+/data/
+/logs/
+*.log
+
+# Runtime artifacts
+series_urls.txt
+.pause_scraping
+.scrape_checkpoint.json
+
+# Reports
+mismatch_report.json
+
+# Test fixtures: real captured pages that carry personal watch state.
+# Not committed -- regenerate locally with: python tests/capture_fixtures.py
+/tests/fixtures/
