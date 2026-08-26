@@ -354,12 +354,30 @@ def _find_vanished_renames(vanished_entries, new_entries, threshold: float = 0.7
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
-LOGIN_URL = f"{SITE_URL}/login"
-SERIES_LIST_URL = f"{SITE_URL}/animes"
-ACCOUNT_SUBSCRIBED_URL = f"{SITE_URL}/account/subscribed"
-ACCOUNT_WATCHLIST_URL = f"{SITE_URL}/account/watchlist"
+# Paths, not finished URLs. These are all fetched from whichever host is
+# active, and baking SITE_URL into them meant a per-host catalogue check
+# silently queried the primary host instead of the one it was asked about --
+# so the startup table compared the primary against itself and a run whose
+# primary was down chose a working mirror and then ignored it.
+LOGIN_PATH = "/login"
+SERIES_LIST_PATH = "/animes"
+ACCOUNT_SUBSCRIBED_PATH = "/account/subscribed"
+ACCOUNT_WATCHLIST_PATH = "/account/watchlist"
 REQUEST_TIMEOUT = HTTP_REQUEST_TIMEOUT
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+
+def _host_url(path: str, site_url: str | None = None) -> str:
+    """Build a URL on the active host, matching the sibling scrapers."""
+    return f"{site_url or SITE_URL}{path}"
+
+
+def _login_url(site_url: str | None = None) -> str:
+    return _host_url(LOGIN_PATH, site_url)
+
+
+def _series_list_url(site_url: str | None = None) -> str:
+    return _host_url(SERIES_LIST_PATH, site_url)
 
 _ANIME_PATH_RE = re.compile(r"(/anime/stream/[^/]+)")
 _ANIME_SLUG_RE = re.compile(r"^/anime/stream/([^/?#]+)/?$")
@@ -1356,7 +1374,8 @@ class AniWorldScraper:
             second time to reach the same verdict.
         """
         # GET the login page first to establish session cookies
-        await client.get(LOGIN_URL)
+        login_url = _login_url(self.site_url)
+        await client.get(login_url)
 
         # aniworld.to login: email + password + autoLogin (no CSRF token)
         login_data = {
@@ -1366,11 +1385,11 @@ class AniWorldScraper:
         }
 
         await client.post(
-            LOGIN_URL,
+            login_url,
             data=login_data,
             headers={
-                "Origin": SITE_URL,
-                "Referer": LOGIN_URL,
+                "Origin": self.site_url,
+                "Referer": login_url,
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             follow_redirects=True,
@@ -1379,7 +1398,7 @@ class AniWorldScraper:
         # returning the client, matching the other scrapers/watchmaker pattern.
         if not verify:
             return
-        verify_resp = await client.get(SERIES_LIST_URL)
+        verify_resp = await client.get(_series_list_url(self.site_url))
         verify_soup = make_soup(verify_resp.text)
         if not _is_logged_in(verify_soup):
             await client.aclose()
@@ -1411,8 +1430,8 @@ class AniWorldScraper:
         return client
 
     async def _get_all_series(self, client: httpx.AsyncClient) -> list[dict]:
-        """Fetch the full anime catalogue from aniworld.to/animes."""
-        resp = await self._get(client, SERIES_LIST_URL)
+        """Fetch the full anime catalogue from the active host."""
+        resp = await self._get(client, _series_list_url(self.site_url))
         soup = make_soup(resp.text)
         if not _is_logged_in(soup):
             raise RuntimeError("Not logged in — cannot fetch anime catalogue")
@@ -1480,9 +1499,9 @@ class AniWorldScraper:
         """
         pages = []
         if source in ("subscribed", "both"):
-            pages.append((ACCOUNT_SUBSCRIBED_URL, "Subscriptions"))
+            pages.append((_host_url(ACCOUNT_SUBSCRIBED_PATH, self.site_url), "Subscriptions"))
         if source in ("watchlist", "both"):
-            pages.append((ACCOUNT_WATCHLIST_URL, "Watchlist"))
+            pages.append((_host_url(ACCOUNT_WATCHLIST_PATH, self.site_url), "Watchlist"))
 
         seen_slugs = set()
         series_list = []
@@ -2487,12 +2506,19 @@ class AniWorldScraper:
     # ── Domain checking / probing ───────────────────────────────────────────
 
     async def _probe_one_site(self, site_url: str) -> dict:
-        """Return probe result for a single site URL."""
+        """Return probe result for a single site URL.
+
+        Fetches that host's login page and confirms it actually looks like
+        one, as both sibling scrapers do. Checking only the status code on
+        the homepage accepted any host that answered at all, so a stale
+        mirror serving a 200 placeholder read as reachable and could be
+        made the active host. The login page is also the smaller request:
+        ~17 KB against a ~350 KB homepage.
+        """
         try:
             async with httpx.AsyncClient(timeout=HTTP_REQUEST_TIMEOUT, follow_redirects=True) as client:
-                resp = await client.get(site_url)
-            # Check if page loads without major errors (200-499)
-            ok = resp.status_code < 500
+                resp = await client.get(_login_url(site_url))
+            ok = resp.status_code < 500 and "login" in resp.text.lower()
             return {
                 "site_url": site_url,
                 "ok": ok,
@@ -2544,7 +2570,6 @@ class AniWorldScraper:
         finally:
             self.site_url = previous_site_url
 
-    # Kept for backwards compatibility; prefer get_catalogue_info_for_site.
     # Kept for backwards compatibility; prefer get_catalogue_info_for_site.
     async def verify_series_url(
         self,

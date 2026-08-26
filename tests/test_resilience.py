@@ -891,5 +891,99 @@ class TestCatalogueLoginSkipsTheSecondDownload(QuietCase):
         self.assertEqual(scraper.site_url, before)
 
 
+class _CannedResponse:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+class _RecordingClient:
+    """Stands in for httpx.AsyncClient and records what it was asked to fetch."""
+
+    def __init__(self, requests, response):
+        self._requests = requests
+        self._response = response
+        # httpx.AsyncClient exposes this and one of these scrapers checks it
+        # while cleaning up, so the double has to carry it too.
+        self.is_closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, **kwargs):
+        self._requests.append(str(url))
+        return self._response
+
+    async def aclose(self):
+        self.is_closed = True
+
+
+class TestHostChecksTargetTheRightHost(QuietCase):
+    """A per-host check has to actually talk to that host.
+
+    aniworld built its login, catalogue and account URLs from module constants
+    baked to SITE_URL, so get_catalogue_info_for_site(host) logged in to the
+    primary host and fetched the primary host's catalogue no matter which host
+    it was asked about. The startup table then showed one host's count in all
+    three rows, "cross-host counts: match" compared the primary against
+    itself, and a run whose primary was down would pick a working mirror and
+    then ignore it. Both sibling scrapers already passed the host through;
+    these tests keep all three honest.
+    """
+
+    HOST = "https://mirror.test"
+
+    def _probe(self, status=200, body="Please Login"):
+        requests = []
+        response = _CannedResponse(status, body)
+        with mock.patch.object(
+            sc.httpx, "AsyncClient", lambda *a, **kw: _RecordingClient(requests, response)
+        ):
+            result = asyncio.run(SCRAPER_CLS()._probe_one_site(self.HOST))
+        return result, requests
+
+    def test_the_probe_reads_the_login_page_of_the_host_it_was_given(self):
+        _result, requests = self._probe()
+
+        self.assertEqual(len(requests), 1, requests)
+        self.assertTrue(requests[0].startswith(self.HOST), requests[0])
+        self.assertIn("login", requests[0].lower(), requests[0])
+
+    def test_a_host_that_answers_with_something_else_is_not_reachable(self):
+        """A stale mirror serving a 200 placeholder is not a working host."""
+        result, _requests = self._probe(status=200, body="<html>parked domain</html>")
+
+        self.assertFalse(result["ok"])
+
+    def test_a_real_login_page_is_reachable(self):
+        result, _requests = self._probe(status=200, body="<form>Login</form>")
+
+        self.assertTrue(result["ok"])
+
+    def test_a_server_error_is_not_reachable(self):
+        result, _requests = self._probe(status=503, body="Login")
+
+        self.assertFalse(result["ok"])
+
+    def test_the_catalogue_is_fetched_from_the_host_it_was_asked_about(self):
+        scraper = SCRAPER_CLS()
+        scraper.site_url = self.HOST
+        fetched = []
+
+        async def record_get(client, url, *args, **kwargs):
+            fetched.append(str(url))
+            raise RuntimeError("stop once the request is recorded")
+
+        scraper._get = record_get
+        with contextlib.suppress(RuntimeError):
+            asyncio.run(scraper._get_all_series(object()))
+
+        self.assertTrue(fetched, "no catalogue request was made at all")
+        self.assertTrue(fetched[0].startswith(self.HOST), fetched[0])
+
+
 if __name__ == "__main__":
     unittest.main()
