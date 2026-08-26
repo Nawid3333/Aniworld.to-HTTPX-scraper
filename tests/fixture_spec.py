@@ -38,5 +38,5 @@ def parse_all(html: str, slug: str, base_url: str) -> dict:
         "subscribed": subscribed,
         "watchlist": watchlist,
         "season_links": [list(x) for x in _extract_season_links(soup, slug, base_url)],
-        "episodes": _parse_episodes(soup),
+        "episodes": _parse_episodes(html),
     }

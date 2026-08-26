@@ -146,20 +146,20 @@ class TestExtractTitle(unittest.TestCase):
         self.assertEqual(str(s), before)
 
 
-class TestParseEpisodesTakesSoup(unittest.TestCase):
+class TestParseEpisodesTakesHtml(unittest.TestCase):
     def test_missing_episode_table_returns_none(self):
         """No episode table at all = we don't understand this page = failure.
         Verified live: aniworld.to serves a nav-less generic page for a
         season that doesn't exist, which lands exactly here."""
         html = "<html><body></body></html>"
-        self.assertIsNone(_parse_episodes(soup(html)))
+        self.assertIsNone(_parse_episodes(html))
 
     def test_empty_but_present_table_returns_empty_list(self):
         """Table present with zero rows = a season listed before its episodes
         are uploaded. That is a real state (four such seasons exist in the
         sibling s.to index) and must NOT fail the whole series."""
         html = '<html><body><table class="seasonEpisodesList"><tbody></tbody></table></body></html>'
-        self.assertEqual(_parse_episodes(soup(html)), [])
+        self.assertEqual(_parse_episodes(html), [])
 
     def test_normal_row_parses(self):
         html = """
@@ -168,7 +168,7 @@ class TestParseEpisodesTakesSoup(unittest.TestCase):
             <td class="seasonEpisodeTitle"><a><strong>Pilot</strong></a></td>
         </tr></tbody></table>
         """
-        episodes = _parse_episodes(soup(html))
+        episodes = _parse_episodes(html)
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["number"], 1)
 
@@ -181,7 +181,7 @@ class TestParseEpisodesTakesSoup(unittest.TestCase):
             <td class="seasonEpisodeTitle"><a><strong>Pilot</strong></a></td>
         </tr></tbody></table>
         """
-        self.assertIsNone(_parse_episodes(soup(html)))
+        self.assertIsNone(_parse_episodes(html))
 
 
 # ==================== unparseable season handling ====================
