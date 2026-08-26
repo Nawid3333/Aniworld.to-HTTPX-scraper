@@ -984,6 +984,56 @@ class TestHostChecksTargetTheRightHost(QuietCase):
         self.assertTrue(fetched, "no catalogue request was made at all")
         self.assertTrue(fetched[0].startswith(self.HOST), fetched[0])
 
+    # ── what counts as a login page ────────────────────────────────────────
+
+    ACCEPTED = {
+        "a reworded page that still has a password field":
+            '<html><form><input type="password" name="p"></form></html>',
+        "single-quoted type": "<input type='password'>",
+        "unquoted type": "<input type=password>",
+        "german wording": "<html><body>Bitte anmelden</body></html>",
+        "english wording": "<html><body>Please Login</body></html>",
+    }
+
+    REJECTED = {
+        "an empty body": "",
+        "a parked domain": "<html><body><h1>Domain for sale</h1></body></html>",
+        "a bare gateway error": "<html><body>502 Bad Gateway</body></html>",
+        "something that is not markup": "not markup at all",
+    }
+
+    def test_a_real_login_page_is_recognised_however_it_is_worded(self):
+        """The probe used to ask only whether the word "login" appeared.
+
+        One English substring decided which mirrors were usable, so rewording
+        or translating that page would have taken every host down at once. A
+        password field carries the same meaning without depending on wording.
+        """
+        for label, html in self.ACCEPTED.items():
+            with self.subTest(label):
+                self.assertTrue(sc._looks_like_login_page(html))
+
+    def test_a_host_serving_something_else_is_still_rejected(self):
+        for label, html in self.REJECTED.items():
+            with self.subTest(label):
+                self.assertFalse(sc._looks_like_login_page(html))
+
+    def test_it_accepts_everything_the_old_word_test_accepted(self):
+        """This check may only ever grow more accepting, never less.
+
+        It decides which mirrors are usable, so a host that works today must
+        not start reading as down because the test was tightened.
+        """
+        for html in (
+            "<p>Login</p>",
+            "please LOGIN here",
+            "<form>login</form>",
+            "<html><body>Anmelden oder Login</body></html>",
+        ):
+            with self.subTest(html):
+                self.assertIn("login", html.lower(), "sample must match the old rule")
+                self.assertTrue(sc._looks_like_login_page(html))
+
 
 if __name__ == "__main__":
     unittest.main()
