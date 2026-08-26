@@ -884,6 +884,8 @@ class AniWorldScraper:
         # run) gets a pool that matches it. A pool smaller than the actual
         # fan-out silently serialises the requests it cannot carry.
         self.pool_workers = NUM_WORKERS
+        # Filled on first lookup; see _index_items.
+        self._index_items_cache: list | None = None
         self._profiler = PhaseProfiler(os.getenv("ANIWORLD_PROFILE", "") == "1")
 
     # ── Static / class methods ──────────────────────────────────────────────
@@ -1169,9 +1171,7 @@ class AniWorldScraper:
         index_map: dict[str, str] = {}
         try:
             if os.path.exists(SERIES_INDEX_FILE):
-                with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
-                    data = json.load(f)
-                items = data if isinstance(data, list) else list(data.values())
+                items = self._index_items()
                 for item in items:
                     url = item.get("url", "") or item.get("link", "")
                     slug = self.get_series_slug_from_url(url)
@@ -1203,9 +1203,7 @@ class AniWorldScraper:
         try:
             if not os.path.exists(SERIES_INDEX_FILE):
                 return entries
-            with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            items = data if isinstance(data, list) else list(data.values())
+            items = self._index_items()
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -1371,13 +1369,43 @@ class AniWorldScraper:
             return False
         return True
 
+    def _index_items(self) -> list:
+        """Every entry in the index, parsed at most once per run.
+
+        Five lookups each opened and parsed the index file for themselves, so
+        a new-only run parsed the whole index four times before fetching
+        anything -- and the same three lines of open/parse/normalise were
+        copied into all five.
+
+        Caching is safe because nothing in this module writes the index: the
+        save goes through IndexManager after run() returns, and main.py builds
+        a fresh scraper for every action, so the cache never outlives the run
+        that filled it.
+
+        Never raises. A missing or unreadable index yields an empty list,
+        which is what each caller's own guard produced before.
+
+        The list is shared between callers, so treat it as read-only. Every
+        lookup here only reads; mutating it would now be visible to the rest.
+        """
+        if self._index_items_cache is None:
+            items: list = []
+            try:
+                if os.path.exists(SERIES_INDEX_FILE):
+                    with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
+                        data = json.load(f)
+                    items = data if isinstance(data, list) else list(data.values())
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("Could not read the index for lookups", exc_info=True)
+                items = []
+            self._index_items_cache = items
+        return self._index_items_cache
+
     def load_existing_slugs(self) -> set[str]:
         existing = set()
         try:
             if os.path.exists(SERIES_INDEX_FILE):
-                with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
-                    data = json.load(f)
-                items = data if isinstance(data, list) else list(data.values())
+                items = self._index_items()
                 for item in items:
                     url = item.get("url", "") or item.get("link", "")
                     if url:
@@ -2056,9 +2084,7 @@ class AniWorldScraper:
         try:
             if not os.path.exists(SERIES_INDEX_FILE):
                 return None
-            with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            items = data if isinstance(data, list) else list(data.values())
+            items = self._index_items()
             # Build slug → avg_scrape_seconds map
             slug_map: dict[str, float] = {}
             for item in items:
@@ -2091,9 +2117,7 @@ class AniWorldScraper:
         try:
             if not os.path.exists(SERIES_INDEX_FILE):
                 return None
-            with open(SERIES_INDEX_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            items = data if isinstance(data, list) else list(data.values())
+            items = self._index_items()
             values = [
                 float(item["avg_scrape_seconds"])
                 for item in items
