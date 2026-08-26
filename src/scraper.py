@@ -53,9 +53,13 @@ except ImportError:  # pragma: no cover - depends on the install
 def make_soup(html: str) -> BeautifulSoup:
     """Parse a page with the fastest parser available.
 
-    Every parse in this module goes through here so the choice is made in
-    exactly one place -- a parser swap must never be able to apply to some
-    pages and not others.
+    Every BeautifulSoup parse in this module goes through here so the choice
+    is made in exactly one place -- a parser swap must never be able to apply
+    to some pages and not others.
+
+    Season pages are the exception and no longer come through here: they are
+    the hot path and go straight to lxml instead. Everything else (series
+    pages, the catalogue, account pages, login) still uses this.
     """
     return BeautifulSoup(html, _HTML_PARSER)
 
@@ -515,7 +519,13 @@ def _parse_episodes(html: str) -> list[dict] | None:
         and shows up later as a false "lost all its episodes" mismatch.
     """
     try:
-        doc = lxml.html.fromstring(html)
+        # document_fromstring, not fromstring: fromstring returns a bare
+        # fragment root, so markup whose outermost element is the <table>
+        # itself never matches a .//table search and the page reads as a
+        # parse failure. BeautifulSoup always wraps in html/body, and this
+        # has to match it -- whole pages are unaffected either way, but the
+        # two disagreed on fragments and only one of them can be right.
+        doc = lxml.html.document_fromstring(html)
     except (lxml.etree.ParserError, ValueError):
         # An empty or non-markup body is a failed fetch, not an empty season.
         return None

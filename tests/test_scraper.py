@@ -183,6 +183,27 @@ class TestParseEpisodesTakesHtml(unittest.TestCase):
         """
         self.assertIsNone(_parse_episodes(html))
 
+    def test_a_bare_table_fragment_still_parses(self):
+        """Markup whose outermost element IS the table must still parse.
+
+        lxml.html.fromstring returns a bare fragment root, so a .//table
+        search matches nothing and the page reads as unparseable -- a
+        regression the BeautifulSoup version never had, because it always
+        wrapped input in html/body. Caught by differencing the two on
+        fragment-shaped input, not by any existing test. Pins
+        document_fromstring.
+        """
+        html = (
+            '<table class="seasonEpisodesList"><tr data-episode-id="1">'
+            '<meta itemprop="episodeNumber" content="2">'
+            '<td class="seasonEpisodeTitle"><a><strong>P</strong></a></td></tr></table>'
+        )
+        self.assertEqual(_parse_episodes(html), [{"number": 2, "watched": False, "title_ger": "P"}])
+
+    def test_a_bare_empty_table_fragment_is_an_empty_season(self):
+        """Same shape, no rows: still [] (a real season state), not None."""
+        self.assertEqual(_parse_episodes('<table class="seasonEpisodesList"><tbody></tbody></table>'), [])
+
 
 # ==================== unparseable season handling ====================
 class _FakeResponse:
