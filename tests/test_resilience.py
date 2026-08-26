@@ -306,6 +306,27 @@ class TestSessionExpiryRecovers(QuietCase):
         scraper._login_client = boom
         self.assertFalse(asyncio.run(scraper._relogin_shared_client(object())))
 
+    def test_the_relogin_really_calls_login_and_not_just_something_shaped_like_it(self):
+        """Enforce the real _login_client signature, not a permissive stub.
+
+        The two tests above hand this path a `(client, *a, **kw)` stub, which
+        accepts any call at all -- including one the real method rejects. That
+        is exactly how s.to shipped a re-login that called _login_client with
+        too few arguments: the TypeError landed in the broad `except Exception`
+        below it, so the run logged "re-login after session expiry failed" and
+        gave up without ever sending a login. Every worker shares the one
+        session, so every remaining series in the run failed with it.
+
+        autospec builds the double from the real signature, so a call the real
+        method could not accept fails here too.
+        """
+        scraper = SCRAPER_CLS()
+        with mock.patch.object(SCRAPER_CLS, "_login_client", autospec=True) as login:
+            recovered = asyncio.run(scraper._relogin_shared_client(object()))
+
+        self.assertTrue(recovered, "re-login reported failure")
+        self.assertEqual(login.await_count, 1, "no login was actually attempted")
+
 
 class TestRenameGuessNeverSkipsAScrape(QuietCase):
     """A fuzzy title score must not decide what gets scraped."""
