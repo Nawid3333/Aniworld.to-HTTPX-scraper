@@ -532,5 +532,77 @@ class TestBatchFileExportAppends(QuietCase):
         self.assertEqual(self._read(), commented)
 
 
+class TestSingleUrlRunReportsProgress(unittest.TestCase):
+    """A one-series scrape used to finish silently.
+
+    The single-URL path called _scrape_one_series directly, so it never
+    entered the worker pool -- and the progress line, the episode counts and
+    the empty-page warnings all live in the pool. Every other mode reported;
+    this one printed nothing between "logged in" and the save.
+
+    Asserted on the printed line rather than on which method gets called, so
+    a later refactor that keeps the reporting keeps the test.
+    """
+
+    def _run(self, result):
+        scraper = SCRAPER_CLS()
+        tmp = mock.AsyncMock()
+        tmp.is_closed = False
+
+        async def fake_scrape(_client, info):
+            return dict(result, url=info["url"], link=info["link"])
+
+        scraper._scrape_one_series = fake_scrape
+        scraper._acquire_client = lambda: asyncio.sleep(0, result=object())
+        scraper._release_client = lambda: asyncio.sleep(0)
+        scraper.clear_checkpoint = lambda: None
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            asyncio.run(scraper._async_run_inner(tmp, single_url=series_url("some-show")))
+        return buf.getvalue()
+
+    def test_a_successful_single_scrape_prints_the_progress_line(self):
+        out = self._run(
+            {
+                "title": "Some Show",
+                "total_episodes": 11,
+                "watched_episodes": 11,
+                "seasons": [{"season": "1"}],
+            }
+        )
+        self.assertIn("[1/1]", out)
+        self.assertIn("100%", out)
+        self.assertIn("ETA:", out)
+        self.assertIn("Some Show", out)
+        self.assertIn("11/11 watched", out)
+
+    def test_a_failed_single_scrape_says_so_instead_of_nothing(self):
+        out = self._run(
+            {
+                "title": "Some Show",
+                "_error": True,
+                "_error_reason": "network unreachable",
+                "total_episodes": 0,
+                "watched_episodes": 0,
+                "seasons": [],
+            }
+        )
+        self.assertIn("[1/1]", out)
+        self.assertIn("network unreachable", out)
+
+    def test_an_empty_series_is_flagged_rather_than_stored_quietly(self):
+        out = self._run(
+            {
+                "title": "Some Show",
+                "total_episodes": 0,
+                "watched_episodes": 0,
+                "seasons": [],
+            }
+        )
+        self.assertIn("[1/1]", out)
+        self.assertIn("No episodes", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2183,15 +2183,16 @@ class AniWorldScraper:
             m = _ANIME_PATH_RE.search(main_url)
             link = m.group(1) if m else main_url
             info = {"title": main_url.split("/")[-1], "link": link, "url": main_url}
-            print(f"→ Scraping single anime: {main_url}")
+            print(f"\u2192 Scraping single anime: {main_url}")
             self.attempted_urls.add(main_url)
-            result = await self._scrape_one_series(tmp, info)
             await tmp.aclose()
-            if result.get("_error"):
-                self.failed_links.append(info)
-                self.series_data = []
-            else:
-                self.series_data = [result]
+            # Go through the worker pool with a single worker instead of
+            # calling _scrape_one_series directly. Done directly, a one-anime
+            # run finished silently: no progress line, no episode count, and
+            # none of the empty-page or episode-0 warnings the pool raises.
+            # One worker costs one extra login and makes this mode report
+            # exactly like every other one.
+            await self._scrape_list([info], num_workers=1)
             # Single-anime runs have no partial resume state to preserve.
             self.clear_checkpoint()
             return
