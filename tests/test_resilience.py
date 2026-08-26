@@ -604,5 +604,149 @@ class TestSingleUrlRunReportsProgress(unittest.TestCase):
         self.assertIn("No episodes", out)
 
 
+class TestStartupProbeFetchesHostsTogether(QuietCase):
+    """Startup used to download every host's catalogue one after another.
+
+    Three multi-megabyte catalogue pages in series were most of the wait
+    between launching the program and seeing the menu, for no reason: the
+    hosts are independent servers. They now go out at once.
+
+    That is only safe if each host gets its own scraper.
+    get_catalogue_info_for_site sets self.site_url for the duration of the
+    call, so concurrent hosts sharing one scraper would overwrite each other's
+    target -- and a count cross-checked against a different host's slug set is
+    wrong in a way that still looks like a plausible number, which is the
+    worst kind of wrong for this program.
+    """
+
+    HOSTS = ["https://a.test", "https://b.test", "https://c.test"]
+
+    def setUp(self):
+        super().setUp()
+        # _probe_sites_before_scrape publishes the chosen host globally.
+        previous = getattr(main, "ACTIVE_SITE_URL", None)
+        self.addCleanup(setattr, main, "ACTIVE_SITE_URL", previous)
+
+    @staticmethod
+    def _empty_index():
+        idx = mock.Mock()
+        idx.series_index = {}
+        return idx
+
+    def test_every_host_is_fetched_and_its_result_stays_with_it(self):
+        async def fake(self_, site_url):
+            await asyncio.sleep(0)
+            return len(site_url), {site_url}
+
+        with mock.patch.object(SCRAPER_CLS, "get_catalogue_info_for_site", fake):
+            result = main._fetch_catalogue_info_for_hosts(SCRAPER_CLS(), self.HOSTS)
+
+        self.assertEqual(sorted(result), sorted(self.HOSTS))
+        for host in self.HOSTS:
+            count, slugs = result[host]
+            self.assertEqual(count, len(host))
+            self.assertEqual(slugs, {host})
+
+    def test_the_fetches_overlap_instead_of_running_one_at_a_time(self):
+        events = []
+
+        async def fake(self_, site_url):
+            events.append(("start", site_url))
+            await asyncio.sleep(0.02)
+            events.append(("end", site_url))
+            return 1, set()
+
+        with mock.patch.object(SCRAPER_CLS, "get_catalogue_info_for_site", fake):
+            main._fetch_catalogue_info_for_hosts(SCRAPER_CLS(), self.HOSTS)
+
+        # Ordering, not wall time, so this cannot go flaky on a slow machine:
+        # if the hosts ran in series the first "end" would land before the
+        # second "start".
+        self.assertEqual([kind for kind, _ in events[:3]], ["start"] * 3)
+
+    def test_each_host_gets_its_own_scraper(self):
+        used = []
+
+        async def fake(self_, site_url):
+            used.append(self_)  # a strong ref, so ids cannot be recycled
+            return 1, set()
+
+        shared = SCRAPER_CLS()
+        with mock.patch.object(SCRAPER_CLS, "get_catalogue_info_for_site", fake):
+            main._fetch_catalogue_info_for_hosts(shared, self.HOSTS)
+
+        self.assertEqual(len({id(scraper) for scraper in used}), len(self.HOSTS))
+        self.assertNotIn(id(shared), [id(scraper) for scraper in used])
+
+    def test_one_hosts_failure_does_not_take_the_others_down(self):
+        async def fake(self_, site_url):
+            if site_url == self.HOSTS[1]:
+                raise RuntimeError("host exploded")
+            return 7, {"slug"}
+
+        with mock.patch.object(SCRAPER_CLS, "get_catalogue_info_for_site", fake):
+            result = main._fetch_catalogue_info_for_hosts(SCRAPER_CLS(), self.HOSTS)
+
+        self.assertEqual(result[self.HOSTS[1]], (None, set()))
+        self.assertEqual(result[self.HOSTS[0]], (7, {"slug"}))
+        self.assertEqual(result[self.HOSTS[2]], (7, {"slug"}))
+
+    def test_no_reachable_hosts_means_no_fetch_at_all(self):
+        called = []
+
+        async def fake(self_, site_url):
+            called.append(site_url)
+            return 1, set()
+
+        with mock.patch.object(SCRAPER_CLS, "get_catalogue_info_for_site", fake):
+            self.assertEqual(main._fetch_catalogue_info_for_hosts(SCRAPER_CLS(), []), {})
+
+        self.assertEqual(called, [])
+
+    def test_an_unreachable_host_is_never_asked_for_its_catalogue(self):
+        """A dead mirror should cost its probe, not a second full timeout."""
+        asked = {}
+
+        def fake_probe(scraper, site_urls):
+            return [
+                {"site_url": site_urls[0], "ok": True, "status_code": 200},
+                {"site_url": site_urls[1], "ok": False, "status_code": None},
+            ]
+
+        def fake_fetch(scraper, site_urls):
+            asked["hosts"] = list(site_urls)
+            return {url: (1, set()) for url in site_urls}
+
+        with (
+            mock.patch.object(main, "SITE_URLS", self.HOSTS[:2]),
+            mock.patch.object(main, "_probe_hosts", fake_probe),
+            mock.patch.object(main, "_fetch_catalogue_info_for_hosts", fake_fetch),
+        ):
+            main._probe_sites_before_scrape(SCRAPER_CLS(), idx_mgr=self._empty_index())
+
+        self.assertEqual(asked["hosts"], [self.HOSTS[:1][0]])
+
+    def test_the_probe_reuses_the_index_main_already_loaded(self):
+        """Reloading it here parsed the same file a second time for the same
+        result -- half a second of startup on the larger indexes."""
+
+        def fake_probe(scraper, site_urls):
+            return [{"site_url": url, "ok": True, "status_code": 200} for url in site_urls]
+
+        def fake_fetch(scraper, site_urls):
+            return {url: (1, set()) for url in site_urls}
+
+        def no_reload(*args, **kwargs):
+            raise AssertionError("the probe reloaded the index instead of reusing it")
+
+        with (
+            mock.patch.object(main, "SITE_URLS", self.HOSTS[:1]),
+            mock.patch.object(main, "_probe_hosts", fake_probe),
+            mock.patch.object(main, "_fetch_catalogue_info_for_hosts", fake_fetch),
+            mock.patch.object(main, "IndexManager", no_reload),
+        ):
+            main._probe_sites_before_scrape(SCRAPER_CLS(), idx_mgr=self._empty_index())
+
+
 if __name__ == "__main__":
     unittest.main()
