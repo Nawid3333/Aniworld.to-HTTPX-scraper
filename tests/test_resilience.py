@@ -769,5 +769,82 @@ class TestStartupProbeFetchesHostsTogether(QuietCase):
             main._probe_sites_before_scrape(SCRAPER_CLS(), idx_mgr=self._empty_index())
 
 
+class TestCatalogueLoginSkipsTheSecondDownload(QuietCase):
+    """The startup catalogue fetch downloaded its page twice per host.
+
+    _login_client proves a login worked by fetching a known-good page and
+    checking it looks logged in. For two of these three sites that page IS the
+    catalogue -- which _get_all_series then downloads again and checks again,
+    with the same predicate. Once per host, on the largest page of the run.
+    The third verifies on the homepage, so it downloaded a second large page
+    it then discarded.
+
+    The verify is now optional and only the catalogue path turns it off. What
+    must not change is the guarantee behind it: a login that did not work has
+    to come back as "no catalogue", never as an empty or partial one, because
+    an empty catalogue makes every indexed series look vanished.
+    """
+
+    HOST = "https://probe.test"
+
+    def _scraper(self, series=None, series_error=None):
+        """A scraper whose login and catalogue fetch are both stubbed out."""
+        scraper = SCRAPER_CLS()
+        self.seen = {}
+
+        async def record_login(client, *args, verify=True, **kwargs):
+            self.seen["verify"] = verify
+
+        async def fake_series(client):
+            if series_error is not None:
+                raise series_error
+            return series or []
+
+        scraper._login_client = record_login
+        scraper._get_all_series = fake_series
+        return scraper
+
+    def test_the_catalogue_path_asks_login_not_to_verify(self):
+        scraper = self._scraper([{"title": "A", "link": series_url("a")}])
+        count, slugs = asyncio.run(scraper.get_catalogue_info_for_site(self.HOST))
+
+        self.assertIs(self.seen["verify"], False, "the verify fetch was not skipped")
+        self.assertEqual(count, 1)
+        self.assertEqual(slugs, {"a"})
+
+    def test_every_other_caller_still_gets_the_verification(self):
+        scraper = self._scraper()
+        client = asyncio.run(scraper._create_logged_in_client())
+        asyncio.run(client.aclose())
+
+        self.assertIs(self.seen["verify"], True, "the default must still verify")
+
+    def test_a_login_that_did_not_work_is_reported_as_no_catalogue(self):
+        """Skipping the verify must not turn a failed login into 0 series."""
+        scraper = self._scraper(series_error=RuntimeError("Not logged in"))
+
+        self.assertEqual(
+            asyncio.run(scraper.get_catalogue_info_for_site(self.HOST)),
+            (None, set()),
+        )
+
+    def test_a_genuinely_empty_catalogue_is_not_confused_with_a_failure(self):
+        scraper = self._scraper([])
+
+        self.assertEqual(
+            asyncio.run(scraper.get_catalogue_info_for_site(self.HOST)),
+            (0, set()),
+        )
+
+    def test_the_active_host_is_put_back_afterwards(self):
+        """Each host is probed on its own scraper now, but this one is shared
+        with the caller in every other mode, so it must come back unchanged."""
+        scraper = self._scraper([{"title": "A", "link": series_url("a")}])
+        before = scraper.site_url
+        asyncio.run(scraper.get_catalogue_info_for_site(self.HOST))
+
+        self.assertEqual(scraper.site_url, before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1346,8 +1346,15 @@ class AniWorldScraper:
 
     # ── Async internals ─────────────────────────────────────────────────────
 
-    async def _login_client(self, client: httpx.AsyncClient) -> None:
-        """Log in an existing httpx client to aniworld.to."""
+    async def _login_client(self, client: httpx.AsyncClient, verify: bool = True) -> None:
+        """Log in an existing httpx client to aniworld.to.
+
+        verify: fetch a known-good page afterwards and confirm the session
+            really is logged in. Callers that immediately fetch the catalogue
+            pass False: _get_all_series applies the same _is_logged_in check
+            to the same response, so verifying here only downloads the page a
+            second time to reach the same verdict.
+        """
         # GET the login page first to establish session cookies
         await client.get(LOGIN_URL)
 
@@ -1370,13 +1377,15 @@ class AniWorldScraper:
         )
         # POST returns empty body — verify on the catalogue page before
         # returning the client, matching the other scrapers/watchmaker pattern.
+        if not verify:
+            return
         verify_resp = await client.get(SERIES_LIST_URL)
         verify_soup = make_soup(verify_resp.text)
         if not _is_logged_in(verify_soup):
             await client.aclose()
             raise RuntimeError("Login failed — check credentials")
 
-    async def _create_logged_in_client(self) -> httpx.AsyncClient:
+    async def _create_logged_in_client(self, verify: bool = True) -> httpx.AsyncClient:
         client = httpx.AsyncClient(
             http2=True,
             headers={
@@ -1398,7 +1407,7 @@ class AniWorldScraper:
                 max_keepalive_connections=self.pool_workers * SEASON_CONCURRENCY + 4,
             ),
         )
-        await self._login_client(client)
+        await self._login_client(client, verify=verify)
         return client
 
     async def _get_all_series(self, client: httpx.AsyncClient) -> list[dict]:
@@ -2515,7 +2524,10 @@ class AniWorldScraper:
         previous_site_url = self.site_url
         try:
             self.site_url = site_url
-            client = await self._create_logged_in_client()
+            # _get_all_series fetches the catalogue and applies the same
+            # logged-in check the login's verify step would, so verifying
+            # here only downloaded the same large page a second time.
+            client = await self._create_logged_in_client(verify=False)
             try:
                 series = await self._get_all_series(client)
             finally:
