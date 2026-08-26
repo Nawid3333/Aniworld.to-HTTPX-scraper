@@ -97,9 +97,9 @@ python main.py
 | 3   | **Scrape unwatched anime**      | Skips fully watched anime; focuses on ongoing/partial.                           |
 | 4   | **Generate report**             | Statistics report saved to JSON, with optional subscription/watchlist filtering. |
 | 5   | **Single link / batch add**     | Paste a URL for a single anime, or load URLs from a file.                        |
-| 6   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
-| 7   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs.                               |
-| 8   | **Exit**                        | Clean exit.                                                                      |
+| 6   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs.                               |
+| 7   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
+| 0   | **Exit**                        | Clean exit.                                                                      |
 
 > **Pausing scraping:** there is no dedicated menu option. To gracefully pause workers, create a `.pause_scraping` file in the `data/` directory (see [Pause/resume](#pauseresume) below).
 

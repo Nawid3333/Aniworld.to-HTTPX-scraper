@@ -62,6 +62,7 @@ series_urls.txt
 
 # Reports
 mismatch_report.json
+cache_probe_report.json
 
 # Test fixtures: real captured pages that carry personal watch state.
 # Not committed -- regenerate locally with: python tests/capture_fixtures.py

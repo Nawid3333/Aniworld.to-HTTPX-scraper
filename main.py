@@ -388,10 +388,10 @@ _MODE_LABELS = {
     "unwatched": "Scrape unwatched anime (option 3)",
     "batch": "Batch add (option 5)",
     "single": "Single anime scrape",
-    "subscribed": "Subscribed anime (option 6)",
-    "watchlist": "Watchlist anime (option 6)",
-    "both": "Subscribed+Watchlist anime (option 6)",
-    "retry": "Retry failed (option 7)",
+    "subscribed": "Subscribed anime (option 7)",
+    "watchlist": "Watchlist anime (option 7)",
+    "both": "Subscribed+Watchlist anime (option 7)",
+    "retry": "Retry failed (option 6)",
 }
 
 
@@ -572,8 +572,8 @@ def show_menu():
     print("  3. Scrape unwatched anime")
     print("  4. Generate report")
     print("  5. Single link / batch add")
-    print("  6. Scrape subscribed/watchlist anime")
-    print("  7. Retry failed scrapes")
+    print("  6. Retry failed scrapes")
+    print("  7. Scrape subscribed/watchlist anime")
     print("  0. Exit\n")
 
 
@@ -668,7 +668,7 @@ def _run_scrape_and_save(
                     title = entry.get("title") or entry.get("url", "?")
                     reason = entry.get("reason", "unknown error")
                     print(f"  • {title}  →  {reason}")
-                print("\n→ Failed list preserved. Use option 7 to retry again.")
+                print("\n→ Failed list preserved. Use option 6 to retry again.")
                 logger.warning("All %d retried anime failed again", n)
             else:
                 print(f"\n⚠ {no_data_msg}")
@@ -682,7 +682,7 @@ def _run_scrape_and_save(
 
         if scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} anime failed during scraping.")
-            print("→ Use option 7 (Retry failed series) to rescrape these later.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
 
         t_elapsed = time.perf_counter() - t_start
         print(f"\n⏱ Scrape duration: {t_elapsed / 60:.1f}m ({t_elapsed:.1f}s)")
@@ -694,7 +694,7 @@ def _run_scrape_and_save(
         logger.info("%s paused — returning to menu", description)
         if scraper is not None and scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} anime failed.")
-            print("→ Use option 7 (Retry failed series) to rescrape these later.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
         return scraper
     except (KeyboardInterrupt, SystemExit):
         print("\n⚠ Scraping interrupted by Ctrl+C")
@@ -719,14 +719,14 @@ def _run_scrape_and_save(
                     )
                 scraper.save_failed_series()
                 print(f"\n✓ {len(result['urls'])} critical series removed from index and added to retry list.")
-                print("→ Use option 7 (Retry failed series) to rescrape these.")
+                print("→ Use option 6 (Retry failed series) to rescrape these.")
                 logger.info("Critical series removed from index and added to retry list after Ctrl+C")
             elif result:
                 print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
                 logger.info("%s interrupted — partial data saved", description)
         if "scraper" in locals() and scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} anime failed.")
-            print("→ Use option 7 (Retry failed series) to rescrape these later.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
         return scraper if "scraper" in locals() else None
     except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
@@ -950,6 +950,61 @@ def batch_add_from_file(file_path):
     )
 
 
+def _report_batch_export(added, skipped, urls_file, noun):
+    """Print what the automatic batch-file export actually did.
+
+    The export runs without asking now, so the terminal has to say plainly
+    what changed -- which URLs were added, and how many were already there.
+    """
+    if added:
+        print(f"\n✓ Added {len(added)} {noun} URL(s) to {urls_file}:")
+        for url in added[:10]:
+            print(f"    + {url}")
+        if len(added) > 10:
+            print(f"    ... and {len(added) - 10} more")
+    else:
+        print(f"\n✓ {urls_file} already lists every ongoing {noun} — nothing added")
+    if skipped:
+        print(f"  ({skipped} already listed)")
+    print(f"  → Use option 5 (Single link / batch add) to rescrape these {noun}")
+    print("  (existing entries are kept — delete the file first for a clean replace)")
+
+
+def _append_urls_to_batch_file(urls_file, urls):
+    """Add URLs to the batch file without discarding what is already there.
+
+    Exporting used to open the file in "w" mode, which replaced the whole
+    file -- a hand-curated list, comments and all, vanished the moment
+    someone answered yes to the export prompt. Appending keeps that work.
+
+    A URL already present is skipped, including one that is commented out:
+    commenting a line was a deliberate decision to skip that series, and an
+    export should not quietly undo it. To start clean, delete the file and
+    export again.
+
+    Returns (added_urls, skipped_count).
+    """
+    existing_lines = []
+    known = set()
+    if os.path.exists(urls_file):
+        with open(urls_file, encoding="utf-8") as fh:
+            existing_lines = fh.read().splitlines()
+        for line in existing_lines:
+            stripped = line.strip().lstrip("#").strip()
+            if stripped:
+                known.add(stripped)
+
+    fresh = [u for u in urls if u not in known]
+    if fresh:
+        body = list(existing_lines)
+        while body and not body[-1].strip():
+            body.pop()
+        body.extend(fresh)
+        with open(urls_file, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(body) + "\n")
+    return fresh, len(urls) - len(fresh)
+
+
 def _show_ongoing_and_export(report, index_manager):
     """Show ongoing anime and offer to export their URLs to series_urls.txt"""
     ongoing_count = report["categories"]["ongoing"]["count"]
@@ -968,30 +1023,35 @@ def _show_ongoing_and_export(report, index_manager):
     if ongoing_count > 10:
         print(f"    ... and {ongoing_count - 10} more")
 
-    export = input(f"\nExport {ongoing_count} ongoing anime URLs to series_urls.txt? (y/n): ").strip().lower()
-    if export == "y":
-        try:
-            urls = []
-            for title in ongoing_titles:
-                series_data = index_manager.series_index.get(title, {})
-                url = series_data.get("url") or series_data.get("link")
-                if url:
-                    if not url.startswith("http"):
-                        url = f"https://aniworld.to{url}"
-                    urls.append(url)
+    # Exported automatically: appending is additive and de-duplicated, so
+    # there is nothing to lose by doing it, and the old prompt only stood
+    # between the report and a batch file that should already be current.
+    try:
+        urls = []
+        for title in ongoing_titles:
+            series_data = index_manager.series_index.get(title, {})
+            url = series_data.get("url") or series_data.get("link")
+            if url:
+                if not url.startswith("http"):
+                    url = f"https://aniworld.to{url}"
+                urls.append(url)
 
-            if urls:
-                urls_file = DEFAULT_BATCH_FILE
-                with open(urls_file, "w", encoding="utf-8") as f:
-                    f.write("\n".join(urls) + "\n")
-                print(f"\n✓ Exported {len(urls)} URLs to {urls_file}")
-                print("  → Use option 5 (Batch add from file) to rescrape these anime")
-                logger.info("Exported %d URLs to %s", len(urls), urls_file)
-            else:
-                print("\n⚠ Could not extract URLs from ongoing anime")
-        except Exception as e:
-            print(f"\n✗ Failed to export URLs: {str(e)}")
-            logger.error("Failed to export URLs: %s", e)
+        if not urls:
+            print("\n⚠ Could not extract URLs from ongoing anime")
+            return
+
+        urls_file = DEFAULT_BATCH_FILE
+        added, skipped = _append_urls_to_batch_file(urls_file, urls)
+        _report_batch_export(added, skipped, urls_file, "anime")
+        logger.info(
+            "Appended %d URLs to %s (%d already present)",
+            len(added),
+            urls_file,
+            skipped,
+        )
+    except Exception as e:
+        print(f"\n✗ Failed to export URLs: {str(e)}")
+        logger.error("Failed to export URLs: %s", e)
 
 
 def _print_report_summary(report, report_file, filter_name=None):
@@ -1286,9 +1346,9 @@ def main():
         elif choice == "5":
             single_or_batch_add()
         elif choice == "6":
-            scrape_subscribed_watchlist()
-        elif choice == "7":
             retry_failed_series()
+        elif choice == "7":
+            scrape_subscribed_watchlist()
         elif choice == "0":
             print("\n✓ Goodbye!\n")
             break

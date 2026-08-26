@@ -94,11 +94,25 @@ def atomic_write_json(filepath, data, *, indent: int | None = 2, backup: bool = 
         # can simply be *renamed* into .bak1 rather than copied there. The
         # old code copied it: on the 80 MB series index that was 80 MB of
         # pointless I/O on every single save. A rename moves no data at all.
+        moved_to_backup = False
         if backup and os.path.exists(filepath):
             _rotate_backups(filepath)
-            with contextlib.suppress(OSError):
+            try:
                 os.replace(filepath, f"{filepath}.bak1")
-        os.replace(tmp_path, filepath)
+                moved_to_backup = True
+            except OSError:
+                moved_to_backup = False
+        try:
+            os.replace(tmp_path, filepath)
+        except Exception:
+            # The outgoing file has already been renamed away at this point,
+            # so failing here used to leave no file at that path at all --
+            # the data survived only in .bak1, and the loader does not look
+            # there for a *missing* file. Put it back before propagating.
+            if moved_to_backup:
+                with contextlib.suppress(OSError):
+                    os.replace(f"{filepath}.bak1", filepath)
+            raise
     except Exception:
         with contextlib.suppress(OSError):
             os.remove(tmp_path)
