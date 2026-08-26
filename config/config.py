@@ -116,6 +116,15 @@ DEFAULT_BATCH_FILE = os.path.abspath(DEFAULT_BATCH_FILE_PATH)
 # per-worker login both skewed the comparison and cost real throughput.
 # Past the peak the season fan-out already keeps pool_workers *
 # SEASON_CONCURRENCY requests in flight, so more workers only add load.
+#
+# Where the time actually goes, measured with the built-in PhaseProfiler
+# over 300 series x2 shuffled passes at these settings:
+#   network 98.8%   parse 1.1%   checkpoint <0.1%
+# Parsing costs 9% of ONE core across the run, so the scrape is bound by
+# the network and not by this process. Offloading parse off the event loop was
+# already measured 2-2.7x SLOWER (see parse_season_html), and the lxml parser
+# cut per-page parse time another 5.7x on top, so there is nothing left to
+# win here. Do not reopen this without a fresh profile showing otherwise.
 NUM_WORKERS = int(os.getenv("ANIWORLD_MAX_WORKERS", "8"))
 
 # Season pages of one series are independent GETs. Fetching them one after
