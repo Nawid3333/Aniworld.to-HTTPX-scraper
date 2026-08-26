@@ -768,6 +768,51 @@ class TestStartupProbeFetchesHostsTogether(QuietCase):
         ):
             main._probe_sites_before_scrape(SCRAPER_CLS(), idx_mgr=self._empty_index())
 
+    # ── which host ends up active ──────────────────────────────────────────
+
+    def _choose_host(self, served):
+        """Run the probe with every host reachable and `served` deciding which
+        ones actually return a catalogue; return the host left active."""
+
+        def fake_probe(scraper, site_urls):
+            return [{"site_url": url, "ok": True, "status_code": 200} for url in site_urls]
+
+        def fake_fetch(scraper, site_urls):
+            return {
+                url: ((10, {"a"}) if served.get(url) else (None, set()))
+                for url in site_urls
+            }
+
+        scraper = SCRAPER_CLS()
+        with (
+            mock.patch.object(main, "SITE_URLS", self.HOSTS),
+            mock.patch.object(main, "_probe_hosts", fake_probe),
+            mock.patch.object(main, "_fetch_catalogue_info_for_hosts", fake_fetch),
+        ):
+            main._probe_sites_before_scrape(scraper, idx_mgr=self._empty_index())
+        return scraper.site_url
+
+    def test_a_host_that_failed_its_catalogue_is_not_made_active(self):
+        """Reachable is not the same as serving.
+
+        The active host used to be the first one that answered the probe, even
+        when that host had just failed to return a catalogue and another had
+        succeeded. Scraping it then fails outright, or -- worse -- returns a
+        short catalogue, and a short catalogue makes every indexed series look
+        vanished and offers thousands of good entries for deletion.
+        """
+        active = self._choose_host({self.HOSTS[0]: False, self.HOSTS[1]: True, self.HOSTS[2]: True})
+        self.assertEqual(active, self.HOSTS[1])
+
+    def test_the_first_serving_host_is_still_preferred(self):
+        active = self._choose_host(dict.fromkeys(self.HOSTS, True))
+        self.assertEqual(active, self.HOSTS[0])
+
+    def test_when_no_host_serves_the_probe_order_still_decides(self):
+        """With nothing to choose between, behave exactly as before."""
+        active = self._choose_host(dict.fromkeys(self.HOSTS, False))
+        self.assertEqual(active, self.HOSTS[0])
+
 
 class TestCatalogueLoginSkipsTheSecondDownload(QuietCase):
     """The startup catalogue fetch downloaded its page twice per host.

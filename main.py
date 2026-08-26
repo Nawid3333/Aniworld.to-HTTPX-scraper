@@ -394,8 +394,19 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
     if index_duplicates:
         _remove_duplicate_index_entries(idx_mgr, index_duplicates)
 
-    if ok_hosts:
-        scraper.site_url = ok_hosts[0]
+    # Prefer a host that actually served its catalogue. A host can answer the
+    # reachability probe and still fail the catalogue fetch, and making that
+    # one active means the scrape runs against a host already known not to be
+    # serving -- at best a failed run, at worst a truncated catalogue, and a
+    # truncated catalogue makes every indexed series look vanished. The counts
+    # are already in hand by this point, so reachability alone is the wrong
+    # test. Falls back to the probe order when no host served, which is what
+    # this did before.
+    serving_hosts = [url for url in ok_hosts if host_counts.get(url) is not None]
+    preferred = serving_hosts or ok_hosts
+
+    if preferred:
+        scraper.site_url = preferred[0]
         print(f"\n→ Active host: {scraper.site_url}")
         if scraper.site_url.startswith("http://"):
             print("  ⚠ WARNING: Active host is unencrypted (HTTP) — credentials sent in cleartext.")
