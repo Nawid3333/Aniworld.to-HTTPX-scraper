@@ -65,12 +65,9 @@ def _restore_module_index_path(module, previous):
 
 
 def make_index_manager(path):
-    """IndexManager takes an explicit path in two projects, a global in bs.to."""
+    """IndexManager takes an explicit path in all three projects."""
     _set_module_index_path(im, path)
-    try:
-        return im.IndexManager(path)
-    except TypeError:
-        return im.IndexManager()  # type: ignore[call-arg]  # bs.to's IndexManager takes no argument
+    return im.IndexManager(path)
 
 
 class QuietCase(unittest.TestCase):
