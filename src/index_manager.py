@@ -1510,9 +1510,7 @@ def _build_merged_data(old_data, new_dict, allowed):
                         # An episode the scrape did not return is kept unless
                         # the user approved deleting it. Appended entries are
                         # re-sorted so the season stays in episode order.
-                        merged_episodes.extend(
-                            old_ep for ep_num, old_ep in old_eps.items() if ep_num not in seen_new
-                        )
+                        merged_episodes.extend(old_ep for ep_num, old_ep in old_eps.items() if ep_num not in seen_new)
                         merged_episodes.sort(key=lambda e: (e.get("number") is None, e.get("number") or 0))
                     old_seasons[season_label]["episodes"] = merged_episodes
                     # Remove leftover episode 0 if this season is in the ignore list

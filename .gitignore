@@ -48,12 +48,14 @@ desktop.ini
 
 # Credentials / env files
 config/.env
+
+# Logs
+logs/
+*.log
 .env
 
 # Project local data (generated at runtime)
 /data/
-/logs/
-*.log
 
 # Runtime artifacts
 series_urls.txt

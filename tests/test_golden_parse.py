@@ -59,9 +59,7 @@ class TestGoldenParse(unittest.TestCase):
         names = list(GOLDEN)
         self.assertTrue(any(n.startswith("series__") for n in names), "no series pages captured")
         self.assertTrue(any(n.startswith("season__") for n in names), "no season pages captured")
-        episode_counts = [
-            len(v["result"].get("episodes") or []) for k, v in GOLDEN.items() if k.startswith("season__")
-        ]
+        episode_counts = [len(v["result"].get("episodes") or []) for k, v in GOLDEN.items() if k.startswith("season__")]
         self.assertTrue(any(c > 0 for c in episode_counts), "no captured season page has episodes")
 
 

@@ -26,7 +26,7 @@ def configure_console() -> None:
     """
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 
 
 configure_console()

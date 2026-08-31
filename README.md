@@ -25,6 +25,9 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
 - **Failed anime retry** — automatically tracks failures for later bulk retry
 - **Pause/resume** — create a `.pause_scraping` file to gracefully pause workers
 - **Report generation** — full statistics with subscription/watchlist filtering and ongoing anime export
+- **Genre completion stats** — option 7 scrapes every series page for its genres into a separate
+  `data/genre_index.json`, then reports watched/total per genre. Self-contained: it never writes
+  `series_index.json`
 - **Data integrity checks** — detects episode count drops, season removals, watched-status corruption, and title changes before merging; offers to delete & rescrape critical series
 - **Atomic file writes** — all JSON writes use temp file + replace to prevent corruption
 - **Rotating log files** — 10 MB per file, 5 backups
@@ -98,7 +101,8 @@ python main.py
 | 4   | **Generate report**             | Statistics report saved to JSON, with optional subscription/watchlist filtering. |
 | 5   | **Single link / batch add**     | Paste a URL for a single anime, or load URLs from a file.                        |
 | 6   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs.                               |
-| 7   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
+| 7   | **Watch Stats of Categories**   | Genre completion stats: scrape genres, show watched/total per genre, export.     |
+| 8   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
 | 0   | **Exit**                        | Clean exit.                                                                      |
 
 > **Pausing scraping:** there is no dedicated menu option. To gracefully pause workers, create a `.pause_scraping` file in the `data/` directory (see [Pause/resume](#pauseresume) below).
@@ -218,12 +222,14 @@ The scraper re-validates ignored anime at the start of every run and checks them
 │   └── config.py            # Settings (credentials, workers, paths)
 ├── src/
 │   ├── atomic_io.py         # Durable atomic JSON writes (shared by every writer)
+│   ├── genre_stats.py       # Option 7: genre completion stats (own data file)
 │   ├── index_manager.py     # Merge, change detection, stats, reports
 │   └── scraper.py           # httpx scraping engine
 └── tests/
     ├── __init__.py
     ├── capture_fixtures.py  # Regenerates test fixtures from the live site
     ├── fixture_spec.py      # Which parser outputs the fixtures pin
+    ├── test_genre_stats.py  # Genre parser, snapshot, diff and storage tests
     ├── test_golden_parse.py # Parser output pinned against real captured pages
     └── test_scraper.py      # Unit + regression tests
 ```

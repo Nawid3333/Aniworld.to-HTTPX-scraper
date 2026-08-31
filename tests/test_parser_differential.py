@@ -78,6 +78,7 @@ class TestParserOutputIsUnchanged(unittest.TestCase):
             actual = fixture_spec.parse_all(_html(name), entry["slug"], SITE_URL).get("episodes")
             with self.subTest(page=name):
                 self.assertIsNotNone(actual, f"{name}: parser returned None where it used to return episodes")
+                assert actual is not None  # narrows for the type checker; asserted above
                 self.assertEqual(len(actual), len(expected), f"{name}: episode count changed")
                 for exp, act in zip(expected, actual, strict=True):
                     self.assertEqual(act.get("number"), exp.get("number"), f"{name}: episode number changed")
@@ -120,9 +121,7 @@ class TestParserOutputIsUnchanged(unittest.TestCase):
                 continue
             actual = fixture_spec.parse_all(_html(name), entry["slug"], SITE_URL).get("episodes", "absent")
             with self.subTest(page=name):
-                self.assertEqual(
-                    actual is None, expected is None, f"{name}: None/empty distinction changed"
-                )
+                self.assertEqual(actual is None, expected is None, f"{name}: None/empty distinction changed")
             nones += expected is None
             empties += expected == []
         # only informational -- the fixtures may or may not contain either shape

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aniworld-scraper"
+version = "1.0.0"
+description = "AniWorld.to anime scraper and index manager (httpx version)."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "beautifulsoup4>=4.15.0",
+    "python-dotenv>=1.2.3",
+    "lxml>=5.3.0",
+    "h2>=4.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+
+[project.scripts]
+aniworld-scraper = "main:_run_cli"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "src*"]

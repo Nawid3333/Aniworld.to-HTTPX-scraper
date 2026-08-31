@@ -189,8 +189,7 @@ class PhaseProfiler:
             count = self._counts[name]
             share = seconds / total * 100 if total else 0
             lines.append(
-                f"  {name:<12} {seconds:8.1f}s  {share:5.1f}%  "
-                f"n={count:<6} avg={seconds / count * 1000:7.1f}ms"
+                f"  {name:<12} {seconds:8.1f}s  {share:5.1f}%  n={count:<6} avg={seconds / count * 1000:7.1f}ms"
             )
         print("\n".join(lines))
 
@@ -239,7 +238,6 @@ def _retry_after_seconds(resp) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
-
 
 
 # ── Rename matching helpers ─────────────────────────────────────────────────
@@ -403,6 +401,7 @@ def _login_url(site_url: str | None = None) -> str:
 
 def _series_list_url(site_url: str | None = None) -> str:
     return _host_url(SERIES_LIST_PATH, site_url)
+
 
 _ANIME_PATH_RE = re.compile(r"(/anime/stream/[^/]+)")
 _ANIME_SLUG_RE = re.compile(r"^/anime/stream/([^/?#]+)/?$")
@@ -669,6 +668,7 @@ def _parse_episodes(html: str) -> list[dict] | None:
             ep["languages"] = languages
         episodes.append(ep)
     return episodes
+
 
 def _extract_season_links(soup: BeautifulSoup, series_slug: str, base_url: str | None = None) -> list[tuple[str, str]]:
     """Extract season numbers and URLs from the #stream season navigation.
@@ -2039,8 +2039,7 @@ class AniWorldScraper:
                 if result.get("_error"):
                     reason = result.get("_error_reason", "Failed")
                     self._progress.write(
-                        f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m"
-                        f" | ⚠ {info.get('title', '?')}: {reason}"
+                        f"[{done}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m | ⚠ {info.get('title', '?')}: {reason}"
                     )
                 elif result["total_episodes"] == 0:
                     self._progress.write(
