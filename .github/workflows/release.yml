@@ -37,6 +37,26 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Verify the tag matches the package version
+        # The failure this exists for: pyproject.toml once said 1.0.0 while the
+        # repo was tagged v1.1.0, so a release built from it would have attached
+        # files named 1.0.0. Checked before anything is built or uploaded, so a
+        # mismatched release fails loudly instead of shipping misnamed packages.
+        # Skipped on manual runs, which have no tag to compare against.
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag_version="${TAG#v}"
+          pkg_version=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag $TAG declares $tag_version but pyproject.toml says $pkg_version"
+            echo "This release would attach packages named $pkg_version, not $tag_version."
+            echo "Bump version in pyproject.toml (and the wheel name in README.md) to $tag_version, push, then delete and re-create the tag."
+            exit 1
+          fi
+          echo "tag $TAG matches pyproject.toml version $pkg_version"
+
       - name: Install
         run: |
           python -m pip install --upgrade pip
