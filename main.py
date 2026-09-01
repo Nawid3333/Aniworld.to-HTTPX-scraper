@@ -29,12 +29,14 @@ from config.config import (
     DATA_DIR,
     DEFAULT_BATCH_FILE,
     EMAIL,
+    ENV_FILE,
     LOG_FILE,
     PASSWORD,
     SERIES_INDEX_FILE,
     SITE_URL,
     SITE_URLS,
     configure_console,
+    ensure_env_file,
 )
 from src import genre_stats
 from src.index_manager import (
@@ -637,7 +639,7 @@ def validate_credentials():
     if not EMAIL or not PASSWORD:
         print("\n✗ ERROR: Credentials not configured!")
         print("\nPlease follow these steps:")
-        print("1. Create a '.env' file in the config/ directory")
+        print(f"1. Open the .env file at: {ENV_FILE}")
         print("2. Add your aniworld.to email and password:")
         print("   ANIWORLD_EMAIL=your_email@example.com")
         print("   ANIWORLD_PASSWORD=your_password")
@@ -863,12 +865,12 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
             import tty
 
             fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
+            old = termios.tcgetattr(fd)  # pyright: ignore[reportAttributeAccessIssue]
             try:
-                tty.setcbreak(fd)
+                tty.setcbreak(fd)  # pyright: ignore[reportAttributeAccessIssue]
                 return sys.stdin.read(1)
             finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)  # pyright: ignore[reportAttributeAccessIssue]
         except Exception:
             return None
 
@@ -1825,6 +1827,16 @@ def _run_cli() -> int:
 
     Separate from main() so tests and packaging entry points can call it.
     """
+    # A fresh install has no .env anywhere, so write the template out rather than
+    # leaving the user a filename to hunt for. Deliberately non-fatal: the
+    # credential check further in reports what still needs filling in.
+    created = ensure_env_file()
+    if created:
+        print("")
+        print("Created a credentials file at:")
+        print(f"    {created}")
+        print("Fill in your details there, then run this again.")
+        print("")
     try:
         main()
     except KeyboardInterrupt:

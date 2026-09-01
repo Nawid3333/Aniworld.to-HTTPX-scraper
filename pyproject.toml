@@ -33,8 +33,6 @@ include = ["config*", "src*"]
 # Ship the credentials template inside the wheel too, so an installed copy has
 # a reference to copy from and is not just told to find a file that is not
 # there. See the project-home note in config/config.py for where it should go.
-[tool.setuptools.package-data]
-config = [".env.example"]
 
 # ==================== TESTS ====================
 # Run the suite with:      python -m pytest
@@ -73,3 +71,21 @@ exclude_also = [
     "raise NotImplementedError",
     '@(abc\.)?abstractmethod',
 ]
+
+# ==================== TYPE CHECKING ====================
+# Ruff does not cover this and cannot: it has no type inference, so a helper
+# written without annotations -- one whose return type is then widened across
+# a whole module -- is invisible to `ruff check`. That exact mistake put 138
+# errors into src/index_manager.py in a single commit while ruff stayed green.
+#
+# Run it with:   npx pyright          (or: pip install pyright && pyright)
+#
+# The code shipped to users is held at zero errors. tests/ is deliberately
+# outside `include`: the suite hands fakes and partial doubles to functions
+# that declare a real client type, and annotating those would add noise
+# without finding bugs.
+[tool.pyright]
+include = ["main.py", "src", "config"]
+exclude = ["**/__pycache__", "build", "dist", ".venv"]
+typeCheckingMode = "basic"
+pythonVersion = "3.11"

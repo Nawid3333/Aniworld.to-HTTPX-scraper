@@ -11,7 +11,7 @@ include ruff.toml
 recursive-include tests *.py
 
 # The credentials template, so an installed copy has something to copy from.
-include config/.env.example
+include .env.example
 
 # series_urls.txt is the user's own watch list, not sample data.
 exclude series_urls.txt

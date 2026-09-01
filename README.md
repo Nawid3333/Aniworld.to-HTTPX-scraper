@@ -66,7 +66,7 @@ source .venv/bin/activate        # Linux / macOS
 
 pip install -r requirements.txt
 
-cp config/.env.example config/.env   # then edit it — see Configuration below
+cp .env.example .env                 # then edit it — see Configuration below
 python main.py
 ```
 
@@ -96,7 +96,7 @@ isolated environment per application and avoids this entirely:
 pipx install .
 ```
 
-**Tell it where to keep your files.** Once installed, `config/` lives inside
+**Tell it where to keep your files.** Once installed, the package lives inside
 `site-packages`, which is no place to keep a `.env` you have to edit by hand.
 Point `ANIWORLD_HOME` at a folder you own, and `.env`, `data/`, `logs/` and the
 default batch file all move there:
@@ -105,18 +105,23 @@ default batch file all move there:
 export ANIWORLD_HOME=~/aniworld                  # Linux / macOS
 $env:ANIWORLD_HOME = "$HOME\aniworld"            # Windows (PowerShell)
 
-mkdir -p ~/aniworld/config
-cp config/.env.example ~/aniworld/config/.env
+mkdir -p ~/aniworld
+cp .env.example ~/aniworld/.env
 ```
 
+If you skip that copy, the first run writes the template there for you and
+says where it put it -- so an installed copy never leaves you hunting for a
+file inside `site-packages`.
+
 `ANIWORLD_HOME` has to be a real environment variable. It cannot be set inside
-`config/.env`, because it is what tells the program where to find that file in
+`.env`, because it is what tells the program where to find that file in
 the first place. Left unset it resolves to the checkout, which is why running
 from a clone needs no configuration at all.
 
 ## Configuration
 
-Create a `.env` file inside the `config/` directory (see `config/.env.example`):
+Create a `.env` file in the project root (see `.env.example`). Running the
+program once without one writes that template for you:
 
 ```
 ANIWORLD_EMAIL=your_email@example.com
@@ -141,7 +146,7 @@ NUM_WORKERS = 10  # Number of parallel httpx sessions
 
 ## Tuning
 
-All optional, with sensible defaults. Set them in `config/.env`.
+All optional, with sensible defaults. Set them in `.env`.
 
 | Variable                      | Default | What it does                                                                                                                                                                  |
 | ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -149,7 +154,7 @@ All optional, with sensible defaults. Set them in `config/.env`.
 | `ANIWORLD_SEASON_CONCURRENCY` | `4`     | Season pages fetched at once per series. Total requests in flight is workers x this.                                                                                          |
 | `ANIWORLD_CHECKPOINT_EVERY`   | `25`    | Save resume state every N anime.                                                                                                                                              |
 | `ANIWORLD_PROFILE`            | unset   | Set to `1` to print where a run's time actually went (network vs parse vs disk).                                                                                              |
-| `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `config/.env`, because it is what locates that file. |
+| `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `.env`, because it is what locates that file. |
 
 ## Usage
 
@@ -335,6 +340,7 @@ credentials); the tests that use them skip when they are absent.
 ## Project Structure
 
 ```
+├── .env.example            # Template for your credentials
 ├── .gitignore
 ├── LICENSE                  # GNU GPL v3.0
 ├── MANIFEST.in              # What a source archive ships
@@ -344,7 +350,6 @@ credentials); the tests that use them skip when they are absent.
 ├── requirements.txt         # Runtime dependencies
 ├── ruff.toml                # Lint/format configuration
 ├── config/
-│   ├── .env.example         # Template for your credentials
 │   ├── __init__.py
 │   └── config.py            # Settings, paths, and the project-home override
 ├── src/

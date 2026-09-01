@@ -780,12 +780,12 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
             import tty
 
             fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
+            old = termios.tcgetattr(fd)  # pyright: ignore[reportAttributeAccessIssue]
             try:
-                tty.setcbreak(fd)
+                tty.setcbreak(fd)  # pyright: ignore[reportAttributeAccessIssue]
                 return sys.stdin.read(1)
             finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)  # pyright: ignore[reportAttributeAccessIssue]
         except Exception:
             return None
 
