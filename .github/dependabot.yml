@@ -12,3 +12,16 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - 'dependencies'
+
+  # Workflow actions pin a major tag, so v7.x fixes arrive on their own but a
+  # new major never does. Without this the pins simply rot: checkout and
+  # setup-python sat three majors behind until a Node 20 deprecation warning
+  # made it visible. Dependabot opens a PR when v8 lands, which is a decision
+  # rather than a surprise.
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 5
+    labels:
+      - 'dependencies'
