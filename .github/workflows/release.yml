@@ -31,7 +31,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # The floor declared in requires-python, deliberately: testing the
+          # oldest supported version is what catches a newer-only API slipping
+          # in. The first run of this workflow caught exactly that.
+          python-version: "3.11"
           cache: pip
 
       - name: Install

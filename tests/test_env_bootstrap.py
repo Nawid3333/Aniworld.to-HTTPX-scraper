@@ -56,7 +56,10 @@ def _run(home: Path, snippet: str) -> str:
 
 
 def _example() -> str:
-    return _norm((REPO_ROOT / ".env.example").read_text(encoding="utf-8", newline=""))
+    # No newline= argument: Path.read_text only grew one in 3.13, and this
+    # project supports 3.11. The default already translates CRLF to LF, which
+    # is exactly the normalisation the comparisons want.
+    return _norm((REPO_ROOT / ".env.example").read_text(encoding="utf-8"))
 
 
 class TestTheShippedExample:
