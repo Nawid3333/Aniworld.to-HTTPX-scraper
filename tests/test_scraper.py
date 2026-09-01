@@ -247,12 +247,25 @@ class TestScrapeOneSeriesUnparseableSeason(unittest.TestCase):
     </body></html>
     """
 
-    def _run(self, season_html: str) -> dict:
+    # Every real season page carries the site chrome, and the avatar/profile
+    # link in it is what proves the page was served to a logged-in session
+    # (verified against all 36 recorded season fixtures). The bodies below are
+    # trimmed to the episode table, so the chrome is added back here -- without
+    # it these would be testing the logged-out path instead of the parse path.
+    # The profile name has to match SERIES_HTML's: that is the account name
+    # the scraper learns from the series page and then enforces below.
+    CHROME = '<div class="avatar"><a href="/user/profil/1">Me</a></div>'
+
+    def _run(self, season_html: str, chrome: str | None = None) -> dict:
+        # Resolved from the instance, not bound as a default: a default is
+        # evaluated once at class-body time, so subclasses overriding CHROME
+        # would silently still get this class's value.
+        chrome = self.CHROME if chrome is None else chrome
         scraper = AniWorldScraper()
         client = _FakeClient(
             {
                 self.SERIES_URL: self.SERIES_HTML,
-                self.SEASON_URL: season_html,
+                self.SEASON_URL: chrome + season_html,
             }
         )
         info = {"url": self.SERIES_URL, "link": "/anime/stream/test-series", "title": "Test Series"}
@@ -292,6 +305,43 @@ class TestScrapeOneSeriesUnparseableSeason(unittest.TestCase):
         </tr></tbody></table>
         """
         result = self._run(season_html)
+        self.assertFalse(result.get("_error"))
+        self.assertEqual(result["total_episodes"], 1)
+
+
+class TestSeasonPageLoggedOut(TestScrapeOneSeriesUnparseableSeason):
+    """A season page served logged out must fail the series, not record zeros.
+
+    Watched state comes from one CSS class the site only emits for an
+    authenticated request, so an anonymous season page parses perfectly and
+    reports every episode as unwatched. Storing that silently rewrites real
+    watch history, and nothing downstream can tell it from a series the user
+    genuinely has not watched.
+    """
+
+    SEASON_HTML = """
+    <table class="seasonEpisodesList"><tbody><tr data-episode-id="1">
+        <meta itemprop="episodeNumber" content="1">
+        <td class="seasonEpisodeTitle"><a><strong>Pilot</strong></a></td>
+    </tr></tbody></table>
+    """
+
+    def test_logged_out_season_errors_instead_of_storing_unwatched(self):
+        result = self._run(self.SEASON_HTML, chrome="")
+        self.assertTrue(result.get("_error"), f"expected an error result, got: {result}")
+        self.assertIn("not logged in", result.get("_error_reason", ""))
+
+    def test_wrong_account_season_errors(self):
+        """The marker alone is not enough: a page belonging to another
+        account must not be trusted for this account's watch data."""
+        other = '<div class="avatar"><a href="/user/profil/someoneelse">X</a></div>'
+        result = self._run(self.SEASON_HTML, chrome=other)
+        self.assertTrue(result.get("_error"), f"expected an error result, got: {result}")
+        self.assertIn("not logged in", result.get("_error_reason", ""))
+
+    def test_logged_in_season_still_parses(self):
+        """The same page with the chrome present must be unaffected."""
+        result = self._run(self.SEASON_HTML)
         self.assertFalse(result.get("_error"))
         self.assertEqual(result["total_episodes"], 1)
 

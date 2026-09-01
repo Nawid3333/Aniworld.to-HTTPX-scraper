@@ -525,6 +525,32 @@ _XP_EPISODE_NUMBER = ".//meta[@itemprop='episodeNumber']/@content"
 _XP_TITLE_GER = f".//td[{_has_class_xpath('seasonEpisodeTitle')}]//a//strong"
 _XP_TITLE_ENG = f".//td[{_has_class_xpath('seasonEpisodeTitle')}]//a//span"
 _XP_FLAG_CELL = f".//td[{_has_class_xpath('editFunctions')}]"
+# Same marker _is_logged_in checks for, as XPath so a season page can be
+# verified from the lxml tree that _parse_episodes already builds.
+_XP_LOGGED_IN = f".//*[{_has_class_xpath('avatar')}]//a[contains(@href, '/user/profil/')]"
+# Second, independent login signal: the site prints the account name in the
+# header of every page it serves to a logged-in session. Checked alongside
+# the avatar link because the two come from different parts of the template,
+# and because matching the *name* proves the session belongs to this account
+# rather than merely being some session.
+_XP_ACCOUNT_LINK = ".//a[contains(@href, '/user/profil/')]"
+_ACCOUNT_HREF_RE = re.compile(r"/user/profil/([^/?#\s]+)")
+
+
+def _account_name_from_hrefs(hrefs) -> str | None:
+    """First account name found among a page's profile links, if any."""
+    for href in hrefs:
+        m = _ACCOUNT_HREF_RE.search((href or "").strip())
+        if m:
+            name = m.group(1).strip()
+            if name:
+                return name
+    return None
+
+
+def _account_name_from_soup(soup: BeautifulSoup) -> str | None:
+    """Read the logged-in account name off a series/catalogue page."""
+    return _account_name_from_hrefs(a.get("href") for a in soup.find_all("a", href=True))
 
 
 def _stripped_text(el) -> str:
@@ -568,6 +594,20 @@ def _parse_episodes(html: str) -> list[dict] | None:
         treat None as a scrape failure -- storing 0 there corrupts the index
         and shows up later as a false "lost all its episodes" mismatch.
     """
+    doc = _build_doc(html)
+    if doc is None:
+        # An empty or non-markup body is a failed fetch, not an empty season.
+        return None
+    return _parse_episodes_from_doc(doc)
+
+
+def _build_doc(html: str):
+    """Build the lxml tree for a season page, or None if the body is not markup.
+
+    Split out so a caller can run more than one check against a single parse:
+    the tree build is the expensive half of reading a season page, and the
+    login check has to look at the same document the episodes came from.
+    """
     try:
         # document_fromstring, not fromstring: fromstring returns a bare
         # fragment root, so markup whose outermost element is the <table>
@@ -575,11 +615,41 @@ def _parse_episodes(html: str) -> list[dict] | None:
         # parse failure. BeautifulSoup always wraps in html/body, and this
         # has to match it -- whole pages are unaffected either way, but the
         # two disagreed on fragments and only one of them can be right.
-        doc = lxml.html.document_fromstring(html)
+        return lxml.html.document_fromstring(html)
     except (lxml.etree.ParserError, ValueError):
-        # An empty or non-markup body is a failed fetch, not an empty season.
         return None
 
+
+def parse_season_page(html: str, account_name: str | None = None) -> tuple[bool, list[dict] | None]:
+    """Read a season page once, returning (logged_in, episodes).
+
+    Every episode's watched flag comes from a single CSS class that the site
+    only emits for an authenticated request, so a season page served logged
+    out parses perfectly and reports every episode as unwatched. That is
+    indistinguishable from a real "nothing watched here" result once it
+    reaches the index, which is why the page has to be checked for the login
+    marker before its watch data is trusted -- the series page having been
+    logged in a moment earlier does not vouch for this one.
+
+    A body that is not markup at all reports (False, None); callers test the
+    episodes for None first, so it surfaces as the parse failure it is
+    rather than as a session expiry.
+    """
+    doc = _build_doc(html)
+    if doc is None:
+        return False, None
+    logged_in = bool(doc.xpath(_XP_LOGGED_IN))
+    if logged_in and account_name:
+        # Both signals must agree. Getting this wrong in the safe direction
+        # costs one series a retry; getting it wrong the other way writes a
+        # page's worth of false "unwatched" into the index.
+        found = _account_name_from_hrefs(a.get("href") for a in doc.xpath(_XP_ACCOUNT_LINK))
+        logged_in = found is not None and found.casefold() == account_name.casefold()
+    return logged_in, _parse_episodes_from_doc(doc)
+
+
+def _parse_episodes_from_doc(doc) -> list[dict] | None:
+    """Extract episode rows from an already-built season-page tree."""
     rows = doc.xpath(_ROWS_PRIMARY) or doc.xpath(_ROWS_NO_TBODY) or doc.xpath(_ROWS_GENERIC)
     if not rows:
         # Tell "the table is there, it's just empty" (a real, if rare,
@@ -886,6 +956,11 @@ class AniWorldScraper:
         self._progress = ProgressWriter()
         self._shared_client = None
         self._client_users = 0
+        # Learned from the first page that proves it is logged in, then
+        # required on every season page. Left None until then, so a run that
+        # never sees it falls back to the avatar-link signal alone rather
+        # than failing every series.
+        self._account_name = None
         self._client_lock = asyncio.Lock()
         # Connection pool is sized from this, not from NUM_WORKERS directly,
         # so a run that overrides the worker count (a benchmark, a scoped
@@ -1730,6 +1805,10 @@ class AniWorldScraper:
                 logger.error("Session expired while scraping %s", url)
                 return self._error_result(info, "session expired — not logged in")
 
+        # This page is proven logged in; use it to learn the account name that
+        # the season pages below are then checked against.
+        self._remember_account_name(soup)
+
         title = _extract_title(soup) or info.get("title", slug)
         if title and title.lower().strip() in _UTILITY_PAGES:
             return self._error_result(info, "utility page")
@@ -1762,11 +1841,27 @@ class AniWorldScraper:
 
         season_pages = await self._fetch_season_pages(client, season_links)
 
+        # A season page that came back logged out yields a full, well-formed
+        # episode table with every row unwatched, so it has to be caught here
+        # rather than by any later sanity check on the numbers. Re-login and
+        # refetch once, exactly as the series page above does; only give up if
+        # the second read is still anonymous.
+        if self._any_season_logged_out(season_pages):
+            if await self._relogin_shared_client(client):
+                season_pages = await self._fetch_season_pages(client, season_links)
+            if self._any_season_logged_out(season_pages):
+                logger.error("Season pages served logged out for %s", url)
+                return self._error_result(info, "session expired — season page not logged in")
+
         for (label, season_url), page in zip(season_links, season_pages, strict=True):
             if isinstance(page, BaseException):
                 return self._error_result(info, f"season {label} fetch failed: {page}")
             with self._profiler.phase("parse"):
-                episodes = parse_season_html(page)
+                logged_in, episodes = parse_season_page(page, self._account_name)
+            if episodes is not None and not logged_in:
+                # Belt and braces: _any_season_logged_out already screened the
+                # batch, so reaching here means the page changed between reads.
+                return self._error_result(info, f"season {label}: not logged in")
             if episodes is None:
                 # None means the page had no episode table at all, or a row
                 # whose episode number could not be determined -- a scrape
@@ -1848,6 +1943,35 @@ class AniWorldScraper:
         }
 
     # ── Worker ──────────────────────────────────────────────────────────────
+
+    def _remember_account_name(self, soup) -> None:
+        """Learn the account name from a page already proven to be logged in.
+
+        The series page is checked for the avatar marker before this runs, so
+        whatever name it carries is this session's. Learning it at runtime
+        keeps the account out of the config and the source, and means the
+        check follows a rename on its own.
+        """
+        if self._account_name is None:
+            name = _account_name_from_soup(soup)
+            if name:
+                self._account_name = name
+                logger.debug("Account name for season-page checks: %s", name)
+
+    def _any_season_logged_out(self, season_pages) -> bool:
+        """True if any successfully fetched season page came back anonymous.
+
+        Exceptions are left alone: a failed fetch is already handled per
+        season further down, and reporting it as a login problem here would
+        mask the real reason.
+        """
+        for page in season_pages:
+            if isinstance(page, BaseException):
+                continue
+            logged_in, episodes = parse_season_page(page, self._account_name)
+            if episodes is not None and not logged_in:
+                return True
+        return False
 
     async def _relogin_shared_client(self, client) -> bool:
         """Log the shared session back in after an expiry, at most once at a time.
