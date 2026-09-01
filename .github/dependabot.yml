@@ -1,0 +1,14 @@
+# Dependabot configuration for pip dependencies.
+# Enables weekly dependency update PRs for the root requirements.txt.
+#
+# Note: You must also enable Dependabot in the repository settings
+# (Settings > Code security > Dependabot alerts/version updates).
+version: 2
+updates:
+  - package-ecosystem: 'pip'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 10
+    labels:
+      - 'dependencies'
