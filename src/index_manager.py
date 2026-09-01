@@ -1541,6 +1541,27 @@ def _prompt_change_confirmations(changes, new_dict):
     return allowed
 
 
+_SCALARS = {str, int, float, bool, type(None)}
+
+
+def fast_copy(x):
+    """Deep copy JSON-like data faster, fall back to copy.deepcopy otherwise.
+
+    Dicts and lists are rebuilt recursively so the result is never aliased.
+    JSON scalars are immutable and returned as-is. Anything else (tuples,
+    sets, dates, custom objects) is handed to copy.deepcopy so behaviour is
+    identical to the original implementation for every possible input.
+    """
+    t = type(x)
+    if t is dict:
+        return {k: fast_copy(v) for k, v in x.items()}
+    if t is list:
+        return [fast_copy(v) for v in x]
+    if t in _SCALARS:
+        return x
+    return copy.deepcopy(x)
+
+
 def _build_merged_data(old_data, new_dict, allowed):
     """Merge new scraped data into old data, respecting user-allowed change categories.
 
@@ -1549,8 +1570,8 @@ def _build_merged_data(old_data, new_dict, allowed):
     data came back rewritten -- merging the same scrape twice gave a different
     answer the second time, and the scraper's series_data was quietly altered.
     """
-    old_data = copy.deepcopy(old_data)
-    new_dict = copy.deepcopy(new_dict)
+    old_data = fast_copy(old_data)
+    new_dict = fast_copy(new_dict)
     merged = old_data
     for title, new_entry in new_dict.items():
         if title in merged:

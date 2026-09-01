@@ -47,12 +47,22 @@ def _load_page(stem: str) -> str | None:
 
 
 def _largest_season_page() -> str | None:
-    """The biggest captured season page, which is the honest parser input."""
-    pages = sorted(PAGE_DIR.glob("season__*.html.gz"), key=lambda p: p.stat().st_size, reverse=True)
-    if not pages:
-        return None
-    with gzip.open(pages[0], "rt", encoding="utf-8") as fh:
-        return fh.read()
+    """The biggest captured season page, which is the honest parser input.
+
+    Sized by decompressed length rather than by the .gz on disk. The two
+    orderings genuinely disagree -- on s.to the largest archive is not the
+    largest page -- and what the parser costs depends on the text it is
+    handed, not on how well that text happened to compress. Each archive is
+    opened once and the winning text kept, so this reads no more than sorting
+    on decompressed size would have.
+    """
+    largest: str | None = None
+    for path in PAGE_DIR.glob("season__*.html.gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            html = fh.read()
+        if largest is None or len(html) > len(largest):
+            largest = html
+    return largest
 
 
 def _index(series_count: int, *, seasons: int = 4, episodes: int = 24) -> dict:
