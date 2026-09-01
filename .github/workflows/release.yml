@@ -48,6 +48,11 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           tag_version="${TAG#v}"
+          if [ -z "$tag_version" ]; then
+            echo "::error::No tag name reached this step, so nothing can be checked against it."
+            echo "Refusing to build a release blind."
+            exit 1
+          fi
           pkg_version=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
           if [ "$tag_version" != "$pkg_version" ]; then
             echo "::error::Tag $TAG declares $tag_version but pyproject.toml says $pkg_version"

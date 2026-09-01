@@ -119,5 +119,5 @@ ignore = []
 convention = "google"
 
 # Type errors are not ruff's job and cannot be made ruff's job -- it has no
-# type inference. Those are checked by pyright; see [tool.pyright] in
-# pyproject.toml, and run `npx pyright` alongside `ruff check`.
+# type inference. They are checked by pyright, configured in the
+# [tool.pyright] section above; run `npx pyright` alongside `ruff check`.
