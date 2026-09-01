@@ -81,7 +81,7 @@ Building a wheel puts a `aniworld-scraper` command on your PATH:
 ```bash
 pip install build
 python -m build
-pip install dist/aniworld_scraper-1.0.0-py3-none-any.whl
+pip install dist/aniworld_scraper-2.0.0-py3-none-any.whl
 ```
 
 Two things are worth knowing before you do.
