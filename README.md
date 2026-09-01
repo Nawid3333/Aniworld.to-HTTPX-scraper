@@ -1,6 +1,6 @@
 # AniWorld.to Anime Scraper & Index Manager (httpx)
 
-[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 
 Scrapes watched anime from **aniworld.to** and maintains a local JSON index.
@@ -37,9 +37,11 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
 
 ## Requirements
 
-- Python 3.10+ — developed and tested on 3.14. The 3.10 floor comes from
-  `zip(strict=True)` and PEP 604 `X | None` annotations evaluated at runtime;
-  versions between 3.10 and 3.13 are expected to work but are not tested.
+- **Python 3.11+** — developed and tested on 3.14. `requires-python` in
+  `pyproject.toml` enforces 3.11, so pip will refuse to install on anything
+  older. The code itself uses nothing newer than 3.10 features
+  (`zip(strict=True)`, PEP 604 `X | None` annotations evaluated at runtime), so
+  3.10 would very likely work — it is simply not tested, so it is not offered.
 - Dependencies: `httpx`, `beautifulsoup4`, `lxml`, `h2`, `python-dotenv`
 
 `lxml` and `h2` are what make the scraper fast: pages parse ~1.4x quicker than with
@@ -48,9 +50,69 @@ back gracefully if unavailable, at the old speed.
 
 ## Installation
 
+There are two ways to run this. **Clone it** unless you have a reason not to —
+that is how the program is designed to be used, and it keeps your credentials,
+your watch list and your scraped index together in one folder you control.
+
+### Run from a clone (recommended)
+
 ```bash
+git clone https://github.com/Nawid3333/Aniworld.to-HTTPX-scraper.git
+cd Aniworld.to-HTTPX-scraper
+
+python -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+.venv\Scripts\Activate.ps1       # Windows (PowerShell)
+
 pip install -r requirements.txt
+
+cp config/.env.example config/.env   # then edit it — see Configuration below
+python main.py
 ```
+
+Everything the program reads or writes — `.env`, `data/`, `logs/` and the
+default batch file — stays inside that folder. Nothing is written anywhere else
+on your machine.
+
+### Install it as a command
+
+Building a wheel puts a `aniworld-scraper` command on your PATH:
+
+```bash
+pip install build
+python -m build
+pip install dist/aniworld_scraper-1.0.0-py3-none-any.whl
+```
+
+Two things are worth knowing before you do.
+
+**Give each program its own virtual environment.** Every project in this family
+ships its code as the top-level modules `main`, `src` and `config`. Install two
+of them into the same environment and the second overwrites the first — the
+command still exists, but it silently runs the other program. `pipx` creates an
+isolated environment per application and avoids this entirely:
+
+```bash
+pipx install .
+```
+
+**Tell it where to keep your files.** Once installed, `config/` lives inside
+`site-packages`, which is no place to keep a `.env` you have to edit by hand.
+Point `ANIWORLD_HOME` at a folder you own, and `.env`, `data/`, `logs/` and the
+default batch file all move there:
+
+```bash
+export ANIWORLD_HOME=~/aniworld                  # Linux / macOS
+$env:ANIWORLD_HOME = "$HOME\aniworld"            # Windows (PowerShell)
+
+mkdir -p ~/aniworld/config
+cp config/.env.example ~/aniworld/config/.env
+```
+
+`ANIWORLD_HOME` has to be a real environment variable. It cannot be set inside
+`config/.env`, because it is what tells the program where to find that file in
+the first place. Left unset it resolves to the checkout, which is why running
+from a clone needs no configuration at all.
 
 ## Configuration
 
@@ -87,6 +149,7 @@ All optional, with sensible defaults. Set them in `config/.env`.
 | `ANIWORLD_SEASON_CONCURRENCY` | `4`     | Season pages fetched at once per series. Total requests in flight is workers x this.                                                                                          |
 | `ANIWORLD_CHECKPOINT_EVERY`   | `25`    | Save resume state every N anime.                                                                                                                                              |
 | `ANIWORLD_PROFILE`            | unset   | Set to `1` to print where a run's time actually went (network vs parse vs disk).                                                                                              |
+| `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `config/.env`, because it is what locates that file. |
 
 ## Usage
 
@@ -244,35 +307,65 @@ Only the `url` field is required for matching; `title` is optional and informati
 
 The scraper re-validates ignored anime at the start of every run and checks them against the fetched catalog. It **does not** auto-add or auto-remove entries — all changes to `.ignored_series.json` are manual.
 
+## Development
+
+```bash
+pip install -e ".[dev]"     # pytest + ruff
+```
+
+| Command                                                  | What it does                                              |
+| -------------------------------------------------------- | --------------------------------------------------------- |
+| `python -m pytest`                                       | The suite. Benchmarks are excluded, so it stays fast.     |
+| `python -m pytest --cov`                                 | With a branch-coverage report.                            |
+| `python -m pytest --benchmark`                           | Adds the timing benchmarks.                               |
+| `python -m pytest --benchmark -m benchmark --benchmark-update` | Re-records the timing baseline.                     |
+| `ruff check . && ruff format --check .`                  | Lint and formatting.                                      |
+
+Benchmarks compare against `tests/benchmark_baseline.json` and fail only when a
+result exceeds the recorded time by more than 60%. That tolerance is deliberately
+loose: it is there to catch an algorithmic regression — a loop that turned
+quadratic, a parse that started running twice — not to police a few percent of
+drift between machines. The baseline is machine-specific, so treat a failure on
+hardware that did not record it as "go look", not as a hard gate.
+
+Fixtures under `tests/fixtures/` are captured from the live site and are not in
+git. Regenerate them with `python tests/capture_fixtures.py` (needs working
+credentials); the tests that use them skip when they are absent.
+
 ## Project Structure
 
 ```
 ├── .gitignore
 ├── LICENSE                  # GNU GPL v3.0
+├── MANIFEST.in              # What a source archive ships
 ├── README.md                # This file
 ├── main.py                  # Entry point & interactive menu
-├── requirements.txt         # Python dependencies
+├── pyproject.toml           # Package metadata, pytest and coverage settings
+├── requirements.txt         # Runtime dependencies
 ├── ruff.toml                # Lint/format configuration
 ├── config/
 │   ├── .env.example         # Template for your credentials
-│   └── config.py            # Settings (credentials, workers, paths)
+│   ├── __init__.py
+│   └── config.py            # Settings, paths, and the project-home override
 ├── src/
+│   ├── __init__.py
 │   ├── atomic_io.py         # Durable atomic JSON writes (shared by every writer)
 │   ├── genre_stats.py       # Option 7: genre completion stats (own data file)
 │   ├── index_manager.py     # Merge, change detection, stats, reports
 │   └── scraper.py           # httpx scraping engine
 └── tests/
-    ├── __init__.py
-    ├── capture_fixtures.py  # Regenerates test fixtures from the live site
-    ├── fixture_spec.py      # Which parser outputs the fixtures pin
-    ├── test_genre_stats.py  # Genre parser, snapshot, diff and storage tests
-    ├── test_golden_parse.py # Parser output pinned against real captured pages
-    └── test_scraper.py      # Unit + regression tests
+    ├── _support.py              # Builders and fakes shared across the suite
+    ├── bench.py                 # Timing harness and regression tolerance
+    ├── capture_fixtures.py      # Regenerates fixtures from the live site
+    ├── conftest.py              # sys.path, --benchmark flag, shared fixtures
+    ├── fixture_spec.py          # Which parser outputs the fixtures pin
+    ├── manual_picker_demo.py    # Manual harness for the genre picker
+    └── test_*.py                # The suite itself (see Development)
 ```
 
-Directories created at runtime (`data/`, `logs/`) and your `.env` are not part of
-the repository. Test fixtures live in `tests/fixtures/` and are generated locally
-with `python tests/capture_fixtures.py`.
+Directories created at runtime (`data/`, `logs/`), your `.env`, and your
+`series_urls.txt` are not part of the repository. Test fixtures live in
+`tests/fixtures/` and are generated locally.
 
 ## Author
 

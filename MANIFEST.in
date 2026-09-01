@@ -1,0 +1,27 @@
+# What goes into a source archive (python -m build --sdist).
+#
+# The wheel takes its contents from [tool.setuptools] in pyproject.toml; this
+# file governs only the sdist, which should carry everything needed to build
+# the project and run its tests -- and nothing personal.
+
+include LICENSE
+include README.md
+include requirements.txt
+include ruff.toml
+recursive-include tests *.py
+
+# The credentials template, so an installed copy has something to copy from.
+include config/.env.example
+
+# series_urls.txt is the user's own watch list, not sample data.
+exclude series_urls.txt
+
+# Never ship. data/ and logs/ are local state; the fixtures are multi-megabyte
+# captures of the live site, kept out of git for the same reason they are kept
+# out of here; .env holds real credentials.
+prune tests/fixtures
+prune data
+prune logs
+global-exclude .env
+global-exclude *.pyc
+global-exclude __pycache__

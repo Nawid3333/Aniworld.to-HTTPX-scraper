@@ -31,9 +31,26 @@ def configure_console() -> None:
 
 configure_console()
 
-# Load environment variables from .env file at import time so every module
-# that imports from this config sees the correct values immediately.
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+# ==================== PROJECT HOME ====================
+# Every path this program reads or writes -- .env, data/, logs/ and the default
+# batch file -- hangs off one directory, so there is a single thing to point
+# somewhere else.
+#
+# Unset, it resolves to the repo checkout exactly as it always has: this file
+# lives in config/, so its parent is the project root. Running from a clone is
+# therefore byte-for-byte unchanged.
+#
+# ANIWORLD_HOME overrides it, and that is what makes an *installed* copy usable.
+# Installed into a venv, config/ sits inside site-packages, where no user can
+# reasonably be expected to find a .env to edit; pointing ANIWORLD_HOME at a real
+# folder gives the program a writable home it owns.
+_DEFAULT_HOME = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+PROJECT_HOME = os.path.abspath(os.environ.get("ANIWORLD_HOME") or _DEFAULT_HOME)
+
+# Load environment variables from .env at import time so every module that
+# imports from this config sees the correct values immediately.
+ENV_FILE = os.path.join(PROJECT_HOME, "config", ".env")
+load_dotenv(ENV_FILE)
 
 
 def _validate_and_normalize_url(url: str) -> str:
@@ -94,8 +111,8 @@ EMAIL = os.getenv("ANIWORLD_EMAIL", "")
 PASSWORD = os.getenv("ANIWORLD_PASSWORD", "")
 
 # ==================== DIRECTORIES ====================
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+DATA_DIR = os.path.join(PROJECT_HOME, "data")
+LOGS_DIR = os.path.join(PROJECT_HOME, "logs")
 
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
@@ -105,7 +122,7 @@ SERIES_INDEX_FILE = os.path.join(DATA_DIR, "series_index.json")
 
 # Default batch file for single/batch URL import
 # Edit DEFAULT_BATCH_FILE_PATH below to change the default batch file
-DEFAULT_BATCH_FILE_PATH = os.path.join(os.path.dirname(__file__), "..", "series_urls.txt")
+DEFAULT_BATCH_FILE_PATH = os.path.join(PROJECT_HOME, "series_urls.txt")
 DEFAULT_BATCH_FILE = os.path.abspath(DEFAULT_BATCH_FILE_PATH)
 
 # ==================== SCRAPING SETTINGS ====================

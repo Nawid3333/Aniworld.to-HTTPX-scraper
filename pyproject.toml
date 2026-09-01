@@ -30,6 +30,12 @@ py-modules = ["main"]
 where = ["."]
 include = ["config*", "src*"]
 
+# Ship the credentials template inside the wheel too, so an installed copy has
+# a reference to copy from and is not just told to find a file that is not
+# there. See the project-home note in config/config.py for where it should go.
+[tool.setuptools.package-data]
+config = [".env.example"]
+
 # ==================== TESTS ====================
 # Run the suite with:      python -m pytest
 # With coverage:           python -m pytest --cov
