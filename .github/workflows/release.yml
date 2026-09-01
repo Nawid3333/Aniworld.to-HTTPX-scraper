@@ -1,0 +1,68 @@
+# Builds the package when a release is published and attaches the sdist and
+# wheel to that release, so people can install a build without cloning.
+#
+# Runs on windows-latest because that is the only platform this suite has ever
+# been run on. The wheel is pure Python, so the artifact is identical wherever
+# it is built -- the runner choice only affects whether the tests pass. Switch
+# to ubuntu-latest (faster) once the suite has been confirmed on Linux.
+name: Release
+
+on:
+  release:
+    types: [published]
+  # Also runnable by hand from the Actions tab, to check the build without
+  # cutting a release. That run uploads the artifacts to the run itself.
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to upload assets onto the release
+
+jobs:
+  package:
+    runs-on: windows-latest
+    defaults:
+      run:
+        # bash on Windows too: the upload step relies on glob expansion, which
+        # PowerShell does not do for arguments to external commands.
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ".[dev]" build twine
+
+      - name: Test
+        # The suite runs without credentials and without the captured fixtures,
+        # which are not in git; the tests needing either skip themselves. A
+        # release should not be built from a tree that is failing.
+        run: python -m pytest
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check package metadata
+        run: twine check dist/*
+
+      - name: Attach artifacts to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --clobber so re-running the workflow on the same release replaces the
+        # assets instead of failing on the second attempt.
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+
+      - name: Keep artifacts on a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
