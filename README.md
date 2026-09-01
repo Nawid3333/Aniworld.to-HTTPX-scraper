@@ -346,9 +346,8 @@ credentials); the tests that use them skip when they are absent.
 ├── MANIFEST.in              # What a source archive ships
 ├── README.md                # This file
 ├── main.py                  # Entry point & interactive menu
-├── pyproject.toml           # Package metadata, pytest and coverage settings
+├── pyproject.toml           # Package metadata, ruff, pytest and coverage settings
 ├── requirements.txt         # Runtime dependencies
-├── ruff.toml                # Lint/format configuration
 ├── config/
 │   ├── __init__.py
 │   └── config.py            # Settings, paths, and the project-home override
