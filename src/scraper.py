@@ -93,9 +93,17 @@ class RateGuard:
         self._penalty = 0.0
 
     async def wait(self) -> None:
-        """Block until the pool is allowed to send again."""
-        delay = self._resume_at - time.monotonic()
-        if delay > 0:
+        """Block until the pool is allowed to send again.
+
+        Re-checked in a loop rather than slept once. A worker parked here
+        computed its delay from _resume_at at the moment it arrived, so a
+        second 429 landing while it slept -- which pushes _resume_at further
+        out and doubles the penalty -- never reached it: it woke at the old
+        time and sent anyway. The escalation was therefore lost on exactly
+        the workers it was meant to hold back, at exactly the moment the site
+        was pushing hardest.
+        """
+        while (delay := self._resume_at - time.monotonic()) > 0:
             await asyncio.sleep(delay)
 
     def penalise(self, retry_after: float | None = None) -> float:
@@ -370,6 +378,9 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox
 # every host at startup and only has to answer "is this the login page", not
 # read anything out of it.
 _PASSWORD_INPUT_RE = re.compile(r"<input[^>]+type\s*=\s*['\"]?password", re.IGNORECASE)
+# A form that posts to a login endpoint. Structural, like the password field,
+# rather than a word that happens to appear on the page.
+_LOGIN_FORM_RE = re.compile(r"<form[^>]*\baction\s*=\s*['\"]?[^'\"\s>]*/?login\b", re.IGNORECASE)
 
 
 def _looks_like_login_page(html: str) -> bool:
@@ -384,10 +395,7 @@ def _looks_like_login_page(html: str) -> bool:
     this strictly more accepting than the old check -- nothing that passes
     today can start failing because of this.
     """
-    if _PASSWORD_INPUT_RE.search(html):
-        return True
-    lowered = html.lower()
-    return "login" in lowered or "anmelden" in lowered
+    return bool(_PASSWORD_INPUT_RE.search(html) or _LOGIN_FORM_RE.search(html))
 
 
 def _host_url(path: str, site_url: str | None = None) -> str:

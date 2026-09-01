@@ -241,32 +241,64 @@ def _save_combined_mismatch_report(report_path, idx_mgr, host_reports):
 
 
 def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
-    """Prompt to remove duplicate index entries and save if confirmed."""
-    dup_extra = sum(index_duplicates.values()) - len(index_duplicates)
-    print(f"    ⚠ Found {len(index_duplicates)} duplicate slug(s) in index (extra count: {dup_extra})")
-    print("    Duplicate slugs:")
-    for dup_slug in sorted(index_duplicates):
-        print(f"      - {dup_slug}")
+    """Resolve duplicate-slug entries one slug at a time, under user control.
 
-    choice = input("\nDelete duplicate index entries? (y/n): ").strip().lower()
-    if choice != "y":
-        return
+    This used to delete *every* entry whose slug was duplicated, including the
+    copy holding the watch history, while reporting only the "extra" count --
+    so two entries went for a reported extra of one, and the series came back
+    from the rescrape blank. Deduplicating is meant to leave one entry
+    standing, and which one that should be is a judgement the program cannot
+    make: a slug repeats because a series was renamed, because the site reused
+    it, or because one scrape stored a stale title. Each slug is shown with
+    everything that tells its copies apart, and the choice is the user's.
+    """
+    dup_extra = sum(index_duplicates.values()) - len(index_duplicates)
+    print(f"\n    [WARN] Found {len(index_duplicates)} duplicate slug(s) in index (extra count: {dup_extra})")
+
+    by_slug = {}
+    for title, series in idx_mgr.series_index.items():
+        slug = _extract_slug(series)
+        if slug in index_duplicates:
+            by_slug.setdefault(slug, []).append((title, series))
 
     removed_titles = []
-    for title, series in list(idx_mgr.series_index.items()):
-        slug = _extract_slug_from_field(series.get("url", "") or series.get("link", ""))
-        if slug in index_duplicates:
-            removed_titles.append(title)
-            del idx_mgr.series_index[title]
+    for slug in sorted(by_slug):
+        entries = sorted(by_slug[slug], key=lambda kv: kv[0].lower())
+        if len(entries) < 2:
+            continue
+        print(f"\n    slug '{slug}' - {len(entries)} entries:")
+        for position, (title, series) in enumerate(entries, 1):
+            total, watched = get_episode_counts(series)
+            seasons = len(series.get("seasons", []))
+            print(f"      {position}. {title}")
+            print(f"         {seasons} season(s), {watched}/{total} watched")
+            print(f"         {series.get('url') or series.get('link', '')}")
+
+        choice = input(f"      keep which? (1-{len(entries)}, s=skip, a=abort): ").strip().lower()
+        if choice == "a":
+            print("      aborted - nothing further changed.")
+            break
+        if not choice or choice == "s":
+            print("      skipped - every copy kept.")
+            continue
+        if not choice.isdigit() or not 1 <= int(choice) <= len(entries):
+            print("      not one of the listed options - skipped, every copy kept.")
+            continue
+
+        keep = int(choice) - 1
+        for position, (title, _series) in enumerate(entries):
+            if position != keep and title in idx_mgr.series_index:
+                del idx_mgr.series_index[title]
+                removed_titles.append(title)
+        print(f"      kept '{entries[keep][0]}'.")
+
+    if not removed_titles:
+        print("\n    No entries removed.")
+        return
+
     idx_mgr.save_index()
-    print(f"    🗑 Removed {len(removed_titles)} duplicate entries. Run 'Fetch new series' to rescrape them.")
-    logger.info(
-        "Removed %d duplicate index entries: %s",
-        len(removed_titles),
-        sorted(index_duplicates),
-    )
-
-
+    print(f"\n    Removed {len(removed_titles)} duplicate entry(s); one copy of each resolved slug kept.")
+    logger.info("Removed %d duplicate index entries: %s", len(removed_titles), removed_titles[:10])
 def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
     """Compare site slugs against the local index for one host.
 
@@ -751,11 +783,173 @@ def _prompt_clean_vanished(idx_mgr: IndexManager | None = None):
     return True
 
 
+def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) -> str:
+    """Interactive, case-insensitive genre picker.
+
+    Prints the full genre list once, then keeps a single prompt line.
+    Tab autocompletes/cycles through matching labels, Enter confirms,
+    Backspace deletes, Esc clears. Type 0 (or the literal "Back" label)
+    and press Enter to return to the previous menu when ``allow_back`` is
+    True. Unknown input loops back to retry. Falls back to plain ``input()``
+    on non-interactive terminals. Returns the selected genre key or
+    ``"__back__"`` when the user chooses to go back.
+    """
+    back_key = "__back__"
+    back_label = "0. Back"
+
+    genre_items = sorted(((k, v) for k, v in choices.items() if k != "all"), key=lambda kv: kv[1].lower())
+    all_items: list[tuple[str, str]] = [("all", choices["all"])]
+    if allow_back:
+        all_items.append((back_key, back_label))
+    all_items.extend(genre_items)
+
+    def _resolve(text: str) -> str | None:
+        text = text.strip().lower()
+        if not text:
+            return None
+        if allow_back and text in ("0", "back"):
+            return back_key
+        for key, label in all_items:
+            if label.lower() == text:
+                return key
+        for key, label in all_items:
+            if text in label.lower():
+                return key
+        return None
+
+    def _matches(query: str) -> list[tuple[str, str]]:
+        """Every selectable entry matching the query, in display order.
+
+        The empty-query branch used to return `genre_items`, which leaves the
+        "all" pseudo-entry out, while the filtered branch searched `all_items`,
+        which includes it. Because "All genres / no filter" sorts first and Tab
+        took the first match, typing any letter that appears in that label and
+        pressing Tab silently completed to "show everything" instead of the
+        genre being typed. Both branches now search the same list.
+        """
+        selectable = [(k, v) for k, v in all_items if k != back_key]
+        query = query.strip().lower()
+        if not query:
+            return selectable
+        parts = query.split()
+        return [(k, v) for k, v in selectable if all(part in v.lower() for part in parts)]
+
+    print("\nSuggest something to watch")
+    print("Available genres:")
+    for _, label in all_items:
+        print(f"  {label}")
+    print("\nType to filter. Tab = cycle matches, Enter = confirm, 0 = back.")
+
+    def _read_char() -> str | None:
+        try:
+            import msvcrt
+
+            # Deliberately no kbhit() drain here. Draining ran before *every*
+            # character read, not once at startup, so anything typed while the
+            # prompt line was being redrawn was thrown away -- and because
+            # matching is substring-based, the surviving fragment usually still
+            # matched something, so "dram" selected Comedy rather than failing.
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                return ""
+            if ch == "\r":
+                return "\n"
+            return ch
+        except Exception:
+            pass
+        try:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            return None
+
+    def _interactive() -> str | None:
+        if not sys.stdout.isatty():
+            return None
+        query = ""
+        current_match = ""
+        # Anchor + position for Tab cycling; reset by any key that edits the query.
+        tab_base: str | None = None
+        tab_index = 0
+        prompt_prefix = "> "
+        hint = "  [Tab: cycle, Enter: pick, 0: back]"
+        print(f"{hint}{prompt_prefix}{query}", end="", flush=True)
+
+        while True:
+            ch = _read_char()
+            if ch is None:
+                return None
+            if ch in ("\n", "\r"):
+                selected = _resolve(query)
+                if selected is None:
+                    print("\n✗ No genre matched. Please try again.")
+                    print(f"{hint}{prompt_prefix}{query}", end="", flush=True)
+                    continue
+                print()
+                return selected
+            if ch == "\t":
+                # Real cycling, which the hint and the docstring both promise.
+                # The old code reassigned `query` to the first match and then
+                # recomputed from it, so every further Tab matched only the
+                # entry just completed and the list never advanced. Cycling is
+                # anchored to the text actually typed, kept in `tab_base`.
+                base = query if tab_base is None else tab_base
+                matches = _matches(base)
+                if matches:
+                    if tab_base is None:
+                        tab_base, tab_index = base, 0
+                    else:
+                        tab_index = (tab_index + 1) % len(matches)
+                    query = matches[tab_index][1]
+                    current_match = query
+            elif ch in ("\x08", "\x7f"):
+                query = query[:-1]
+                tab_base, tab_index = None, 0
+            elif ch == "\x1b":
+                query = ""
+                current_match = ""
+                tab_base, tab_index = None, 0
+            elif ch and ch.isprintable():
+                query += ch
+                tab_base, tab_index = None, 0
+            else:
+                continue
+
+            matches = _matches(query)
+            current_match = matches[0][1] if matches else ""
+            line = f"{hint}{prompt_prefix}{query}"
+            if current_match and current_match.lower() != query.lower():
+                line += f"  → {current_match}"
+            sys.stdout.write("\r\033[K" + line)
+            sys.stdout.flush()
+
+    selected = _interactive()
+    if selected is not None:
+        return selected
+
+    # Fallback for non-tty or unsupported terminals.
+    while True:
+        answer = input("Enter genre name (0 = back): ").strip()
+        selected = _resolve(answer)
+        if selected is not None:
+            return selected
+        print("✗ No genre matched. Please try again.")
+
+
 def _suggest_something_to_watch(idx_mgr: IndexManager | None = None):
     """Suggest unwatched anime from the index, optionally filtered by genre.
 
     Loads the genre index and presents a list of unwatched anime. The user
-    can filter by genre or pick from all unwatched anime. Five random
+    can filter by genre or pick from all unwatched anime. Ten random
     suggestions are shown (or fewer if not enough exist).
     """
     if idx_mgr is None:
@@ -778,14 +972,9 @@ def _suggest_something_to_watch(idx_mgr: IndexManager | None = None):
         choices[key] = label
 
     print("\nSuggest something to watch")
-    print("Available filters:")
-    for key, label in choices.items():
-        print(f"  {key}: {label}")
-
-    selected = input("\nEnter genre key (or 'all'): ").strip().lower()
-    if selected not in choices:
-        print("✗ Invalid genre key. Using 'all'.")
-        selected = "all"
+    selected = _prompt_genre_choice(choices)
+    if selected == "__back__":
+        return
 
     candidates = []
     for title, series in idx_mgr.series_index.items():
@@ -806,20 +995,45 @@ def _suggest_something_to_watch(idx_mgr: IndexManager | None = None):
         return
 
     random.shuffle(candidates)
-    sample = candidates[: max(5, len(candidates))]
+    sample = candidates[: min(10, len(candidates))]
 
-    print(f"\n🎲 {len(sample)} suggestion(s) from {len(candidates)} unwatched anime:")
+    print(f"\n🎲 {len(sample)} suggestion(s) from {len(candidates)} unwatched anime:\n")
+
+    idx_w = len(str(len(sample)))
+    title_w = max((len(s.get("title", "Unknown")) for s in sample), default=0)
+    total_w = max((len(str(s.get("total_episodes", 0))) for s in sample), default=0) + 5
+    genre_w = max(
+        (
+            len(", ".join(genre_labels.get(g, g) for g in series_genres.get(s.get("title", ""), [])) or "—")
+            for s in sample
+        ),
+        default=0,
+    )
+    link_w = max((len(s.get("url") or s.get("link", "")) for s in sample), default=0)
+    header = (
+        f"    {'#':<{idx_w}}  {'Title':<{title_w}}  {'Watched/Total':<{total_w}}"
+        f"  {'Sub':<3}  {'WL':<3}  {'Genres':<{genre_w}}  {'Link':<{link_w}}"
+    )
+    print(header)
+    sep = f"    {'─' * idx_w}  {'─' * title_w}  {'─' * total_w}  {'─' * 3}  {'─' * 3}  {'─' * genre_w}  {'─' * link_w}"
+    print(sep)
     for i, series in enumerate(sample, 1):
         title = series.get("title", "Unknown")
         link = series.get("url") or series.get("link", "")
+        watched = series.get("watched_episodes", 0)
         total = series.get("total_episodes", 0)
+        sub = series.get("subscribed")
+        wl = series.get("watchlist")
+        sub_mark = "✓" if sub else "✗" if sub is not None else "?"
+        wl_mark = "✓" if wl else "✗" if wl is not None else "?"
         genres = series_genres.get(title, [])
         genre_str = ", ".join(genre_labels.get(g, g) for g in genres) if genres else "—"
-        print(f"\n  {i}. {title}")
-        print(f"     Link: {link}")
-        print(f"     Episodes: {total}")
-        print(f"     Genres: {genre_str}")
-    print("\nCopy a link and open it in your browser to check it out.")
+        row = (
+            f"    {i:<{idx_w}}  {title:<{title_w}}  {watched}/{total:<{total_w - 2}}"
+            f"  {sub_mark:<3}  {wl_mark:<3}  {genre_str:<{genre_w}}  {link}"
+        )
+        print(row)
+    print("\n  Copy a link and open it in your browser to check it out.")
 
 
 def _run_scrape_and_save(

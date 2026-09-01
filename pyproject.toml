@@ -29,3 +29,41 @@ py-modules = ["main"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["config*", "src*"]
+
+# ==================== TESTS ====================
+# Run the suite with:      python -m pytest
+# With coverage:           python -m pytest --cov
+# Timing benchmarks:       python -m pytest --benchmark
+# Re-record the baseline:  python -m pytest --benchmark -m benchmark --benchmark-update
+#
+# Benchmarks are excluded from a normal run by tests/conftest.py, so `pytest`
+# stays fast; see tests/bench.py for how a regression is judged.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Quiet, but with the short traceback style that actually fits on a screen.
+addopts = "-q --tb=short"
+markers = [
+    "benchmark: a timing test, skipped unless --benchmark is passed",
+]
+
+[tool.coverage.run]
+source = ["main", "src", "config"]
+branch = true
+# Helper scripts that talk to the live site on purpose. They are tools, not
+# code under test, and including them makes the coverage number meaningless.
+omit = [
+    "tests/*",
+    "*/capture_fixtures.py",
+    "*/probe_*.py",
+    "*/manual_*.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    '@(abc\.)?abstractmethod',
+]

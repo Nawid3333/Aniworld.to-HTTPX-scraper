@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import time
 from datetime import datetime
 from typing import Protocol
@@ -698,6 +699,216 @@ def export_report(site_url: str | None = None) -> None:
         print()
 
 
+def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) -> str:
+    """Interactive, case-insensitive genre picker.
+
+    Prints the full genre list once, then keeps a single prompt line.
+    Tab autocompletes/cycles through matching labels, Enter confirms,
+    Backspace deletes, Esc clears. Type 0 (or the literal "Back" label)
+    and press Enter to return to the previous menu when ``allow_back`` is
+    True. Unknown input loops back to retry instead of falling back to a
+    silent default. Falls back to plain ``input()`` on non-interactive
+    terminals. Returns the selected genre key or ``"__back__"`` when the
+    user chooses to go back.
+    """
+    back_key = "__back__"
+    back_label = "0. Back"
+
+    genre_items = sorted(((k, v) for k, v in choices.items() if k != "all"), key=lambda kv: kv[1].lower())
+    all_items: list[tuple[str, str]] = [("all", choices["all"])]
+    if allow_back:
+        all_items.append((back_key, back_label))
+    all_items.extend(genre_items)
+
+    def _resolve(text: str) -> str | None:
+        text = text.strip().lower()
+        if not text:
+            return None
+        if allow_back and text in ("0", "back"):
+            return back_key
+        for key, label in all_items:
+            if label.lower() == text:
+                return key
+        for key, label in all_items:
+            if text in label.lower():
+                return key
+        return None
+
+    def _matches(query: str) -> list[tuple[str, str]]:
+        """Every selectable entry matching the query, in display order.
+
+        The empty-query branch used to return `genre_items`, which leaves the
+        "all" pseudo-entry out, while the filtered branch searched `all_items`,
+        which includes it. Because "All genres / no filter" sorts first and Tab
+        took the first match, typing any letter that appears in that label and
+        pressing Tab silently completed to "show everything" instead of the
+        genre being typed. Both branches now search the same list.
+        """
+        selectable = [(k, v) for k, v in all_items if k != back_key]
+        query = query.strip().lower()
+        if not query:
+            return selectable
+        parts = query.split()
+        return [(k, v) for k, v in selectable if all(part in v.lower() for part in parts)]
+
+    print("\nSelect a genre")
+    print("Available genres:")
+    for _, label in all_items:
+        print(f"  {label}")
+    print("\nType to filter. Tab = cycle matches, Enter = confirm, 0 = back.")
+
+    def _read_char() -> str | None:
+        try:
+            import msvcrt
+
+            # Deliberately no kbhit() drain here. Draining ran before *every*
+            # character read, not once at startup, so anything typed while the
+            # prompt line was being redrawn was thrown away -- and because
+            # matching is substring-based, the surviving fragment usually still
+            # matched something, so "dram" selected Comedy rather than failing.
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                return ""
+            if ch == "\r":
+                return "\n"
+            return ch
+        except Exception:
+            pass
+        try:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            return None
+
+    def _interactive() -> str | None:
+        if not sys.stdout.isatty():
+            return None
+        query = ""
+        current_match = ""
+        # Anchor + position for Tab cycling; reset by any key that edits the query.
+        tab_base: str | None = None
+        tab_index = 0
+        prompt_prefix = "> "
+        hint = "  [Tab: cycle, Enter: pick, 0: back]"
+        print(f"{hint}{prompt_prefix}{query}", end="", flush=True)
+
+        while True:
+            ch = _read_char()
+            if ch is None:
+                return None
+            if ch in ("\n", "\r"):
+                selected = _resolve(query)
+                if selected is None:
+                    print("\n✗ No genre matched. Please try again.")
+                    print(f"{hint}{prompt_prefix}{query}", end="", flush=True)
+                    continue
+                print()
+                return selected
+            if ch == "\t":
+                # Real cycling, which the hint and the docstring both promise.
+                # The old code reassigned `query` to the first match and then
+                # recomputed from it, so every further Tab matched only the
+                # entry just completed and the list never advanced. Cycling is
+                # anchored to the text actually typed, kept in `tab_base`.
+                base = query if tab_base is None else tab_base
+                matches = _matches(base)
+                if matches:
+                    if tab_base is None:
+                        tab_base, tab_index = base, 0
+                    else:
+                        tab_index = (tab_index + 1) % len(matches)
+                    query = matches[tab_index][1]
+                    current_match = query
+            elif ch in ("\x08", "\x7f"):
+                query = query[:-1]
+                tab_base, tab_index = None, 0
+            elif ch == "\x1b":
+                query = ""
+                current_match = ""
+                tab_base, tab_index = None, 0
+            elif ch and ch.isprintable():
+                query += ch
+                tab_base, tab_index = None, 0
+            else:
+                continue
+
+            matches = _matches(query)
+            current_match = matches[0][1] if matches else ""
+            line = f"{hint}{prompt_prefix}{query}"
+            if current_match and current_match.lower() != query.lower():
+                line += f"  → {current_match}"
+            sys.stdout.write("\r\033[K" + line)
+            sys.stdout.flush()
+
+    selected = _interactive()
+    if selected is not None:
+        return selected
+
+    # Fallback for non-tty or unsupported terminals.
+    while True:
+        answer = input("Enter genre name (0 = back): ").strip()
+        selected = _resolve(answer)
+        if selected is not None:
+            return selected
+        print("✗ No genre matched. Please try again.")
+
+
+def list_unwatched_by_genre(site_url: str | None = None) -> None:
+    """List indexed anime that still have unwatched episodes, filtered by genre."""
+    data = load_genres()
+    if not data["series"]:
+        print("\n→ No genre data yet. Run option 1 (Scrape genres) first.\n")
+        return
+
+    labels = data.get("labels", {})
+    choices = {"all": "All genres / no filter"}
+    for key, label in sorted(labels.items()):
+        choices[key] = label
+
+    selected = _prompt_genre_choice(choices)
+    if selected == "__back__":
+        return
+
+    index = IndexManager(SERIES_INDEX_FILE)
+    by_slug = _index_by_slug(index)
+
+    unwatched: list[tuple[str, str, str, int, int]] = []
+    for slug, entry in by_slug.items():
+        total, watched = get_episode_counts(entry)
+        if total <= 0 or watched >= total:
+            continue
+        genres = data["series"].get(slug, [])
+        if selected != "all" and selected not in genres:
+            continue
+        title = entry.get("title") or data.get("titles", {}).get(slug, slug)
+        link = entry.get("url") or entry.get("link", "")
+        unwatched.append((title, link, slug, watched, total))
+
+    if not unwatched:
+        suffix = f" for genre '{choices[selected]}'" if selected != "all" else ""
+        print(f"\n✓ No unwatched anime found{suffix}.")
+        return
+
+    unwatched.sort(key=lambda x: x[0].lower())
+
+    def _format(item: tuple[str, str, str, int, int]) -> str:
+        title, link, _slug, watched, total = item
+        return f"  - {title}  ({watched}/{total})  {link}"
+
+    suffix = f" in {choices[selected]}" if selected != "all" else ""
+    print(f"\nUnwatched anime ({len(unwatched)}){suffix}:")
+    paginate_list(unwatched, _format)
+
+
 # ── Menu ────────────────────────────────────────────────────────────────────
 
 
@@ -726,9 +937,10 @@ def menu(site_url: str | None = None) -> None:
         print(f"\n  1. Scrape genres      (refresh, {SCRAPE_ESTIMATE})")
         print("  2. Show stats (watched / total)")
         print("  3. Export genre report")
+        print("  4. Show unwatched by genre")
         print("  0. Back\n")
 
-        choice = input("Choose (0-3): ").strip()
+        choice = input("Choose (0-4): ").strip()
         if choice == "0":
             return
         if choice == "1":
@@ -737,5 +949,7 @@ def menu(site_url: str | None = None) -> None:
             show_stats(site_url)
         elif choice == "3":
             export_report(site_url)
+        elif choice == "4":
+            list_unwatched_by_genre(site_url)
         else:
-            print("✗ Invalid choice. Please enter a number between 0 and 3.")
+            print("✗ Invalid choice. Please enter a number between 0 and 4.")

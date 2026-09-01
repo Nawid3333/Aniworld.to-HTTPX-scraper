@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -948,7 +949,7 @@ class TestHostChecksTargetTheRightHost(QuietCase):
 
     HOST = "https://mirror.test"
 
-    def _probe(self, status=200, body="Please Login"):
+    def _probe(self, status=200, body='<form action="/login"><input type="password"></form>'):
         requests = []
         response = _CannedResponse(status, body)
         with mock.patch.object(sc.httpx, "AsyncClient", lambda *a, **kw: _RecordingClient(requests, response)):
@@ -969,7 +970,7 @@ class TestHostChecksTargetTheRightHost(QuietCase):
         self.assertFalse(result["ok"])
 
     def test_a_real_login_page_is_reachable(self):
-        result, _requests = self._probe(status=200, body="<form>Login</form>")
+        result, _requests = self._probe(status=200, body='<form action="/login"><input type="password"></form>')
 
         self.assertTrue(result["ok"])
 
@@ -1000,8 +1001,8 @@ class TestHostChecksTargetTheRightHost(QuietCase):
         "a reworded page that still has a password field": '<html><form><input type="password" name="p"></form></html>',
         "single-quoted type": "<input type='password'>",
         "unquoted type": "<input type=password>",
-        "german wording": "<html><body>Bitte anmelden</body></html>",
-        "english wording": "<html><body>Please Login</body></html>",
+        "a form posting to the login endpoint": '<html><form action="/login" method="post"></form></html>',
+        "an absolute login action": "<html><form action='https://mirror.test/login'></form></html>",
     }
 
     REJECTED = {
@@ -1027,21 +1028,151 @@ class TestHostChecksTargetTheRightHost(QuietCase):
             with self.subTest(label):
                 self.assertFalse(sc._looks_like_login_page(html))
 
-    def test_it_accepts_everything_the_old_word_test_accepted(self):
-        """This check may only ever grow more accepting, never less.
+    def test_wording_alone_no_longer_makes_a_host_usable(self):
+        """Deliberately narrower than the old word test, which was too wide.
 
-        It decides which mirrors are usable, so a host that works today must
-        not start reading as down because the test was tightened.
+        This used to assert the opposite -- that the check may only ever grow
+        more accepting -- on the grounds that a working host must never start
+        reading as down. That ratchet was the defect: "login" appears in the
+        nav of a parked domain and in the body of a Cloudflare block page, so
+        accepting the bare word accepted exactly the impostors the probe
+        exists to screen out, and the host it picked became the active one.
+
+        Nothing real is lost by tightening. A login page has a password field
+        -- that is how a browser is told to mask the input -- and a form
+        posting to /login is kept as the structural alternative, so both
+        signals survive a rewording or a translation. What no longer counts
+        is the word on its own.
         """
         for html in (
             "<p>Login</p>",
             "please LOGIN here",
             "<form>login</form>",
             "<html><body>Anmelden oder Login</body></html>",
+            "<html><title>Attention Required! | Cloudflare</title>"
+            "<body>Error 1020<a href='/login'>Login</a></body></html>",
         ):
             with self.subTest(html):
                 self.assertIn("login", html.lower(), "sample must match the old rule")
-                self.assertTrue(sc._looks_like_login_page(html))
+                self.assertFalse(sc._looks_like_login_page(html))
+
+
+class TestIndexEntriesSurviveAMirrorChange(QuietCase):
+    """Retiring a mirror must not delete the series scraped from it.
+
+    Index entries store an absolute URL carrying whatever host was live when
+    they were scraped. Validation rejected any host missing from the current
+    _SITE_URLS, load_index dropped those entries, and the very next save
+    wrote the shortened index back to disk -- taking the series and every
+    watched episode with it. Because an index is normally uniformly on one
+    host, one config edit could take all of it.
+    """
+
+    RETIRED = "a-retired-mirror.example"
+
+    def _index(self, *entries) -> str:
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "series_index.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(list(entries), fh)
+        return path
+
+    def _series(self, title: str, host: str, watched: int = 12):
+        slug = title.lower().replace(" ", "-")
+        path = im._VALID_SERIES_PATH_RE.pattern.split("[")[0]
+        return {
+            "title": title,
+            "url": f"https://{host}{path}{slug}",
+            "seasons": [
+                {
+                    "season": "Season 1",
+                    "episodes": [{"number": n, "watched": n <= watched} for n in range(1, 13)],
+                    "total_episodes": 12,
+                    "watched_episodes": watched,
+                }
+            ],
+        }
+
+    def test_an_entry_on_a_retired_mirror_is_kept_not_dropped(self):
+        live = sorted(im.VALID_SERIES_HOSTS)[0]
+        path = self._index(self._series("Kept", live), self._series("Stale", self.RETIRED))
+
+        manager = im.IndexManager(path)
+
+        self.assertEqual(sorted(manager.series_index), ["Kept", "Stale"])
+
+    def test_its_watch_history_survives(self):
+        path = self._index(self._series("Stale", self.RETIRED, watched=7))
+
+        manager = im.IndexManager(path)
+        total, watched = im.get_episode_counts(manager.series_index["Stale"])
+
+        self.assertEqual((total, watched), (12, 7))
+
+    def test_its_host_is_repointed_to_a_configured_one(self):
+        path = self._index(self._series("Stale", self.RETIRED))
+
+        manager = im.IndexManager(path)
+
+        self.assertNotIn(self.RETIRED, manager.series_index["Stale"]["url"])
+        self.assertTrue(im._is_valid_series_url(manager.series_index["Stale"]["url"]))
+
+    def test_a_later_save_does_not_write_the_entry_out_of_the_index(self):
+        path = self._index(self._series("Kept", sorted(im.VALID_SERIES_HOSTS)[0]), self._series("Stale", self.RETIRED))
+
+        manager = im.IndexManager(path)
+        manager.save_index()
+
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(sorted(entry["title"] for entry in on_disk), ["Kept", "Stale"])
+
+    def test_a_genuinely_broken_url_is_still_rejected(self):
+        """Only the host became forgiving. Dangerous schemes still go."""
+        for url in ("javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "https://host/not-a-series"):
+            with self.subTest(url):
+                self.assertIsNone(im._series_path_of(url))
+
+
+class TestRateGuardHoldsParkedWorkers(QuietCase):
+    """An escalating penalty has to reach the workers already waiting.
+
+    wait() computed its sleep once, so a second 429 arriving while a worker
+    was parked -- which pushes the resume time out and doubles the penalty --
+    never reached it: it woke at the original time and sent anyway, exactly
+    when the site was pushing back hardest.
+    """
+
+    def test_a_penalty_raised_mid_sleep_still_holds_the_pool(self):
+        async def scenario():
+            guard = sc.RateGuard()
+            sent = []
+
+            async def worker(n):
+                await guard.wait()
+                sent.append(time.monotonic())
+
+            guard.penalise(retry_after=0.20)
+            tasks = [asyncio.create_task(worker(i)) for i in range(4)]
+            await asyncio.sleep(0.05)
+            pause = guard.penalise(retry_after=0.50)
+            resume_at = time.monotonic() + pause
+            await asyncio.gather(*tasks)
+            return sent, resume_at
+
+        sent, resume_at = asyncio.run(scenario())
+
+        early = [t for t in sent if t < resume_at - 0.02]
+        self.assertEqual(early, [], f"{len(early)} of {len(sent)} workers sent before the pool was released")
+
+    def test_it_still_returns_promptly_when_nothing_is_pending(self):
+        async def scenario():
+            guard = sc.RateGuard()
+            start = time.monotonic()
+            await guard.wait()
+            return time.monotonic() - start
+
+        self.assertLess(asyncio.run(scenario()), 0.05)
 
 
 if __name__ == "__main__":

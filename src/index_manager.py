@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlparse
 
-from config.config import VALID_SERIES_HOSTS
+from config.config import SITE_URL, VALID_SERIES_HOSTS
 from src.atomic_io import atomic_write_json, create_file_backup
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,51 @@ def _is_valid_series_url(url):
     return bool(_VALID_SERIES_PATH_RE.match(parsed.path))
 
 
+def _series_path_of(url):
+    """Return the series path of *url*, or None if it is not one at all.
+
+    Splits the two questions the old single check ran together: "is this a
+    series URL we are willing to store" and "is it on a host we currently
+    talk to". Dangerous schemes (javascript:, data:, file://) are still
+    rejected here -- only the host is left for _rehost_series_url to decide,
+    because a stale host is a fixable detail, not grounds to throw the entry
+    away.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    if _VALID_SERIES_PATH_RE.match(url):
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    return parsed.path if _VALID_SERIES_PATH_RE.match(parsed.path) else None
+
+
+def _rehost_series_url(url):
+    """Point a series URL at the configured host, keeping its path.
+
+    Index entries store whatever mirror was live when they were scraped.
+    Retiring that mirror from _SITE_URLS used to make every entry on it fail
+    validation; load_index dropped those entries, and the very next save
+    wrote the shortened index back to disk -- silently deleting the series
+    and every watched episode recorded against it. Since the whole index is
+    normally on one host, one config edit could take all of it.
+
+    The path is what identifies the series, so only the host is replaced.
+    Rewriting to the configured primary is enough: if the run is actually
+    using a different mirror, the merge stores the URL it really scraped.
+
+    Returns (url, changed).
+    """
+    path = _series_path_of(url)
+    if path is None or _is_valid_series_url(url):
+        return url, False
+    return f"{SITE_URL}{path}", True
+
+
 # Re-exported under their old private names so this module's call sites
 # keep working unchanged. The real implementation lives in atomic_io so
 # scraper.py can share it too.
@@ -71,7 +116,7 @@ def _validate_series_entry(series, title=""):
     if not url:
         logger.warning("Skipping series '%s' - missing 'url' field", title)
         return False
-    if not _is_valid_series_url(url):
+    if _series_path_of(url) is None:
         logger.warning("Skipping series '%s' - invalid URL scheme/format: %s", title, url[:80])
         return False
     seasons = series.get("seasons")
@@ -270,6 +315,16 @@ def _flag_new_series_non_default_state(title, new_series, changes):
         changes["watchlist_added"].append(title)
 
 
+
+def _report_order(title):
+    """Sort key for anything the change report lists, case-insensitively.
+
+    Falls back to str() so a non-string key in a hand-edited index sorts
+    rather than raising TypeError halfway through a scrape.
+    """
+    text = str(title)
+    return (text.lower(), text)
+
 def detect_changes(old_data, new_data):
     """Detect changes between old and new data."""
     changes = {
@@ -299,11 +354,16 @@ def detect_changes(old_data, new_data):
     if isinstance(new_data, list):
         new_data = {s.get("title"): s for s in new_data}
 
-    for title in new_titles - old_titles:
+    # Sorted, not raw set order. Python randomises string hashing per
+    # process, so the same scrape listed its changes in a different order
+    # every run -- and with the report paginated, the first page the user
+    # actually reads before pressing q was a random sample of the set
+    # rather than a stable, comparable list.
+    for title in sorted(new_titles - old_titles, key=_report_order):
         changes["new_series"].append(title)
         _flag_new_series_non_default_state(title, new_data.get(title, {}), changes)
 
-    for title in old_titles & new_titles:
+    for title in sorted(old_titles & new_titles, key=_report_order):
         old_series = old_data[title]
         new_series = new_data[title]
 
@@ -526,10 +586,28 @@ class IndexManager:
                 self.series_index = {}
 
             validated_index = {}
+            rehosted = 0
             for title, series in self.series_index.items():
-                if _validate_series_entry(series, str(title)):
-                    validated_index[title] = series
+                if not _validate_series_entry(series, str(title)):
+                    continue
+                # An entry stored against a mirror that has since left
+                # _SITE_URLS keeps its data and gets its host rewritten.
+                # It used to be dropped here and then written out of the
+                # index by the next save.
+                moved = False
+                for field in ("url", "link"):
+                    value = series.get(field)
+                    if value:
+                        new_value, changed = _rehost_series_url(value)
+                        if changed:
+                            series[field] = new_value
+                            moved = True
+                rehosted += bool(moved)
+                validated_index[title] = series
             self.series_index = validated_index
+            if rehosted:
+                print(f"[INFO] Repointed {rehosted} index entry(s) to {SITE_URL} (stored host no longer configured).")
+                logger.warning("Repointed %d index entry(s) to %s", rehosted, SITE_URL)
             if not self.series_index:
                 logger.warning("Loaded index is empty or contains no valid series")
 

@@ -7,6 +7,7 @@ perfectly correct on short lists while silently losing genres on long ones.
 """
 
 import gzip
+import io
 import json
 import sys
 import tempfile
@@ -464,12 +465,77 @@ class TestExportReport(unittest.TestCase):
         self.assertEqual(report["series"]["one-punch-man"]["title"], "one-punch-man")
 
 
-class TestPartialData(unittest.TestCase):
-    """Trap: an interrupted scrape must not present itself as complete."""
+class TestUnwatchedByGenre(unittest.TestCase):
+    """Option 7 sub menu 4: list unwatched series by genre with a back option."""
 
-    def test_a_partial_file_is_detectable_from_its_counts(self):
-        data = {"scraped_count": 4250, "catalogue_total": 10862}
-        self.assertTrue(0 < data["scraped_count"] < data["catalogue_total"])
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / "genre_index.json")
+        self.index_path = str(Path(self.tmp.name) / "series_index.json")
+        self.patch = mock.patch.object(genre_stats, "GENRE_INDEX_FILE", self.path)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def _write_data(self, labels=None, series=None, titles=None):
+        data = genre_stats.load_genres()
+        data["labels"] = labels or {"action": "Action", "comedy": "Comedy"}
+        data["series"] = series or {"bleach": ["action"], "naruto": ["comedy"]}
+        data["titles"] = titles or {"bleach": "Bleach", "naruto": "Naruto"}
+        save_genres(data)
+
+    @mock.patch.object(genre_stats, "_prompt_genre_choice", return_value="__back__")
+    def test_back_option_returns_early(self, _mock_picker):
+        """Choosing 0/Back from the picker must not print unwatched series."""
+        self._write_data()
+        entry = series_entry(12, 0, "bleach")
+        with mock.patch.object(genre_stats, "IndexManager", lambda *a, **k: FakeIndex([entry])):
+            captured = io.StringIO()
+            with mock.patch("sys.stdout", new=captured):
+                genre_stats.list_unwatched_by_genre()
+        out = captured.getvalue()
+        self.assertNotIn("Unwatched anime", out)
+        self.assertNotIn("Bleach", out)
+
+    @mock.patch.object(genre_stats, "_prompt_genre_choice", return_value="action")
+    def test_selected_genre_filters_unwatched(self, _mock_picker):
+        """Picking a genre only lists unwatched series tagged with that genre."""
+        self._write_data()
+        entries = [
+            series_entry(12, 0, "bleach"),
+            series_entry(12, 0, "naruto"),
+        ]
+        with mock.patch.object(genre_stats, "IndexManager", lambda *a, **k: FakeIndex(entries)):
+            captured = io.StringIO()
+            with mock.patch("sys.stdout", new=captured):
+                genre_stats.list_unwatched_by_genre()
+        out = captured.getvalue()
+        self.assertIn("Unwatched anime", out)
+        self.assertIn("bleach", out)
+        self.assertNotIn("naruto", out)
+
+    def test_picker_resolves_back_input(self):
+        """The picker returns __back__ when the user types 0."""
+        choices = {"all": "All genres / no filter", "action": "Action"}
+        with mock.patch("sys.stdout.isatty", return_value=False), mock.patch("builtins.input", return_value="0"):
+            self.assertEqual(genre_stats._prompt_genre_choice(choices), "__back__")
+
+    def test_picker_resolves_label_input(self):
+        """The picker returns the matching key for a typed genre label."""
+        choices = {"all": "All genres / no filter", "action": "Action"}
+        with mock.patch("sys.stdout.isatty", return_value=False), mock.patch("builtins.input", return_value="Action"):
+            self.assertEqual(genre_stats._prompt_genre_choice(choices), "action")
+
+    def test_picker_rejects_unknown_input_and_retries(self):
+        """Unknown input loops back to retry instead of returning a default."""
+        choices = {"all": "All genres / no filter", "action": "Action"}
+        with (
+            mock.patch("sys.stdout.isatty", return_value=False),
+            mock.patch("builtins.input", side_effect=["nonsense", "Action"]),
+        ):
+            self.assertEqual(genre_stats._prompt_genre_choice(choices), "action")
 
 
 if __name__ == "__main__":

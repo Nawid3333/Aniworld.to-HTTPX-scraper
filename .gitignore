@@ -69,3 +69,10 @@ cache_probe_report.json
 # Test fixtures: real captured pages that carry personal watch state.
 # Not committed -- regenerate locally with: python tests/capture_fixtures.py
 /tests/fixtures/
+
+# Coverage output (pytest --cov)
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/

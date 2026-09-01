@@ -26,8 +26,11 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
 - **Pause/resume** — create a `.pause_scraping` file to gracefully pause workers
 - **Report generation** — full statistics with subscription/watchlist filtering and ongoing anime export
 - **Genre completion stats** — option 7 scrapes every series page for its genres into a separate
-  `data/genre_index.json`, then reports watched/total per genre. Self-contained: it never writes
-  `series_index.json`
+  `data/genre_index.json`, then reports watched/total per genre, exports a full JSON report, and lists
+  unwatched anime by genre. Self-contained: it never writes `series_index.json`
+- **Smart genre picker** — used by option 7 and 8: type a few characters to filter the genre list,
+  press Tab to cycle matches, Enter to confirm, or type `0`/`back` to return. No scroll menu, no external
+  prompt toolkit required
 - **Data integrity checks** — detects episode count drops, season removals, watched-status corruption, and title changes before merging; offers to delete & rescrape critical series
 - **Atomic file writes** — all JSON writes use temp file + replace to prevent corruption
 - **Rotating log files** — 10 MB per file, 5 backups
@@ -78,12 +81,12 @@ NUM_WORKERS = 10  # Number of parallel httpx sessions
 
 All optional, with sensible defaults. Set them in `config/.env`.
 
-| Variable | Default | What it does |
-| --- | --- | --- |
-| `ANIWORLD_MAX_WORKERS` | `8` | Concurrent scraping sessions. The default was measured on a representative sample of this catalogue, not guessed — higher is not faster, and past the peak it only adds load. |
-| `ANIWORLD_SEASON_CONCURRENCY` | `4` | Season pages fetched at once per series. Total requests in flight is workers x this. |
-| `ANIWORLD_CHECKPOINT_EVERY` | `25` | Save resume state every N anime. |
-| `ANIWORLD_PROFILE` | unset | Set to `1` to print where a run's time actually went (network vs parse vs disk). |
+| Variable                      | Default | What it does                                                                                                                                                                  |
+| ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ANIWORLD_MAX_WORKERS`        | `8`     | Concurrent scraping sessions. The default was measured on a representative sample of this catalogue, not guessed — higher is not faster, and past the peak it only adds load. |
+| `ANIWORLD_SEASON_CONCURRENCY` | `4`     | Season pages fetched at once per series. Total requests in flight is workers x this.                                                                                          |
+| `ANIWORLD_CHECKPOINT_EVERY`   | `25`    | Save resume state every N anime.                                                                                                                                              |
+| `ANIWORLD_PROFILE`            | unset   | Set to `1` to print where a run's time actually went (network vs parse vs disk).                                                                                              |
 
 ## Usage
 
@@ -93,19 +96,52 @@ python main.py
 
 ### Menu Options
 
-| #   | Option                          | Description                                                                      |
-| --- | ------------------------------- | -------------------------------------------------------------------------------- |
-| 1   | **Scrape all anime**            | Full scrape of all watched anime. Choose sequential or parallel mode.            |
-| 2   | **Scrape only NEW anime**       | Scrapes only anime not yet in the index (faster).                                |
-| 3   | **Scrape unwatched anime**      | Skips fully watched anime; focuses on ongoing/partial.                           |
-| 4   | **Generate report**             | Statistics report saved to JSON, with optional subscription/watchlist filtering. |
-| 5   | **Single link / batch add**     | Paste a URL for a single anime, or load URLs from a file.                        |
-| 6   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs.                               |
-| 7   | **Watch Stats of Categories**   | Genre completion stats: scrape genres, show watched/total per genre, export.     |
-| 8   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                      |
-| 0   | **Exit**                        | Clean exit.                                                                      |
+| #   | Option                          | Description                                                                                           |
+| --- | ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1   | **Scrape all anime**            | Full scrape of all watched anime. Choose sequential or parallel mode.                                 |
+| 2   | **Scrape only NEW anime**       | Scrapes only anime not yet in the index (faster).                                                     |
+| 3   | **Scrape unwatched anime**      | Skips fully watched anime; focuses on ongoing/partial.                                                |
+| 4   | **Generate report**             | Statistics report saved to JSON, with optional subscription/watchlist filtering.                      |
+| 5   | **Single link / batch add**     | Paste a URL for a single anime, or load URLs from a file.                                             |
+| 6   | **Retry failed scrapes**        | Bulk retry all anime that failed in previous runs.                                                    |
+| 7   | **Watch Stats of Categories**   | Genre completion stats: scrape genres, show watched/total, export report, or list unwatched by genre. |
+| 8   | **Suggest something to watch**  | Pick a genre (or all genres) and get up to 10 random unwatched anime suggestions.                     |
+| 9   | **Scrape subscribed/watchlist** | Scrape anime from your subscribed list, watchlist, or both.                                           |
+| 0   | **Exit**                        | Clean exit.                                                                                           |
 
 > **Pausing scraping:** there is no dedicated menu option. To gracefully pause workers, create a `.pause_scraping` file in the `data/` directory (see [Pause/resume](#pauseresume) below).
+
+### Option 7 — Watch Stats of Categories
+
+Opens its own sub-menu:
+
+1. **Scrape genres** — fetches every series page once, extracts all genres, and writes `data/genre_index.json`. Resumes if interrupted.
+2. **Show stats** — prints a watched/total table per genre, joined against the local series index, plus change notices since the last check.
+3. **Export genre report** — writes the same breakdown to `data/genre_report.json`.
+4. **Show unwatched by genre** — uses the interactive genre picker to filter anime that still have unwatched episodes.
+
+The genre picker prints the full list once, then keeps a single prompt line:
+
+- **Type** to filter the list; matches are shown as `→ genre name`.
+- **Tab** cycles through matching genres.
+- **Enter** confirms the highlighted match.
+- **0** or **back** returns to the previous menu.
+- Non-interactive terminals fall back to plain text input.
+
+### Option 8 — Suggest something to watch
+
+Shows up to 10 random unwatched anime. You can filter by a specific genre via the same picker, or choose **All genres / no filter** to pick across everything. The list is shuffled every time.
+
+### Option 9 — Scrape subscribed/watchlist
+
+Opens a sub-menu:
+
+1. **Only subscribed**
+2. **Only watchlist**
+3. **Both**
+4. **Back**
+
+Supports checkpoint resume the same way as a normal scrape.
 
 ### Scraping Modes (Option 1)
 
