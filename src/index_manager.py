@@ -2371,12 +2371,19 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
         changes["removed_seasons"] = []
 
     # Check for episode count mismatches before merging
+    pending_rescrape = None
     mismatches = _detect_episode_count_mismatches(old_data, new_dict)
     if mismatches:
         proceed, rescrape_data = _prompt_episode_mismatches(mismatches, old_data, active_site_url=active_site_url)
         if rescrape_data:
-            # Return rescrape data so main.py can handle deletion + rescraping
-            return {
+            # Held, not returned. Returning here used to skip the merge
+            # entirely, so every approval the user had just given for every
+            # *other* series in the run was discarded with it -- the sibling
+            # s.to run that found this lost an approved 7->12 watch change and
+            # re-prompted for it on the next two scrapes. The rescrape
+            # concerns one series; the rest of the run still has to be saved,
+            # so this is handed back at the end instead, after the merge.
+            pending_rescrape = {
                 "rescrape": True,
                 "urls": rescrape_data["urls"],
                 "titles": rescrape_data["titles"],
@@ -2459,11 +2466,11 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
             index_manager.series_index = merged
             index_manager.save_index()
             print(f"✓ Saved {len(merged)} series to index")
-            return True
+            return pending_rescrape or True
 
         print(f"\n✓ {description} already up to date.")
         logger.info("No changes to save for %s.", description)
-        return True
+        return pending_rescrape or True
 
     show_changes(
         changes,
@@ -2486,4 +2493,4 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
     index_manager.save_index()
     print(f"✓ Saved {len(merged)} series to index")
     logger.info("Saved %d series to index", len(merged))
-    return True
+    return pending_rescrape or True

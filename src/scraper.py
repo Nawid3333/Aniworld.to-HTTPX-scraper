@@ -745,6 +745,19 @@ def _parse_episodes_from_doc(doc) -> list[dict] | None:
         if languages:
             ep["languages"] = languages
         episodes.append(ep)
+
+    # A season never lists the same episode number twice. If one appears, the
+    # row selector matched something it should not have (a nested element, a
+    # second table, a redesigned page), which means this list is not a
+    # faithful read of the season -- and its watched flags are not either.
+    # Verified against every recorded season fixture: none contains a
+    # duplicate, so this can only fire on a genuine mis-parse.
+    numbers = [ep["number"] for ep in episodes]
+    if len(numbers) != len(set(numbers)):
+        dupes = sorted({n for n in numbers if numbers.count(n) > 1})
+        logger.warning("Duplicate episode numbers %s in season page - treating as a parse failure", dupes)
+        return None
+
     return episodes
 
 
