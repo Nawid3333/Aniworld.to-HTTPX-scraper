@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aniworld-scraper"
-version = "2.0.1"
+version = "2.0.2"
 description = "AniWorld.to anime scraper and index manager (httpx version)."
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -86,7 +86,10 @@ exclude_also = [
 # without finding bugs.
 [tool.pyright]
 include = ["main.py", "src", "config"]
-exclude = ["**/__pycache__", "build", "dist", ".venv"]
+# Re-lists pyright's own defaults because setting this key replaces them
+# rather than merging: naming only the additions below dropped **/.* and
+# left the analyzer walking .git, .pytest_cache and .ruff_cache.
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "build", "dist"]
 typeCheckingMode = "basic"
 pythonVersion = "3.11"
 

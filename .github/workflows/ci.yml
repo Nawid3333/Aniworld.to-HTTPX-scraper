@@ -1,0 +1,43 @@
+# Runs the test suite on every push and pull request. release.yml runs the same
+# suite, but only once a release is published -- by then a broken commit is
+# already on main and tagged. This is the same check, moved earlier.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Matches release.yml: windows-latest is the only platform this suite has
+    # been run on, so keeping CI on the same runner means a green CI run
+    # actually predicts a green release build.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # The floor declared in requires-python, as in release.yml: testing
+          # the oldest supported version is what catches a newer-only API
+          # slipping in.
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ".[dev]"
+
+      - name: Test
+        # As in release.yml: the suite runs without credentials and without the
+        # captured fixtures, which are not in git; the tests needing either
+        # skip themselves.
+        run: python -m pytest
