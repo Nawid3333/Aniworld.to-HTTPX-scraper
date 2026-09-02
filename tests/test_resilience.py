@@ -498,24 +498,136 @@ class TestMergeDoesNotMutateItsInputs(QuietCase):
         )
 
 
-class TestDeleteAllNeedsConfirmation(QuietCase):
-    """ "a" deletes every remaining entry unseen; it has to be confirmed."""
+class TestVanishedDecisionPrompt(QuietCase):
+    """The vanished-series prompt uses a side-by-side table with per-row actions."""
 
     @staticmethod
     def _entries(n):
         return [(f"Show{i}", "gone", series_url(f"s{i}")) for i in range(n)]
 
-    def test_wrong_confirmation_deletes_nothing(self):
-        with mock.patch("builtins.input", side_effect=["a", "nope", "n", "n", "n", "n"]):
-            self.assertEqual(im._prompt_vanished_deletions(self._entries(5)), [])
+    def test_keep_all_by_default(self):
+        # Empty new_dict / old_data => all rows match "none" and default is keep
+        with mock.patch("builtins.input", side_effect=["", "", "", "", ""]):
+            self.assertEqual(im._prompt_vanished_table(self._entries(5), {}, {}), [])
 
-    def test_exact_confirmation_deletes_all(self):
-        with mock.patch("builtins.input", side_effect=["a", "DELETE 5"]):
-            self.assertEqual(len(im._prompt_vanished_deletions(self._entries(5))), 5)
+    def test_delete_per_item_with_confirmation(self):
+        # "d" triggers a y/n confirmation prompt
+        inputs = ["d", "y", "", "d", "y", "", ""]
+        with mock.patch("builtins.input", side_effect=inputs):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(len(result), 2)
 
-    def test_per_item_answers_still_work(self):
-        with mock.patch("builtins.input", side_effect=["y", "n", "s"]):
-            self.assertEqual(len(im._prompt_vanished_deletions(self._entries(5))), 1)
+    def test_yes_shortcut_deletes_without_confirmation(self):
+        # "y" deletes directly without the extra confirmation prompt
+        inputs = ["y", "n", "y", "n", ""]
+        with mock.patch("builtins.input", side_effect=inputs):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(result, ["Show0", "Show2"])
+
+    def test_apply_to_all_delete_needs_typed_confirmation(self):
+        # "a y" deletes current and all remaining rows, but only once the
+        # count has been typed back: it wipes entries the user never saw.
+        inputs = ["a y", "DELETE 5"]
+        with mock.patch("builtins.input", side_effect=inputs):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(result, [f"Show{i}" for i in range(5)])
+
+    def test_apply_to_all_delete_wrong_confirmation_deletes_nothing(self):
+        # A miscounted or half-typed confirmation drops back to the same row.
+        inputs = ["a y", "DELETE 4", "", "", "", "", ""]
+        with mock.patch("builtins.input", side_effect=inputs):
+            self.assertEqual(im._prompt_vanished_table(self._entries(5), {}, {}), [])
+
+    def test_apply_to_all_delete_partway_counts_remaining(self):
+        # Confirmation quotes the rows left, not the whole list.
+        inputs = ["n", "n", "a d", "DELETE 3"]
+        with mock.patch("builtins.input", side_effect=inputs):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(result, ["Show2", "Show3", "Show4"])
+
+    def test_apply_to_all_keep(self):
+        # "a n" keeps current and all remaining rows
+        inputs = ["a n"]
+        with mock.patch("builtins.input", side_effect=inputs):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(result, [])
+
+    def test_skip_all_keeps_remaining(self):
+        with mock.patch("builtins.input", side_effect=["d", "n", "s"]):
+            result = im._prompt_vanished_table(self._entries(5), {}, {})
+            self.assertEqual(result, [])
+
+
+class TestVerifyAcceptsBothVanishedShapes(QuietCase):
+    """The index hands verification 3-tuples; the row prompt hands it 2-tuples.
+
+    Unpacking only the 2-tuple shape crashed the whole verification step the
+    moment the user answered "y" to the re-scrape prompt.
+    """
+
+    def _verify(self, entries):
+        scraper = SCRAPER_CLS()
+        # Empty URLs short-circuit before any request, so this stays offline.
+        with mock.patch.object(SCRAPER_CLS, "_login_client", new=mock.AsyncMock()):
+            return asyncio.run(scraper.verify_vanished_and_candidates(entries, []))
+
+    def test_three_tuple_entries_do_not_raise(self):
+        verified, _ = self._verify([("Show", "not found on aniworld.to", "")])
+        self.assertEqual(verified, [("Show", "", False)])
+
+    def test_two_tuple_entries_do_not_raise(self):
+        verified, _ = self._verify([("Show", "")])
+        self.assertEqual(verified, [("Show", "", False)])
+
+
+class TestRescrapeTrustsReachability(QuietCase):
+    """A rescrape may only rewrite a row when the page was actually reached."""
+
+    class _FakeScraper:
+        """Mirrors the real contract: every entry comes back either way, and
+        only the flag says whether the fetch landed."""
+
+        def __init__(self, reachable):
+            self.reachable = reachable
+
+        async def verify_vanished_and_candidates(self, vanished, candidates):
+            verified_vanished = [("Renamed Title", url, self.reachable) for _title, url in vanished]
+            verified_candidates = []
+            for entry in candidates:
+                verified = dict(entry)
+                verified["title"] = "Verified New Title"
+                verified["_verified_reachable"] = self.reachable
+                verified_candidates.append(verified)
+            return verified_vanished, verified_candidates
+
+    @staticmethod
+    def _row():
+        return {
+            "v_title": "Old Title",
+            "v_url": series_url("old"),
+            "old_entry": {},
+            "n_title": "New Title",
+            "n_url": series_url("new"),
+            "new_entry": {"title": "New Title", "url": series_url("new")},
+            "reason": "weak",
+        }
+
+    def test_unreachable_leaves_row_untouched(self):
+        row = self._row()
+        self.assertFalse(im._rescrape_row(row, self._FakeScraper(False), {}))
+        self.assertEqual(row["v_title"], "Old Title")
+        self.assertEqual(row["n_title"], "New Title")
+
+    def test_reachable_updates_row(self):
+        row = self._row()
+        self.assertTrue(im._rescrape_row(row, self._FakeScraper(True), {}))
+        self.assertEqual(row["v_title"], "Renamed Title")
+        self.assertEqual(row["n_title"], "Verified New Title")
+
+    def test_missing_scraper_is_reported_not_raised(self):
+        row = self._row()
+        self.assertFalse(im._rescrape_row(row, None, {}))
+        self.assertEqual(row["v_title"], "Old Title")
 
 
 class TestBatchFileExportAppends(QuietCase):
@@ -1177,3 +1289,148 @@ class TestRateGuardHoldsParkedWorkers(QuietCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBulkBrowserOpenIsGuarded(QuietCase):
+    """Bulk "open in browser" must state the cost and stop for confirmation.
+
+    Each URL here is a real browser window on the user's desktop, so an
+    unconfirmed loop over a long vanished list is how you lock up a machine.
+    """
+
+    @staticmethod
+    def _rows(n):
+        return [
+            {
+                "v_title": f"Show{i}",
+                "v_url": series_url(f"old{i}"),
+                "old_entry": {},
+                "n_title": f"Show{i} New",
+                "n_url": series_url(f"new{i}"),
+                "new_entry": {},
+                "reason": "weak",
+            }
+            for i in range(n)
+        ]
+
+    def test_declining_opens_nothing(self):
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["n"]):
+            self.assertEqual(im._open_rows_in_browser(self._rows(50)), 0)
+        opener.assert_not_called()
+
+    def test_enter_alone_declines(self):
+        """The default must be the safe answer, not "open 100 tabs"."""
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=[""]):
+            self.assertEqual(im._open_rows_in_browser(self._rows(50)), 0)
+        opener.assert_not_called()
+
+    def test_it_pauses_instead_of_opening_everything(self):
+        """One "y" must not release all 100 tabs; the batch has to be re-confirmed."""
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y", "n"]):
+            opened = im._open_rows_in_browser(self._rows(50))
+        self.assertLessEqual(opened, im._BROWSER_TAB_BATCH + 2)
+        self.assertLessEqual(opener.call_count, im._BROWSER_TAB_BATCH + 2)
+
+    def test_confirming_each_batch_opens_them_all(self):
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y"] * 20):
+            opened = im._open_rows_in_browser(self._rows(50))
+        self.assertEqual(opened, 100)
+        self.assertEqual(opener.call_count, 100)
+
+    def test_a_small_list_needs_one_confirmation(self):
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y"]):
+            self.assertEqual(im._open_rows_in_browser(self._rows(2)), 4)
+        self.assertEqual(opener.call_count, 4)
+
+    def test_rows_without_urls_open_nothing_and_do_not_prompt(self):
+        rows = self._rows(3)
+        for row in rows:
+            row["v_url"] = ""
+            row["n_url"] = ""
+        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input") as prompt:
+            self.assertEqual(im._open_rows_in_browser(rows), 0)
+        opener.assert_not_called()
+        prompt.assert_not_called()
+
+
+class TestBulkRescrapeIsOneRoundTrip(QuietCase):
+    """Verifying N rows must cost one sign-in, not N."""
+
+    class _CountingScraper:
+        def __init__(self, reachable=True):
+            self.reachable = reachable
+            self.calls = []
+
+        async def verify_vanished_and_candidates(self, vanished, candidates):
+            self.calls.append((list(vanished), list(candidates)))
+            verified = [(f"{title} Renamed", url, self.reachable) for title, url in vanished]
+            return verified, [dict(c, _verified_reachable=self.reachable) for c in candidates]
+
+    @staticmethod
+    def _rows(n, with_candidates=True):
+        return [
+            {
+                "v_title": f"Show{i}",
+                "v_url": series_url(f"old{i}"),
+                "old_entry": {},
+                "n_title": f"Show{i} New",
+                "n_url": series_url(f"new{i}"),
+                "new_entry": {"title": f"Show{i} New"} if with_candidates else {},
+                "reason": "weak",
+            }
+            for i in range(n)
+        ]
+
+    def test_all_rows_go_out_in_one_call(self):
+        scraper = self._CountingScraper()
+        rows = self._rows(25)
+        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 25)
+        self.assertEqual(len(scraper.calls), 1, "each row must not trigger its own sign-in")
+        self.assertEqual(len(scraper.calls[0][0]), 25)
+
+    def test_each_row_gets_its_own_verdict(self):
+        """Results are paired back by order; a mix-up would retitle the wrong row."""
+        scraper = self._CountingScraper()
+        rows = self._rows(5)
+        im._rescrape_rows(rows, scraper, {})
+        self.assertEqual([row["v_title"] for row in rows], [f"Show{i} Renamed" for i in range(5)])
+
+    def test_unreachable_rows_are_left_alone(self):
+        scraper = self._CountingScraper(reachable=False)
+        rows = self._rows(5)
+        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 0)
+        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(5)])
+
+    def test_rows_without_a_candidate_still_verify(self):
+        scraper = self._CountingScraper()
+        rows = self._rows(4, with_candidates=False)
+        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 4)
+        self.assertEqual(scraper.calls[0][1], [], "no candidates should be sent")
+
+    def test_a_short_result_changes_nothing(self):
+        """A truncated reply must not pair row 2's verdict onto row 1."""
+
+        class _ShortScraper:
+            async def verify_vanished_and_candidates(self, vanished, candidates):
+                return [("Only One", vanished[0][1], True)], []
+
+        rows = self._rows(3, with_candidates=False)
+        self.assertEqual(im._rescrape_rows(rows, _ShortScraper(), {}), 0)
+        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(3)])
+
+    def test_a_failed_call_changes_nothing(self):
+        class _BrokenScraper:
+            async def verify_vanished_and_candidates(self, vanished, candidates):
+                raise RuntimeError("site down")
+
+        rows = self._rows(3)
+        self.assertEqual(im._rescrape_rows(rows, _BrokenScraper(), {}), 0)
+        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(3)])
+
+    def test_rows_without_urls_are_skipped_not_sent(self):
+        scraper = self._CountingScraper()
+        rows = self._rows(3)
+        rows[1]["v_url"] = ""
+        im._rescrape_rows(rows, scraper, {})
+        self.assertEqual(len(scraper.calls[0][0]), 2)
+        self.assertEqual(rows[1]["v_title"], "Show1")

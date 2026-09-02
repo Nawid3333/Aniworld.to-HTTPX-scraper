@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import webbrowser
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, TypeVar
@@ -987,11 +988,9 @@ def _detect_episode_count_mismatches(old_data, new_dict):
 
     # Build old lookup by stable match key; also keep a title-only fallback.
     old_by_key: dict[str, dict] = {}
-    title_to_key: dict[str, str] = {}
     for title, entry in old_map.items():
         key = _series_match_key(title, entry.get("url", entry.get("link", "")))
         old_by_key[key] = entry
-        title_to_key[title] = key
 
     mismatches = []
     for title, new_entry in new_dict.items():
@@ -1022,7 +1021,10 @@ def _detect_episode_count_mismatches(old_data, new_dict):
         # 1. Total episode count difference
         if old_total != new_total:
             diff = new_total - old_total
-            percent_diff = round((diff / max(old_total, new_total)), 3) * 100 if max(old_total, new_total) > 0 else 0
+            # Scale first, then round: rounding the ratio to 3 places quantised
+            # the result to 0.1% steps and left float noise like 33.30000000004.
+            denominator = max(old_total, new_total)
+            percent_diff = round(diff / denominator * 100, 1) if denominator > 0 else 0
             mismatch_details["issues"].append(
                 {
                     "type": "total_episode_count",
@@ -1994,18 +1996,26 @@ def _match_vanished_to_new(vanished_entries, new_dict):
     """Pair each vanished series with the best matching new series, if any.
 
     Args:
-        vanished_entries: list of (title, reason, url) tuples.
+        vanished_entries: list of (title, reason, url) tuples. A bare
+            (title, url) pair is also accepted, so an older report or a
+            caller that has no vanish reason cannot break the pairing.
         new_dict: dict title -> series data for newly scraped series.
 
     Returns:
         list of (vanished_title, vanished_url, new_title, new_url, reason)
-        tuples. `reason` is one of 'exact', 'strong', 'weak', or None.
+        tuples. `reason` here is the match quality -- 'exact', 'strong',
+        'weak', or None -- not the vanish reason that came in.
     """
     new_titles = list(new_dict.keys())
     used_new = set()
     matched = []
 
-    for v_title, _reason, v_url in vanished_entries:
+    for item in vanished_entries:
+        if len(item) == 3:
+            v_title, _vanish_reason, v_url = item
+        else:
+            v_title, v_url = item
+
         best = None
         best_score = 0.0
         best_idx = -1
@@ -2147,49 +2157,504 @@ def _save_vanished_series_report(vanished_entries, index_file):
         logger.warning("Failed to save vanished series report: %s", exc)
 
 
-def _prompt_vanished_deletions(vanished_entries):
-    """Interactively prompt the user to delete vanished series.
+# Tabs are released in confirmed batches of this size. Every URL opened here
+# becomes a real window in the user's browser, and a bad catalogue fetch can
+# put thousands of entries on the vanished list.
+_BROWSER_TAB_BATCH = 20
+
+
+def _open_urls_for_comparison(old_url: str, new_url: str) -> int:
+    """Open old and new series URLs in the default browser.
+
+    Opens the new URL first (it is the current one) and then the old URL
+    so the user can compare them side-by-side. Returns the number opened.
+    """
+    urls = [u for u in (new_url, old_url) if u]
+    if not urls:
+        print("  ⚠ No URLs available to open.")
+        return 0
+    print("  Opening browser tabs...")
+    opened = 0
+    for url in urls:
+        try:
+            webbrowser.open(url, new=2)
+            print(f"    → {url}")
+            opened += 1
+        except Exception as exc:
+            logger.warning("Failed to open %s: %s", url, exc)
+            print(f"    ✗ Could not open: {url}")
+    return opened
+
+
+def _open_rows_in_browser(rows: list) -> int:
+    """Open every row's pair of URLs, in confirmed batches.
+
+    These are real browser windows, not fetches, so the cost lands on the
+    user's desktop rather than on the scrape: opening one tab per URL across a
+    long vanished list is how you lock up a machine. The total is stated first
+    and the tabs are released in batches that have to be confirmed.
+
+    Returns the number of tabs opened.
+    """
+    tab_count = sum(1 for row in rows for url in (row["v_url"], row["n_url"]) if url)
+    if not tab_count:
+        print("  ⚠ No URLs available to open.")
+        return 0
+
+    print(f"\n  This opens {tab_count} browser tab(s) for {len(rows)} entry(s).")
+    if (input("  Continue? (y/n) [n]: ").strip().lower() or "n") != "y":
+        print("  → Cancelled; no tabs opened.")
+        return 0
+
+    opened = 0
+    since_pause = 0
+    for row in rows:
+        if since_pause >= _BROWSER_TAB_BATCH:
+            answer = input(f"  {opened} tab(s) open, {tab_count - opened} to go. Continue? (y/n) [n]: ")
+            if (answer.strip().lower() or "n") != "y":
+                print(f"  → Stopped after {opened} tab(s).")
+                return opened
+            since_pause = 0
+        just_opened = _open_urls_for_comparison(row["v_url"], row["n_url"])
+        opened += just_opened
+        since_pause += just_opened
+    return opened
+
+
+def _rescrape_rows(rows: list, scraper, old_data: dict) -> int:
+    """Re-verify rows' old and new URLs live, updating them in place.
+
+    Every row goes out in a single verification call, so the whole batch costs
+    one sign-in and one connection pool rather than one of each per row. The
+    results come back in input order, which is what pairs them back to rows.
+
+    Only trusts a fetched title when the page was actually reached:
+    verify_vanished_and_candidates returns every entry it was handed, with a
+    reachability flag, so a non-empty result says nothing on its own — the
+    flag is what separates "still there under a new name" from "really gone".
+
+    Returns how many rows were updated from a reachable page.
+    """
+    if not scraper:
+        for row in rows:
+            print(f"  ⚠ Cannot rescrape {row['v_title']}: no scraper available.")
+        return 0
+
+    actionable = []
+    for row in rows:
+        if row["v_url"]:
+            actionable.append(row)
+        else:
+            print(f"  ⚠ Cannot rescrape {row['v_title']}: no old URL available.")
+    if not actionable:
+        return 0
+
+    vanished = [(row["v_title"], row["v_url"]) for row in actionable]
+    candidate_rows = [row for row in actionable if row["new_entry"]]
+    candidates = [row["new_entry"] for row in candidate_rows]
+
+    if len(vanished) == 1:
+        print(f"\n  → Re-scraping: {vanished[0][1]}")
+    else:
+        print(f"\n  → Re-scraping {len(vanished)} old URLs in one pass (one sign-in)...")
+
+    try:
+        # asyncio.run is correct here rather than an await: this prompt is only
+        # reached from the synchronous CLI path (main._run_scrape_and_save ->
+        # show_vanished_series), so no event loop is running. If it ever moves
+        # under an async caller, this and the prompt itself have to become async.
+        verified_vanished, verified_candidates = asyncio.run(
+            scraper.verify_vanished_and_candidates(vanished, candidates)
+        )
+    except Exception as exc:
+        logger.warning("Live re-scrape of %d URL(s) failed: %s", len(vanished), exc)
+        print(f"  ✗ Re-scrape failed: {exc}")
+        return 0
+
+    # One result per entry is the contract; a short list would silently pair a
+    # row with another row's verdict, which is worse than reporting nothing.
+    if len(verified_vanished) != len(actionable) or len(verified_candidates) != len(candidate_rows):
+        logger.warning(
+            "Verification returned %d/%d vanished and %d/%d candidates; skipping row updates",
+            len(verified_vanished),
+            len(actionable),
+            len(verified_candidates),
+            len(candidate_rows),
+        )
+        print("  ✗ Re-scrape returned an unexpected number of results; nothing was changed.")
+        return 0
+
+    updated = set()
+    for row, (new_v_title, new_v_url, reachable) in zip(actionable, verified_vanished, strict=True):
+        v_title = row["v_title"]
+        if reachable:
+            row["v_title"] = new_v_title
+            row["v_url"] = new_v_url or row["v_url"]
+            row["old_entry"] = old_data.get(new_v_title, row["old_entry"])
+            print(f"  ✓ {v_title}: old URL still reachable. Title now: {new_v_title}")
+            updated.add(id(row))
+        else:
+            print(f"  ✗ {v_title}: old URL not reachable — the series really is gone.")
+
+    for row, verified_new in zip(candidate_rows, verified_candidates, strict=True):
+        v_title = row["v_title"]
+        if verified_new.get("_verified_reachable"):
+            row["n_title"] = verified_new.get("title", row["n_title"])
+            row["n_url"] = verified_new.get("url", verified_new.get("link", row["n_url"]))
+            row["new_entry"] = verified_new
+            print(f"  ✓ {v_title}: new candidate verified: {row['n_title']} @ {row['n_url']}")
+            updated.add(id(row))
+        else:
+            error = verified_new.get("_verified_error")
+            suffix = f" ({error})" if error else ""
+            print(f"  ✗ {v_title}: new candidate could not be verified{suffix}.")
+
+    return len(updated)
+
+
+def _rescrape_row(row: dict, scraper, old_data: dict) -> bool:
+    """Re-verify a single row. Returns True when it was updated."""
+    return _rescrape_rows([row], scraper, old_data) > 0
+
+
+def _series_progress_line(entry: dict) -> str:
+    """Return the same progress summary the scraper uses per series.
+
+    Template when sub/wl are available:
+      [seasons]: watched/total watched (Sub:{✓|✗} WL:{✓|✗})
+    Template when they are not (e.g. BS.to):
+      [seasons]: watched/total watched
+    """
+    total_seasons = entry.get("total_seasons", 0) or len(entry.get("seasons", []))
+    total_eps = entry.get("total_episodes", 0)
+    watched_eps = entry.get("watched_episodes", 0)
+    if not total_eps and entry.get("seasons"):
+        total_eps, watched_eps = get_episode_counts(entry)
+    base = f"[{total_seasons}]: {watched_eps}/{total_eps} watched"
+    has_sub = "subscribed" in entry
+    has_wl = "watchlist" in entry
+    if has_sub or has_wl:
+        sub = "✓" if entry.get("subscribed") else "✗"
+        wl = "✓" if entry.get("watchlist") else "✗"
+        base += f" (Sub:{sub} WL:{wl})"
+    return base
+
+
+def _status_diff_line(old_entry: dict, new_entry: dict) -> str | None:
+    """Return a compact status-difference string, or None if identical.
+
+    Empty/missing new entry returns None. Sites without sub/wl fields
+    (e.g. BS.to) only compare watched/total episode counts.
+    """
+    if not new_entry:
+        return None
+
+    def _counts(entry):
+        total = entry.get("total_episodes", 0)
+        watched = entry.get("watched_episodes", 0)
+        if not total and entry.get("seasons"):
+            total, watched = get_episode_counts(entry)
+        return total, watched
+
+    old_total, old_watched = _counts(old_entry)
+    new_total, new_watched = _counts(new_entry)
+
+    old_sub = old_entry.get("subscribed")
+    new_sub = new_entry.get("subscribed")
+    old_wl = old_entry.get("watchlist")
+    new_wl = new_entry.get("watchlist")
+
+    has_sub = old_sub is not None or new_sub is not None
+    has_wl = old_wl is not None or new_wl is not None
+
+    identical = (
+        old_watched == new_watched
+        and old_total == new_total
+        and (not has_sub or bool(old_sub) == bool(new_sub))
+        and (not has_wl or bool(old_wl) == bool(new_wl))
+    )
+    if identical:
+        return None
+
+    parts = []
+    if has_sub and bool(old_sub) != bool(new_sub):
+        parts.append(f"Sub {'✓' if old_sub else '✗'}→{'✓' if new_sub else '✗'}")
+    if has_wl and bool(old_wl) != bool(new_wl):
+        parts.append(f"WL {'✓' if old_wl else '✗'}→{'✓' if new_wl else '✗'}")
+    if old_watched != new_watched or old_total != new_total:
+        parts.append(f"W:{old_watched}/{old_total}→{new_watched}/{new_total}")
+
+    return "⚠ Status differs: " + "  ".join(parts)
+
+
+def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
+    """Show a side-by-side decision table for vanished vs. new series.
+
+    For each vanished entry the user can choose:
+      y = delete old entry (same as d)
+      n = keep old entry (same as k)
+      k = keep old entry
+      d = delete old entry
+      a <action> = apply the action to all remaining rows (e.g. "a d")
+      r = re-scrape the old URL to verify it live (updates candidate info)
+      o = open old + new URLs in browser to compare visually
+      s = skip all remaining entries (keep them)
 
     Args:
-        vanished_entries: list of (title, reason, url) tuples
+        vanished_entries: list of (title, reason, url) tuples for vanished series.
+        new_dict: dict title -> series data for newly scraped series.
+        old_data: dict title -> series data for the current index.
+        scraper: optional scraper instance for live re-scraping of old URLs.
 
     Returns:
-        list of titles confirmed for deletion
+        list of titles confirmed for deletion.
     """
+    matched = _match_vanished_to_new(vanished_entries, new_dict)
     to_delete = []
+    apply_to_all = None  # action to apply to all remaining rows
     skip_all = False
-    delete_all = False
 
-    for i, (title, _reason, _url) in enumerate(vanished_entries, 1):
-        if skip_all:
-            break
-        if delete_all:
-            to_delete.append(title)
+    print("\n  Compare each vanished series with its best matching new counterpart.")
+    print(
+        "  Actions per row: [y]es=delete  [n]o=keep  [k]eep  [d]elete  "
+        "[a <action>]=all  [r]escrape  [o]pen URLs  [s]kip all"
+    )
+    print()
+
+    # Compute column widths from actual content so every line aligns.
+    term_w = shutil.get_terminal_size().columns
+    max_content_w = max(35, term_w // 2 - 8)
+    left_items = []
+    right_items = []
+    for v_title, v_url, n_title, n_url, _reason in matched:
+        if v_title is None:
             continue
+        left_entry = old_data.get(v_title, {})
+        right_entry = new_dict.get(n_title, {}) if n_title else {}
+        left_items.append(v_title)
+        left_items.append(v_url or "")
+        left_items.append(_series_progress_line(left_entry))
+        diff = _status_diff_line(left_entry, right_entry)
+        if diff:
+            left_items.append(diff)
+        right_items.append(n_title or "—")
+        right_items.append(n_url or "")
+        right_items.append(_series_progress_line(right_entry) if right_entry else "")
+    content_w = min(
+        max_content_w,
+        max(
+            max((len(t) for t in left_items), default=0),
+            max((len(t) for t in right_items), default=0),
+            len("Old (index)"),
+            len("New (site)"),
+        ),
+    )
+    sep = " │ "
+    match_w = 7
+    status_w = 12
+    indent = "  "
+    num_w = 3
 
-        choice = (
-            input(f'  [{i}/{len(vanished_entries)}] Delete "{title}" from index? (y/n/a=all/s=skip all) [n]: ')
-            .strip()
-            .lower()
-            or "n"
+    def _trunc(text: str, width: int) -> str:
+        if len(text) <= width:
+            return text
+        return text[: width - 1] + "…"
+
+    def _cell(text: str, width: int) -> str:
+        return _trunc(text, width).ljust(width)
+
+    def _line(idx: str, left: str, right: str, match: str = "", status: str = "", rule: str = "") -> str:
+        if rule:
+            cells = sep.join(("─" * content_w, "─" * content_w, "─" * match_w, "─" * status_w))
+            return f"{indent}{rule}{'─' * (num_w + 1)}{cells}"
+        match_field = _cell(match, match_w)
+        status_field = _cell(status, status_w)
+        cells = sep.join((_cell(left, content_w), _cell(right, content_w), match_field, status_field))
+        return f"{indent}{idx:>{num_w}}  {cells}"
+
+    def _print_row(
+        i: int, v_title: str, v_url: str, old_entry: dict, n_title: str, n_url: str, new_entry: dict, reason: str
+    ) -> None:
+        right_title = n_title or "—"
+        status = _status_diff_line(old_entry, new_entry)
+        if not new_entry:
+            status_tag = "no match"
+        elif status:
+            status_tag = "differs ⚠"
+        else:
+            status_tag = "identical ✓"
+        print(_line(str(i), v_title, right_title, match=reason, status=status_tag))
+        print(_line("", v_url or "", n_url or ""))
+        print(_line("", _series_progress_line(old_entry), _series_progress_line(new_entry) if new_entry else ""))
+        if status:
+            print(_line("", status, ""))
+        print()
+
+    header = sep.join(
+        (
+            f"{'Old (index)':<{content_w}}",
+            f"{'New (site)':<{content_w}}",
+            f"{'Match':<{match_w}}",
+            f"{'Status':<{status_w}}",
         )
-        if choice == "y":
-            to_delete.append(title)
-        elif choice == "a":
-            # "all" is the one irreversible keystroke in this loop: it deletes
-            # every remaining entry without showing them. A bad catalogue fetch
-            # can put thousands of perfectly good series on this list, so the
-            # count has to be stated and confirmed before it runs.
-            remaining = len(vanished_entries) - i + 1
-            print(f"\n  [WARN] This deletes {remaining} series from the index, including this one.")
-            print("  Deleted entries lose their stored watch history.")
-            if input(f"  Type 'DELETE {remaining}' to confirm: ").strip() != f"DELETE {remaining}":
-                print("  -> Not confirmed; nothing deleted for this entry.")
+    )
+    print(f"{indent}  {'#':>{num_w}}  {header}")
+    print(_line("", "", "", rule="─"))
+
+    # Pre-render rows so indices are stable even after live re-scraping
+    rows = []
+    for v_title, v_url, n_title, n_url, reason in matched:
+        if v_title is None:
+            # Extra new series with no vanished counterpart — not actionable here
+            continue
+        old_entry = old_data.get(v_title, {})
+        new_entry = new_dict.get(n_title, {}) if n_title else {}
+        rows.append(
+            {
+                "v_title": v_title,
+                "v_url": v_url,
+                "old_entry": old_entry,
+                "n_title": n_title,
+                "n_url": n_url,
+                "new_entry": new_entry,
+                "reason": reason or "none",
+            }
+        )
+
+    for i, row in enumerate(rows, 1):
+        if skip_all or apply_to_all is not None:
+            break
+
+        current_idx = i - 1
+        v_title = row["v_title"]
+        v_url = row["v_url"]
+        old_entry = row["old_entry"]
+        n_title = row["n_title"]
+        n_url = row["n_url"]
+        new_entry = row["new_entry"]
+        reason = row["reason"]
+
+        # Print current row
+        _print_row(i, v_title, v_url, old_entry, n_title, n_url, new_entry, reason)
+
+        while True:
+            prompt = (
+                f'  [{i}/{len(rows)}] Action for "{v_title}"? '
+                f"(y=delete n=keep k=keep d=delete r=rescrape o=open a <action>=all s=skip all) [n]: "
+            )
+            choice = input(prompt).strip().lower() or "n"
+
+            if choice == "s":
+                skip_all = True
+                print("  → Skipping all remaining vanished entries.")
+                break
+
+            if choice.startswith("a "):
+                apply_to_all = choice[2:].strip()
+                if apply_to_all not in {"y", "n", "k", "d", "r", "o"}:
+                    print(f"  ⚠ Unknown apply-to-all action '{apply_to_all}'. Use y/n/k/d/r/o.")
+                    apply_to_all = None
+                    continue
+                print(f"  → Apply '{apply_to_all}' to all {len(rows) - i + 1} remaining entries.")
+                # Apply to the current row immediately; the rest are handled after the loop.
+                if apply_to_all in ("y", "d"):
+                    # Deleting "all" is the one irreversible keystroke in this
+                    # loop: it drops every remaining entry without showing them.
+                    # A bad catalogue fetch can put thousands of perfectly good
+                    # series on this list, so the count has to be stated and
+                    # confirmed before it runs.
+                    remaining_count = len(rows) - i + 1
+                    print(f"\n  [WARN] This deletes {remaining_count} series from the index, including this one.")
+                    print("  Deleted entries lose their stored watch history.")
+                    typed = input(f"  Type 'DELETE {remaining_count}' to confirm: ").strip()
+                    if typed != f"DELETE {remaining_count}":
+                        print("  → Not confirmed; nothing deleted. Back to this entry.")
+                        apply_to_all = None
+                        continue
+                    total_eps = old_entry.get("total_episodes", 0)
+                    watched_eps = old_entry.get("watched_episodes", 0)
+                    if not total_eps and old_entry.get("seasons"):
+                        total_eps, watched_eps = get_episode_counts(old_entry)
+                    if watched_eps and total_eps:
+                        print(f"  ⚠ {v_title} has watched progress: {watched_eps}/{total_eps} episodes.")
+                    to_delete.append(v_title)
+                    print("  → Marked for deletion.")
+                elif apply_to_all == "o":
+                    _open_urls_for_comparison(v_url, n_url)
+                elif apply_to_all == "r":
+                    _rescrape_row(row, scraper, old_data)
+                else:
+                    print("  → Kept in index.")
+                break
+
+            if choice in ("k", "n"):
+                print("  → Kept in index.")
+                break
+
+            if choice in ("d", "y"):
+                # If the old entry had progress, warn the user.
+                total_eps = old_entry.get("total_episodes", 0)
+                watched_eps = old_entry.get("watched_episodes", 0)
+                if not total_eps and old_entry.get("seasons"):
+                    total_eps, watched_eps = get_episode_counts(old_entry)
+                if watched_eps and total_eps:
+                    print(f"\n  ⚠ This entry has watched progress: {watched_eps}/{total_eps} episodes.")
+                    print("    Make sure the new entry on the site reflects the same progress,")
+                    print("    otherwise the next scrape may report those episodes as unwatched.")
+                if choice == "d":
+                    confirm = input(f'  Confirm delete "{v_title}"? (y/n) [n]: ').strip().lower() or "n"
+                else:
+                    confirm = "y"
+                if confirm == "y":
+                    to_delete.append(v_title)
+                    print("  → Marked for deletion.")
+                else:
+                    print("  → Not deleted.")
+                break
+
+            if choice == "o":
+                _open_urls_for_comparison(v_url, n_url)
                 continue
-            to_delete.append(title)
-            delete_all = True
-        elif choice == "s":
-            skip_all = True
+
+            if choice == "r":
+                _rescrape_row(row, scraper, old_data)
+
+                # Re-print the row, which the rescrape may have updated
+                v_title = row["v_title"]
+                v_url = row["v_url"]
+                old_entry = row["old_entry"]
+                n_title = row["n_title"]
+                n_url = row["n_url"]
+                new_entry = row["new_entry"]
+                print("\n  Updated row:")
+                _print_row(i, v_title, v_url, old_entry, n_title, n_url, new_entry, reason)
+                continue
+
+            print("  ⚠ Unknown choice. Use y/n/k/d/r/o/a/s.")
+
+    # Apply the chosen action to all remaining rows
+    if apply_to_all is not None:
+        remaining = rows[current_idx + 1 :] if "current_idx" in locals() else rows
+        action = apply_to_all
+        if action in ("y", "d"):
+            print(f"\n  Applying '{action}' to {len(remaining)} remaining entries...")
+            for row in remaining:
+                v_title = row["v_title"]
+                old_entry = row["old_entry"]
+                total_eps = old_entry.get("total_episodes", 0)
+                watched_eps = old_entry.get("watched_episodes", 0)
+                if not total_eps and old_entry.get("seasons"):
+                    total_eps, watched_eps = get_episode_counts(old_entry)
+                if watched_eps and total_eps:
+                    print(f"  ⚠ {v_title} has watched progress: {watched_eps}/{total_eps} episodes.")
+                to_delete.append(v_title)
+            print(f"  → Marked {len(remaining)} entries for deletion.")
+        elif action == "o":
+            _open_rows_in_browser(remaining)
+        elif action == "r":
+            _rescrape_rows(remaining, scraper, old_data)
+        else:
+            print(f"\n  Kept all {len(remaining)} remaining entries in the index.")
 
     return to_delete
 
@@ -2332,7 +2797,8 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                     print(f"      old: {url}")
                 print(separator)
 
-            to_delete = _prompt_vanished_deletions(vanished)
+            new_dict_for_prompt = new_dict if new_data is not None else {}
+            to_delete = _prompt_vanished_table(vanished, new_dict_for_prompt, old_data, scraper=scraper)
 
             if to_delete and index_file:
                 removed = remove_series_from_index(index_file, to_delete)

@@ -548,10 +548,33 @@ def print_header():
     print("=" * 60 + "\n")
 
 
+def _print_alert_block(entries, heading, advice):
+    """Print one titled alert block, or nothing when there is nothing to flag."""
+    if not entries:
+        return
+    entries.sort(key=lambda s: s.get("title", ""))
+    print("\n" + "⚠" * 35)
+    print(f"⚠ {len(entries)} {heading}:")
+    print("─" * 70)
+    for s in entries:
+        print(f"  • {s.get('title')}")
+    print("─" * 70)
+    print(f"  {advice}")
+    print("⚠" * 35)
+
+
 def print_completed_series_alerts(index_manager=None, allow_rescrape=True):
     """Alert user about series that need attention:
     1. Fully watched but not subscribed
-    2. Ongoing (started but incomplete) but not on watchlist
+    2. Started (at least one episode watched) but not subscribed
+    3. Ongoing (started but incomplete) but not on watchlist
+
+    The index treats "has progress" and "subscribed" as the same state: any
+    series with a watched episode is meant to be subscribed, and an unfinished
+    one is meant to be on the watchlist because the watchlist means "waiting
+    for more episodes". Anything else is drift between the site and the index,
+    which is what these alerts exist to surface. That is also why the report's
+    "watched" category requires `subscribed` -- see IndexManager.get_full_report.
 
     When allow_rescrape is False, the rescrape prompt is suppressed
     (used to prevent recursive prompts during a rescrape).
@@ -564,6 +587,7 @@ def print_completed_series_alerts(index_manager=None, allow_rescrape=True):
             return
 
         completed_not_sub = []
+        started_not_sub = []
         ongoing_no_wl = []
 
         for s in index_manager.series_index.values():
@@ -571,48 +595,58 @@ def print_completed_series_alerts(index_manager=None, allow_rescrape=True):
             subscribed = s.get("subscribed", False)
             watchlist = s.get("watchlist", False)
 
-            if total > 0 and watched == total and not subscribed:
-                completed_not_sub.append(s)
-            elif total > 0 and 0 < watched < total and not watchlist:
+            if total <= 0 or watched <= 0:
+                continue
+
+            # Missing subscription and missing watchlist are separate problems,
+            # so they are collected independently rather than as one elif chain:
+            # a part-watched entry that is neither used to hide behind the
+            # watchlist alert and never showed up as a subscription problem.
+            if not subscribed:
+                if watched == total:
+                    completed_not_sub.append(s)
+                else:
+                    started_not_sub.append(s)
+            if watched < total and not watchlist:
                 ongoing_no_wl.append(s)
 
-        if completed_not_sub:
-            completed_not_sub.sort(key=lambda s: s.get("title", ""))
-            print("\n" + "⚠" * 35)
-            print(f"⚠ {len(completed_not_sub)} COMPLETED ANIME — NOT SUBSCRIBED:")
-            print("─" * 70)
-            for s in completed_not_sub:
-                print(f"  • {s.get('title')}")
-            print("─" * 70)
-            print("  Consider subscribing or leaving as-is.")
-            print("⚠" * 35)
+        _print_alert_block(
+            completed_not_sub,
+            "COMPLETED ANIME — NOT SUBSCRIBED",
+            "Consider subscribing or leaving as-is.",
+        )
+        _print_alert_block(
+            started_not_sub,
+            "STARTED ANIME — NOT SUBSCRIBED",
+            "A started anime is meant to be subscribed. Fix it on the site, then rescrape.",
+        )
 
-            if allow_rescrape:
-                rescrape = input("\nRescrape these anime to update Sub/WL status? (y/n): ").strip().lower()
-                if rescrape == "y":
-                    urls = [s.get("url") for s in completed_not_sub if s.get("url")]
-                    if not urls:
-                        print("✗ No URLs found for these anime")
-                    else:
-                        print(f"\n→ Rescraping {len(urls)} completed anime...")
-                        _run_scrape_and_save(
-                            run_kwargs={"url_list": urls, "parallel": False},
-                            description=f"Rescrape completed anime ({len(urls)})",
-                            success_msg=f"Rescrape completed! {len(urls)} anime updated.",
-                            no_data_msg="No data scraped",
-                            post_scrape_allow_rescrape=False,
-                        )
+        # One offer covering both subscription problems: a rescrape re-reads the
+        # site's Sub/WL state, so it is what turns a fix made on the site into an
+        # index update. The two lists cannot overlap (watched == total splits
+        # them), so the URLs need no de-duplication.
+        needs_sub_fix = completed_not_sub + started_not_sub
+        if needs_sub_fix and allow_rescrape:
+            rescrape = input("\nRescrape these anime to update Sub/WL status? (y/n): ").strip().lower()
+            if rescrape == "y":
+                urls = [s.get("url") for s in needs_sub_fix if s.get("url")]
+                if not urls:
+                    print("✗ No URLs found for these anime")
+                else:
+                    print(f"\n→ Rescraping {len(urls)} unsubscribed anime...")
+                    _run_scrape_and_save(
+                        run_kwargs={"url_list": urls, "parallel": False},
+                        description=f"Rescrape unsubscribed anime ({len(urls)})",
+                        success_msg=f"Rescrape completed! {len(urls)} anime updated.",
+                        no_data_msg="No data scraped",
+                        post_scrape_allow_rescrape=False,
+                    )
 
-        if ongoing_no_wl:
-            ongoing_no_wl.sort(key=lambda s: s.get("title", ""))
-            print("\n" + "⚠" * 35)
-            print(f"⚠ {len(ongoing_no_wl)} ONGOING ANIME — NOT ON WATCHLIST:")
-            print("─" * 70)
-            for s in ongoing_no_wl:
-                print(f"  • {s.get('title')}")
-            print("─" * 70)
-            print("  Consider adding them to your watchlist.")
-            print("⚠" * 35)
+        _print_alert_block(
+            ongoing_no_wl,
+            "ONGOING ANIME — NOT ON WATCHLIST",
+            "Consider adding them to your watchlist.",
+        )
 
     except Exception as e:
         logger.error("Error printing series alerts: %s", e)

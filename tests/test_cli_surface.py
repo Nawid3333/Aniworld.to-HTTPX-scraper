@@ -22,7 +22,7 @@ import re
 import pytest
 
 import main
-from tests._support import captured_output, scripted_input
+from tests._support import captured_output, scripted_input, series
 
 
 @pytest.fixture
@@ -188,3 +188,132 @@ class TestShowMenu:
         """A gap means an option was removed and the rest never renumbered."""
         options = self._options()
         assert options == set(range(max(options) + 1)), f"menu numbering is not contiguous: {sorted(options)}"
+
+
+class _FakeIndex:
+    """Just enough IndexManager for the alert pass: it only reads series_index."""
+
+    def __init__(self, entries):
+        self.series_index = {e["title"]: e for e in entries}
+
+
+def _alert_output(entries, *, answers=("n",), allow_rescrape=False):
+    with scripted_input(*answers, default="n"), captured_output() as out:
+        main.print_completed_series_alerts(_FakeIndex(entries), allow_rescrape=allow_rescrape)
+    return out.getvalue()
+
+
+def _flagged_under(output: str, heading: str) -> set[str]:
+    """Titles listed under one alert heading, up to the block's closing rule."""
+    if heading not in output:
+        return set()
+    tail = output.split(heading, 1)[1]
+    body = tail.split("─" * 70)[1] if ("─" * 70) in tail else ""
+    return {line.strip().lstrip("• ").strip() for line in body.splitlines() if line.strip().startswith("•")}
+
+
+class TestSubscriptionAlerts:
+    """Progress and subscription are the same state in this index.
+
+    Any series with a watched episode is meant to be subscribed, and an
+    unfinished one is meant to be on the watchlist ("waiting for more
+    episodes"). These tests pin that rule so the alerts cannot be quietly
+    narrowed again -- the started-but-unsubscribed case in particular used to
+    be invisible whenever the series was on the watchlist.
+    """
+
+    COMPLETED = "COMPLETED"
+    STARTED = "STARTED"
+    ONGOING = "ONGOING"
+
+    def test_finished_but_unsubscribed_is_flagged(self):
+        entry = series("Done", seasons=1, watched=12, subscribed=False, watchlist=False)
+        assert "Done" in _flagged_under(_alert_output([entry]), self.COMPLETED)
+
+    def test_started_but_unsubscribed_is_flagged(self):
+        entry = series("Halfway", seasons=1, watched=6, subscribed=False, watchlist=False)
+        assert "Halfway" in _flagged_under(_alert_output([entry]), self.STARTED)
+
+    def test_started_but_unsubscribed_is_flagged_even_when_watchlisted(self):
+        """The regression: the watchlist used to mask a missing subscription."""
+        entry = series("Halfway", seasons=1, watched=6, subscribed=False, watchlist=True)
+        assert "Halfway" in _flagged_under(_alert_output([entry]), self.STARTED)
+
+    def test_a_subscribed_series_raises_no_subscription_alert(self):
+        entries = [
+            series("Done", seasons=1, watched=12, subscribed=True, watchlist=False),
+            series("Halfway", seasons=1, watched=6, subscribed=True, watchlist=True),
+        ]
+        output = _alert_output(entries)
+        assert not _flagged_under(output, self.COMPLETED)
+        assert not _flagged_under(output, self.STARTED)
+
+    def test_an_unstarted_series_is_never_flagged(self):
+        """Nothing watched means nothing to subscribe to yet."""
+        entry = series("Untouched", seasons=1, watched=0, subscribed=False, watchlist=False)
+        output = _alert_output([entry])
+        assert not _flagged_under(output, self.COMPLETED)
+        assert not _flagged_under(output, self.STARTED)
+        assert not _flagged_under(output, self.ONGOING)
+
+    def test_unfinished_and_unwatchlisted_is_flagged(self):
+        entry = series("Halfway", seasons=1, watched=6, subscribed=True, watchlist=False)
+        assert "Halfway" in _flagged_under(_alert_output([entry]), self.ONGOING)
+
+    def test_both_problems_are_reported_separately(self):
+        """Missing subscription and missing watchlist are different fixes."""
+        entry = series("Halfway", seasons=1, watched=6, subscribed=False, watchlist=False)
+        output = _alert_output([entry])
+        assert "Halfway" in _flagged_under(output, self.STARTED)
+        assert "Halfway" in _flagged_under(output, self.ONGOING)
+
+    def test_a_finished_series_is_not_asked_for_a_watchlist_entry(self):
+        """The watchlist means 'waiting for more episodes', so a finished one is fine."""
+        entry = series("Done", seasons=1, watched=12, subscribed=True, watchlist=False)
+        assert not _flagged_under(_alert_output([entry]), self.ONGOING)
+
+
+class TestSubscriptionAlertRescrape:
+    """The offer to rescrape must cover every unsubscribed series, and only those."""
+
+    @staticmethod
+    def _capture_rescrape(monkeypatch, entries, answers):
+        calls = []
+        monkeypatch.setattr(main, "_run_scrape_and_save", lambda **kw: calls.append(kw))
+        with scripted_input(*answers, default="n"), captured_output():
+            main.print_completed_series_alerts(_FakeIndex(entries), allow_rescrape=True)
+        return calls
+
+    @staticmethod
+    def _entries():
+        return [
+            series("Done", seasons=1, watched=12, subscribed=False, watchlist=False),
+            series("Halfway", seasons=1, watched=6, subscribed=False, watchlist=False),
+            series("Fine", seasons=1, watched=12, subscribed=True, watchlist=False),
+        ]
+
+    def test_yes_rescrapes_finished_and_started_together(self, monkeypatch):
+        calls = self._capture_rescrape(monkeypatch, self._entries(), ["y"])
+        assert len(calls) == 1, "both unsubscribed lists should share one rescrape"
+        urls = calls[0]["run_kwargs"]["url_list"]
+        assert len(urls) == 2
+        assert any("done" in u for u in urls) and any("halfway" in u for u in urls)
+
+    def test_a_correctly_subscribed_series_is_not_rescraped(self, monkeypatch):
+        calls = self._capture_rescrape(monkeypatch, self._entries(), ["y"])
+        assert not any("fine" in u for u in calls[0]["run_kwargs"]["url_list"])
+
+    def test_declining_rescrapes_nothing(self, monkeypatch):
+        assert self._capture_rescrape(monkeypatch, self._entries(), ["n"]) == []
+
+    def test_the_rescrape_cannot_recurse(self, monkeypatch):
+        """The nested run must not offer the same prompt again."""
+        calls = self._capture_rescrape(monkeypatch, self._entries(), ["y"])
+        assert calls[0]["post_scrape_allow_rescrape"] is False
+
+    def test_suppressed_mode_asks_nothing(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(main, "_run_scrape_and_save", lambda **kw: calls.append(kw))
+        with scripted_input(default="y") as asked, captured_output():
+            main.print_completed_series_alerts(_FakeIndex(self._entries()), allow_rescrape=False)
+        assert asked == [] and calls == []

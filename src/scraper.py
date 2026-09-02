@@ -2801,19 +2801,32 @@ class AniWorldScraper:
 
     async def verify_vanished_and_candidates(
         self,
-        vanished_entries: list[tuple[str, str]],
+        vanished_entries: list[tuple[str, ...]],
         candidate_entries: list[dict],
-    ) -> tuple[list[tuple[str, str]], list[dict]]:
+    ) -> tuple[list[tuple[str, str, bool]], list[dict]]:
         """Re-fetch vanished URLs and rename candidates to verify accuracy.
 
         Args:
-            vanished_entries: list of (title, url) tuples for vanished series.
+            vanished_entries: list of (title, url) or (title, reason, url)
+                tuples for vanished series. Both shapes arrive here: the index
+                builds 3-tuples with a vanish reason, the per-row prompt builds
+                bare 2-tuples.
             candidate_entries: list of new-entry dicts that might be renames.
 
         Returns:
-            Tuple of (verified_vanished, verified_candidates) with updated
-            titles and reachability flags stored in dict metadata.
+            Tuple of (verified_vanished, verified_candidates). Each verified
+            vanished entry is (title, url, reachable). Callers must test
+            `reachable`: an unreachable URL is still returned, carrying its
+            original title, so the list being non-empty proves nothing.
         """
+        normalised_vanished: list[tuple[str, str]] = []
+        for item in vanished_entries:
+            if len(item) == 3:
+                v_title, _reason, v_url = item
+            else:
+                v_title, v_url = item
+            normalised_vanished.append((v_title, v_url))
+
         client = httpx.AsyncClient(
             http2=True,
             headers={"User-Agent": UA},
@@ -2831,11 +2844,12 @@ class AniWorldScraper:
         )
         try:
             await self._login_client(client)
-            all_urls = [url for _, url in vanished_entries if url]
+            all_urls = [url for _, url in normalised_vanished if url]
             all_urls.extend(e.get("url", e.get("link", "")) for e in candidate_entries if e.get("url") or e.get("link"))
             unique_urls = sorted(set(all_urls))
             if not unique_urls:
-                return vanished_entries, candidate_entries
+                # Nothing was fetched, so nothing is verified as reachable.
+                return [(t, u, False) for t, u in normalised_vanished], candidate_entries
 
             print(f"\n→ Verifying {len(unique_urls)} vanished/rename URL(s) with fresh scrape...")
             results = await asyncio.gather(
@@ -2850,12 +2864,12 @@ class AniWorldScraper:
                     info_by_url[res["url"]] = res
 
             verified_vanished = []
-            for title, url in vanished_entries:
+            for title, url in normalised_vanished:
                 info = info_by_url.get(url, {})
                 if info.get("reachable"):
-                    verified_vanished.append((info.get("title") or title, url))
+                    verified_vanished.append((info.get("title") or title, url, True))
                 else:
-                    verified_vanished.append((title, url))
+                    verified_vanished.append((title, url, False))
 
             verified_candidates = []
             for entry in candidate_entries:

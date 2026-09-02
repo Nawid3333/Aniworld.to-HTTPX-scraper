@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from src.index_manager import (
+    IndexManager,
     _find_series,
     _get_season_stats,
     _score_match,
@@ -28,7 +29,7 @@ from src.index_manager import (
     group_episodes_by_season,
     show_changes,
 )
-from tests._support import SUPPORTS_SUBSCRIPTIONS, captured_output, scripted_input, season, series
+from tests._support import SUPPORTS_SUBSCRIPTIONS, captured_output, scripted_input, season, series, write_index
 
 
 @pytest.fixture
@@ -250,3 +251,40 @@ class TestScoreMatch:
             "https://x/anime/stream/sousou-no-frieren",
         )
         assert score == 1.0
+
+
+@pytest.mark.skipif(not SUPPORTS_SUBSCRIPTIONS, reason="this site has no subscribe/watchlist state")
+class TestWatchedCategoryMeansSubscribedAndComplete:
+    """ "watched" deliberately requires `subscribed`, and that is not a bug.
+
+    In this index a series with progress is meant to be subscribed, so
+    "finished but unsubscribed" is drift, not a category -- main.py's
+    print_completed_series_alerts is what surfaces it, with an offer to
+    rescrape. Dropping the `subscribed` filter here would turn a state the
+    program is supposed to shout about into a quietly correct-looking row,
+    which is why this test exists.
+    """
+
+    @staticmethod
+    def _categories(tmp_path, entries):
+        path = write_index(entries, tmp_path)
+        with captured_output():
+            manager = IndexManager(path)
+            report = manager.get_full_report()
+        return {name: set(block.get("titles", [])) for name, block in report["categories"].items()}
+
+    def test_finished_and_subscribed_counts_as_watched(self, tmp_path):
+        entry = series("Done", seasons=[season(1, episodes=12, watched=12)], subscribed=True, watchlist=False)
+        assert "Done" in self._categories(tmp_path, [entry])["watched"]
+
+    def test_finished_but_unsubscribed_is_not_listed_as_watched(self, tmp_path):
+        """It is drift; the CLI alert reports it instead of the report burying it."""
+        entry = series("Done", seasons=[season(1, episodes=12, watched=12)], subscribed=False, watchlist=False)
+        assert "Done" not in self._categories(tmp_path, [entry])["watched"]
+
+    def test_a_watchlisted_series_is_waiting_not_watched(self, tmp_path):
+        """The watchlist means 'waiting for more episodes'."""
+        entry = series("Waiting", seasons=[season(1, episodes=12, watched=12)], subscribed=False, watchlist=True)
+        categories = self._categories(tmp_path, [entry])
+        assert "Waiting" in categories["waiting_for_new_episodes"]
+        assert "Waiting" not in categories["watched"]
