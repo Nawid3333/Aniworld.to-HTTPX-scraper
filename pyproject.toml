@@ -34,6 +34,17 @@ include = ["config*", "src*"]
 # a reference to copy from and is not just told to find a file that is not
 # there. See the project-home note in config/config.py for where it should go.
 
+# ==================== RELEASE AUTOMATION ====================
+# Version is bumped automatically by python-semantic-release, driven by
+# Conventional Commits (feat:/fix:/BREAKING CHANGE) on every push to
+# main -- see .github/workflows/auto-release.yml. Don't bump `version`
+# above by hand; the next automated run will just move it again.
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+branch = "main"
+commit_message = "chore(release): {version}"
+commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
 # ==================== TESTS ====================
 # Run the suite with:      python -m pytest
 # With coverage:           python -m pytest --cov

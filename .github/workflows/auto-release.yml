@@ -1,0 +1,50 @@
+# Bumps the version and cuts a release automatically, driven by Conventional
+# Commits on every push to main. python-semantic-release inspects the
+# commits since the last tag: a `fix:` bumps patch, `feat:` bumps minor, a
+# "BREAKING CHANGE:" footer bumps major; anything else (chore:, ci:, docs:,
+# test:, refactor:, ...) does not trigger a release at all.
+#
+# This only bumps pyproject.toml, commits, tags, and publishes the GitHub
+# Release -- release.yml (triggered by `release: published`) still does the
+# actual build/test/attach, exactly as it does for a manually-cut release.
+#
+# Needs a PAT in the RELEASE_PAT secret, not the default GITHUB_TOKEN: a push
+# or release made with the default token does not trigger other workflows
+# (GitHub's own loop-prevention), which would silently stop release.yml from
+# ever running.
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Python Semantic Release
+        uses: python-semantic-release/python-semantic-release@v10.6.2
+        with:
+          github_token: ${{ secrets.RELEASE_PAT }}
+          git_committer_name: "github-actions[bot]"
+          git_committer_email: "github-actions[bot]@users.noreply.github.com"
+          build: false
+          changelog: false
+          commit: true
+          tag: true
+          push: true
+          vcs_release: true
