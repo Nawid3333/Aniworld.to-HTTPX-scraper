@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -642,7 +643,7 @@ def _parse_episodes(html: str) -> list[dict] | None:
     return _parse_episodes_from_doc(doc)
 
 
-def make_doc(html: str):
+def make_doc(html: str) -> lxml.html.HtmlElement | None:
     """Build the lxml tree for a season page, or None if the body is not markup.
 
     Split out so a caller can run more than one check against a single parse:
@@ -977,6 +978,19 @@ class ScrapingPausedError(Exception):
     pass
 
 
+class _AsyncGetClient(Protocol):
+    """Subset of httpx.AsyncClient that only needs GET."""
+
+    async def get(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
+
+
+class _AsyncClient(_AsyncGetClient, Protocol):
+    """Subset of httpx.AsyncClient used by login and account helpers."""
+
+    async def post(self, *args: Any, **kwargs: Any) -> httpx.Response: ...
+    async def aclose(self) -> None: ...
+
+
 # ── AniWorldScraper (httpx) ────────────────────────────────────────────────
 
 
@@ -1219,7 +1233,7 @@ class AniWorldScraper:
     def get_ignored_slugs(self) -> set[str]:
         return slug_keys(self.get_series_slug_from_url(s.get("url", "")) for s in self.load_ignored_series())
 
-    async def _revalidate_ignored_series(self, client: httpx.AsyncClient):
+    async def _revalidate_ignored_series(self, client: _AsyncClient):
         """Re-check ignored series to see if they are still empty/404.
 
         Notification-only — does not auto-remove entries.  Prints a warning
@@ -1557,7 +1571,7 @@ class AniWorldScraper:
 
     # ── Async internals ─────────────────────────────────────────────────────
 
-    async def _login_client(self, client: httpx.AsyncClient, verify: bool = True) -> None:
+    async def _login_client(self, client: _AsyncClient, verify: bool = True) -> None:
         """Log in an existing httpx client to aniworld.to.
 
         verify: fetch a known-good page afterwards and confirm the session
@@ -1622,7 +1636,7 @@ class AniWorldScraper:
         await self._login_client(client, verify=verify)
         return client
 
-    async def _get_all_series(self, client: httpx.AsyncClient) -> list[dict]:
+    async def _get_all_series(self, client: _AsyncGetClient) -> list[dict]:
         """Fetch the full anime catalogue from the active host."""
         resp = await self._get(client, _series_list_url(self.site_url))
         doc = make_doc(resp.text)
@@ -1684,7 +1698,7 @@ class AniWorldScraper:
 
         return series
 
-    async def _get_account_series(self, client: httpx.AsyncClient, source: str = "both") -> list[dict]:
+    async def _get_account_series(self, client: _AsyncClient, source: str = "both") -> list[dict]:
         """Fetch subscribed/watchlist anime from account pages.
 
         Args:
@@ -1830,7 +1844,7 @@ class AniWorldScraper:
             return_exceptions=True,
         )
 
-    async def _scrape_one_series(self, client: httpx.AsyncClient, info: dict) -> dict:
+    async def _scrape_one_series(self, client: _AsyncGetClient, info: dict) -> dict:
         """Scrape a single anime: all seasons, episodes, subscription status."""
         t_start = time.perf_counter()
         url = info.get("scrape_url", info["url"])

@@ -42,7 +42,7 @@ from src.scraper import (  # noqa: E402
 
 def tree_repr(doc) -> str:
     """Serialise a tree so a test can prove a reader did not edit it."""
-    return lxml.html.tostring(doc, encoding="unicode")
+    return lxml.html.tostring(doc, encoding="unicode")  # type: ignore[return-value]
 
 
 class TempFileCase(unittest.TestCase):
@@ -618,9 +618,9 @@ class TestCatalogueLinkExtraction(unittest.TestCase):
     </body></html>
     """
 
-    def _catalogue(self, html):
+    def _catalogue(self, html) -> lxml.html.HtmlElement:
         doc = make_doc(html)
-        self.assertIsNotNone(doc)
+        assert doc is not None
         return doc
 
     def test_the_container_links_are_read_with_titles_and_alt_titles(self):

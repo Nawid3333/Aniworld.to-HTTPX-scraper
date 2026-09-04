@@ -19,11 +19,8 @@ import shutil
 import sys
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import Protocol
 from urllib.parse import urlparse
-
-if TYPE_CHECKING:
-    from src.index_manager import IndexManager
 
 from config.config import (
     DATA_DIR,
@@ -52,6 +49,11 @@ from src.scraper import AniWorldScraper, ScrapingPausedError
 from src.slug import slug_keys
 from src.term import cinput as input
 from src.term import cprint as print
+
+
+class _IndexLike(Protocol):
+    series_index: dict[str, dict]
+
 
 # Global active site URL (set by domain probing)
 ACTIVE_SITE_URL: str | None = None
@@ -529,7 +531,7 @@ _file_handler = logging.handlers.RotatingFileHandler(
 )
 _file_handler.setFormatter(term.PlainFormatter(_LOG_FORMAT))
 
-_console_handler = logging.StreamHandler()
+_console_handler = logging.StreamHandler(sys.stdout)
 _console_handler.setFormatter(term.ColorFormatter(_LOG_FORMAT))
 
 logging.basicConfig(
@@ -1079,7 +1081,7 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
         print("✗ No genre matched. Please try again.")
 
 
-def _suggest_something_to_watch(idx_mgr: IndexManager | None = None):
+def _suggest_something_to_watch(idx_mgr: _IndexLike | None = None):
     """Suggest unwatched anime from the index, optionally filtered by genre.
 
     Loads the genre index and presents a list of unwatched anime. The user
