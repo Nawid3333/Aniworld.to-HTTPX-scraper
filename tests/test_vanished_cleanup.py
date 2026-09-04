@@ -7,6 +7,8 @@ read from or write to the real data/ directory.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -15,6 +17,13 @@ from unittest.mock import patch
 
 import config.config as cfg
 import main
+
+
+@contextlib.contextmanager
+def _quiet():
+    """Swallow the decision table's output so the suite stays readable."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
 
 
 class VanishedCleanupTests(unittest.TestCase):
@@ -114,7 +123,10 @@ class VanishedCleanupTests(unittest.TestCase):
             self._write_index(index_path, [self._make_index_entry("Alpha", "alpha")])
             self._write_mismatch(mismatch_path, ["alpha"])
 
-            with patch("builtins.input", return_value="n"):
+            # The prompt now runs the vanished/new decision table, so "n"
+            # answers the table's per-row question (keep) and then its
+            # follow-up about silencing the entry (no).
+            with patch("builtins.input", return_value="n"), _quiet():
                 removed = main._prompt_clean_vanished()
 
             self.assertFalse(removed)
@@ -129,7 +141,9 @@ class VanishedCleanupTests(unittest.TestCase):
             self._write_index(index_path, [self._make_index_entry("Alpha", "alpha")])
             self._write_mismatch(mismatch_path, ["alpha"])
 
-            with patch("builtins.input", return_value="ignore"):
+            # Keep the entry in the table, then accept the offer to stop
+            # reporting it.
+            with patch("builtins.input", side_effect=["k", "y"]), _quiet():
                 removed = main._prompt_clean_vanished()
 
             self.assertFalse(removed)
@@ -149,7 +163,7 @@ class VanishedCleanupTests(unittest.TestCase):
             )
             self._write_mismatch(mismatch_path, ["alpha"])
 
-            with patch("builtins.input", return_value="y"):
+            with patch("builtins.input", return_value="y"), _quiet():
                 removed = main._prompt_clean_vanished()
 
             self.assertTrue(removed)

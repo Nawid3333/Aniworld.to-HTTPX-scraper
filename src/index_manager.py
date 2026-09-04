@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from config.config import SITE_URL, VALID_SERIES_HOSTS
 from src.atomic_io import atomic_write_json, create_file_backup
+from src.slug import slug_key
 
 logger = logging.getLogger(__name__)
 
@@ -1825,14 +1826,22 @@ def _build_merged_data(old_data, new_dict, allowed):
 
 
 def _extract_slug_from_field(value):
-    """Extract series slug from a link or URL field containing '/anime/stream/'."""
+    """Return the comparison key for the slug in a link or URL field.
+
+    The result is normalised by :func:`slug_key`, because every caller of this
+    function is asking "is this the same anime?" -- against the catalogue, the
+    mismatch report, or another index entry. The site does not spell a slug the
+    same way in every list it prints, so a raw string comparison here reports
+    an entry as both vanished and new at once. Use the stored ``url``/``link``
+    field, not this key, when building a request.
+    """
     if not value or not isinstance(value, str):
         return None
     idx = value.find("/anime/stream/")
     if idx == -1:
         return None
     slug = value[idx + len("/anime/stream/") :].strip("/").split("/")[0]
-    return slug if slug else None
+    return slug_key(slug)
 
 
 def _extract_slug(entry):
@@ -2542,7 +2551,16 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                 f'  [{i}/{len(rows)}] Action for "{v_title}"? '
                 f"(y=delete n=keep k=keep d=delete r=rescrape o=open a <action>=all s=skip all) [n]: "
             )
-            choice = input(prompt).strip().lower() or "n"
+            try:
+                choice = input(prompt).strip().lower() or "n"
+            except EOFError:
+                # No one is there to answer -- a piped or redirected run. The
+                # loop below re-prompts on anything it does not recognise, so
+                # without this an unattended run spins forever on a closed
+                # stdin. Keeping every entry is the reversible answer.
+                print("  -> No input available; keeping all remaining entries.")
+                skip_all = True
+                break
 
             if choice == "s":
                 skip_all = True
@@ -2751,15 +2769,23 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                         s for s in new_data.values() if s.get("title") and s.get("title") not in old_titles
                     ]
                 if candidate_entries:
-                    ask = (
-                        input(
-                            f"\n{len(vanished)} vanished series found; "
-                            f"{len(candidate_entries)} new series could be renames. "
-                            "Re-scrape all candidate URLs for verification? (y/n): "
+                    try:
+                        ask = (
+                            input(
+                                f"\n{len(vanished)} vanished series found; "
+                                f"{len(candidate_entries)} new series could be renames. "
+                                "Re-scrape all candidate URLs for verification? (y/n): "
+                            )
+                            .strip()
+                            .lower()
                         )
-                        .strip()
-                        .lower()
-                    )
+                    except EOFError:
+                        # Piped or redirected run. Skipping the live re-verification costs
+                        # accuracy, not data -- the decision table below has its own
+                        # closed-stdin guard and keeps every entry. Letting this raise
+                        # would instead kill the run just before the results are saved.
+                        print("  -> No input available; skipping live re-verification.")
+                        ask = "n"
                     if ask == "y":
                         _, verified_new_data = asyncio.run(
                             scraper.verify_vanished_and_candidates(vanished, candidate_entries)

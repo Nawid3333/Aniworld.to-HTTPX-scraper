@@ -373,6 +373,8 @@ class TestDuplicateEpisodeNumbers(unittest.TestCase):
 
     def test_distinct_numbers_still_parse(self):
         eps = _parse_episodes(self._table(1, 2))
+        self.assertIsNotNone(eps, "a well-formed table must parse")
+        assert eps is not None  # narrows for the type checker
         self.assertEqual([e["number"] for e in eps], [1, 2])
 
 

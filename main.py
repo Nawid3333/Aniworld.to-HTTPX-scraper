@@ -49,6 +49,7 @@ from src.index_manager import (
     show_vanished_series,
 )
 from src.scraper import AniWorldScraper, ScrapingPausedError
+from src.slug import slug_keys
 
 # Global active site URL (set by domain probing)
 ACTIVE_SITE_URL: str | None = None
@@ -301,6 +302,8 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
     idx_mgr.save_index()
     print(f"\n    Removed {len(removed_titles)} duplicate entry(s); one copy of each resolved slug kept.")
     logger.info("Removed %d duplicate index entries: %s", len(removed_titles), removed_titles[:10])
+
+
 def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
     """Compare site slugs against the local index for one host.
 
@@ -552,12 +555,24 @@ def _print_alert_block(entries, heading, advice):
     """Print one titled alert block, or nothing when there is nothing to flag."""
     if not entries:
         return
+    # Resolved here rather than taken as an argument: every caller wants the
+    # host this run actually settled on, and ACTIVE_SITE_URL is only set once
+    # domain probing has picked one, so a parameter defaulting to it would
+    # freeze whatever the value was at import time.
+    site_url = (ACTIVE_SITE_URL or SITE_URL).rstrip("/")
     entries.sort(key=lambda s: s.get("title", ""))
     print("\n" + "⚠" * 35)
     print(f"⚠ {len(entries)} {heading}:")
     print("─" * 70)
     for s in entries:
-        print(f"  • {s.get('title')}")
+        title = s.get("title", "")
+        url = s.get("url") or s.get("link")
+        if url and not url.startswith("http"):
+            url = f"{site_url}{url}"
+        if url:
+            print(f"  • {title}\n    {url}")
+        else:
+            print(f"  • {title}")
     print("─" * 70)
     print(f"  {advice}")
     print("⚠" * 35)
@@ -705,9 +720,9 @@ def _load_ignored_vanished():
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return set(data)
+            return slug_keys(data)
         if isinstance(data, dict):
-            return set(data.get("slugs", []))
+            return slug_keys(data.get("slugs", []))
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Could not read ignored vanished file: %s", exc)
     return set()
@@ -724,16 +739,31 @@ def _save_ignored_vanished(slugs):
 
 
 def _extract_slug_for_suggest(series):
-    """Extract slug from an AniWorld index entry."""
-    return _extract_slug_from_field(series.get("url", "") or series.get("link", ""))
+    """Return the comparison key for an index entry, reading link before url.
+
+    The field order matters. show_vanished_series and the index-wide slug set
+    it is compared against both read "link" first, so reading "url" first here
+    meant an entry whose two fields disagree -- a rename that updated one and
+    not the other -- resolved to one slug on this side and a different one on
+    the other, and could be called vanished by one and present by the other.
+    """
+    return _extract_slug_from_field(series.get("link", "") or series.get("url", ""))
 
 
-def _find_vanished_to_clean(idx_mgr=None, ignored=None):
-    """Return title->slug mapping for vanished entries that can be cleaned.
+def _find_vanished_to_clean(idx_mgr=None, ignored=None, seen_slugs=None):
+    """Return slug->title mapping for vanished entries that can be cleaned.
 
     Reads the most recent mismatch report. Only slugs reported as
     'only_in_index' by every reachable host are considered vanished.
     Slugs in the ignored set are skipped.
+
+    Args:
+        seen_slugs: slugs the site served during the run that just finished.
+            The report is written once at startup, so by the time anything
+            acts on it a scrape may have proven those entries alive -- and a
+            anime the site just handed us is not vanished, whatever an older
+            report says. Without this the cleanup deleted freshly scraped
+            entries and the next run added them straight back.
     """
     if ignored is None:
         ignored = _load_ignored_vanished()
@@ -751,11 +781,11 @@ def _find_vanished_to_clean(idx_mgr=None, ignored=None):
     if not host_reports:
         return {}
 
-    in_only_sets = [set(h.get("only_in_index", [])) for h in host_reports]
+    in_only_sets = [slug_keys(h.get("only_in_index", [])) for h in host_reports]
     if not in_only_sets or not any(in_only_sets):
         return {}
 
-    vanished_slugs = set.intersection(*in_only_sets) - ignored
+    vanished_slugs = set.intersection(*in_only_sets) - ignored - slug_keys(seen_slugs or ())
     if not vanished_slugs:
         return {}
 
@@ -771,21 +801,42 @@ def _find_vanished_to_clean(idx_mgr=None, ignored=None):
     return title_by_slug
 
 
-def _notify_vanished_at_startup(idx_mgr=None):
-    """Print a notification when vanished entries exist, without prompting."""
-    title_by_slug = _find_vanished_to_clean(idx_mgr)
+def _notify_vanished_at_startup(idx_mgr=None, seen_slugs=None):
+    """Print a notification when vanished entries exist, without prompting.
+
+    Args:
+        seen_slugs: slugs this run proved alive, if any. A targeted run
+            fetches no catalogue but still scrapes something, and an entry it
+            just read is not vanished whatever the startup report says.
+    """
+    title_by_slug = _find_vanished_to_clean(idx_mgr, seen_slugs=seen_slugs)
     if not title_by_slug:
         return
     print(f"\n  ⚠ {len(title_by_slug)} anime in index are not on any reachable host.")
     print("  → Run option 1 or 2 to verify, then choose whether to remove them.")
 
 
-def _prompt_clean_vanished(idx_mgr: IndexManager | None = None):
-    """Ask to delete vanished entries and update the ignored list.
+def _prompt_clean_vanished(idx_mgr: IndexManager | None = None, scraper=None, seen_slugs=None):
+    """Ask what to do with report-only vanished entries, and update the ignored list.
+
+    The decision goes through show_vanished_series -- the same table the
+    scrape-time check uses -- so an entry reaching this point is shown with its
+    stored progress and can be re-scraped live before anything is deleted. This
+    was a bare "delete all of these? (y/n)", which is a lot of trust to ask for
+    a list the user cannot inspect: every entry carries watch history, and one
+    keystroke dropped all of it.
+
+    Args:
+        scraper: optional scraper for the table's live re-scrape action.
+        seen_slugs: slugs the site served during the run that just finished;
+            those are alive whatever the startup report says.
 
     Returns True if anything was removed.
     """
-    title_by_slug = _find_vanished_to_clean(idx_mgr)
+    if idx_mgr is None:
+        idx_mgr = IndexManager(SERIES_INDEX_FILE)
+
+    title_by_slug = _find_vanished_to_clean(idx_mgr, seen_slugs=seen_slugs)
     if not title_by_slug:
         return False
 
@@ -794,29 +845,46 @@ def _prompt_clean_vanished(idx_mgr: IndexManager | None = None):
     for title in titles:
         print(f"    - {title}")
 
-    choice = input("\nDelete these vanished entries from the index? (y/n/ignore): ").strip().lower()
-    if choice == "ignore":
-        ignored = _load_ignored_vanished()
-        ignored.update(title_by_slug)
-        _save_ignored_vanished(ignored)
-        print(f"  Ignored {len(title_by_slug)} vanished slug(s) — will not prompt again.")
-        return False
-    if choice != "y":
-        print("  Cancelled — no changes made.")
-        return False
+    # show_vanished_series reports whatever is missing from the slug set it is
+    # handed, so hand it every index slug except these. The startup report is
+    # the only evidence available here; re-deriving it would mean a second
+    # catalogue fetch the probe already paid for.
+    vanished_slugs = set(title_by_slug)
+    # _extract_slug_from_field, not _extract_slug: the latter prints a warning
+    # per entry that falls back to "url", and this walks the whole index.
+    all_slugs = {
+        _extract_slug_from_field(entry.get("link", "") or entry.get("url", ""))
+        for entry in idx_mgr.series_index.values()
+    } - {None}
+    before = len(idx_mgr.series_index)
 
-    if idx_mgr is None:
-        idx_mgr = IndexManager(SERIES_INDEX_FILE)
+    kept = show_vanished_series(
+        dict(idx_mgr.series_index),
+        all_slugs - vanished_slugs,
+        "all",
+        index_file=SERIES_INDEX_FILE,
+        scraper=scraper,
+    )
+    idx_mgr.load_index()
+    removed = before - len(idx_mgr.series_index)
 
-    removed = 0
-    for title in titles:
-        if title in idx_mgr.series_index:
-            del idx_mgr.series_index[title]
-            removed += 1
-    idx_mgr.save_index()
-    print(f"\n✓ Removed {removed} vanished anime from index.")
-    logger.info("Removed %d vanished anime from index after scrape: %s", removed, titles[:10])
-    return True
+    kept_titles = {title for title, _ in kept}
+    kept_slugs = {slug for slug, title in title_by_slug.items() if title in kept_titles}
+    if kept_slugs:
+        try:
+            prompt = f"\nStop reporting the {len(kept_slugs)} kept entry(s) as vanished? (y/n): "
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer == "y":
+            ignored = _load_ignored_vanished()
+            ignored.update(kept_slugs)
+            _save_ignored_vanished(ignored)
+            print(f"  Ignored {len(kept_slugs)} vanished slug(s) — will not prompt again.")
+
+    if removed:
+        logger.info("Removed %d vanished anime from index after scrape: %s", removed, titles[:10])
+    return bool(removed)
 
 
 def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) -> str:
@@ -1106,13 +1174,26 @@ def _run_scrape_and_save(
                 pre_save_hook(scraper, pre_index)
 
             index_manager = IndexManager(SERIES_INDEX_FILE)
+            catalogue_slugs = {_extract_slug(s) for s in (scraper.all_discovered_series or [])} - {None}
+            # Everything this run proved alive. A run that fetched no
+            # catalogue still scraped something, and what it read is then its
+            # only evidence -- enough to keep a freshly scraped entry off the
+            # vanished list the startup report still names.
+            seen_slugs = catalogue_slugs | ({_extract_slug(s) for s in (scraper.series_data or [])} - {None})
+            scope = vanished_scope or ("new_only" if run_kwargs.get("new_only") else "all")
+            # True when show_vanished_series ran its decision table over these
+            # entries. The startup report lists what is missing from every
+            # reachable host, which is a subset of what that table already
+            # asked about, so a second pass would ask the same question twice.
+            # The account scopes (subscribed/watchlist/both) are the exception:
+            # their table is informational only and never prompts, so for them
+            # the decision still has to be offered further down.
+            already_offered = scraper.all_discovered_series is not None and scope in ("all", "new_only")
 
             if scraper.all_discovered_series is not None:
-                all_slugs = {_extract_slug(s) for s in scraper.all_discovered_series} - {None}
-                scope = vanished_scope or ("new_only" if run_kwargs.get("new_only") else "all")
                 show_vanished_series(
                     index_manager.series_index,
-                    all_slugs,
+                    catalogue_slugs,
                     scope,
                     index_file=SERIES_INDEX_FILE,
                     new_data=scraper.series_data,
@@ -1156,7 +1237,13 @@ def _run_scrape_and_save(
                         sign = "+" if diff > 0 else ""
                         print(f"  Index count: {idx_count}  →  match = False ({sign}{diff} difference)")
                         print("  → Vanished/renamed series were already checked above.")
-                _prompt_clean_vanished(index_manager)
+                # A run that fetched no catalogue has no evidence to delete
+                # on, so it only says what is flagged and leaves the decision
+                # to a later scrape.
+                if scraper.all_discovered_series is None:
+                    _notify_vanished_at_startup(index_manager, seen_slugs=seen_slugs)
+                elif not already_offered:
+                    _prompt_clean_vanished(index_manager, scraper=scraper, seen_slugs=seen_slugs)
         else:
             if run_kwargs.get("retry_failed") and scraper.failed_links:
                 n = len(scraper.failed_links)

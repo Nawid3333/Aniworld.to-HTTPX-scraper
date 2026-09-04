@@ -32,8 +32,7 @@ from src import index_manager as im  # noqa: E402
 def _series(title, season, watched_flags):
     """One index entry with a single season and the given watched flags."""
     episodes = [
-        {"number": i + 1, "watched": w, "title_ger": f"E{i + 1}", "title_eng": ""}
-        for i, w in enumerate(watched_flags)
+        {"number": i + 1, "watched": w, "title_ger": f"E{i + 1}", "title_eng": ""} for i, w in enumerate(watched_flags)
     ]
     return {
         "url": f"https://aniworld.to/anime/stream/{title.lower()}",

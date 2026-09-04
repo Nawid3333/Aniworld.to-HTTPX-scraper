@@ -49,11 +49,15 @@ def two_series():
 class TestFindSeries:
     def test_finds_by_title_in_a_dict(self):
         data = {"Alpha": series("Alpha")}
-        assert _find_series(data, "Alpha")["title"] == "Alpha"
+        found = _find_series(data, "Alpha")
+        assert found is not None
+        assert found["title"] == "Alpha"
 
     def test_finds_by_title_in_a_list(self):
         data = [series("Alpha"), series("Beta")]
-        assert _find_series(data, "Beta")["title"] == "Beta"
+        found = _find_series(data, "Beta")
+        assert found is not None
+        assert found["title"] == "Beta"
 
     def test_returns_none_for_an_unknown_title(self):
         assert _find_series({"Alpha": series("Alpha")}, "Missing") is None
