@@ -18,7 +18,6 @@ from urllib.parse import urlparse
 import httpx
 import lxml.etree
 import lxml.html
-from bs4 import BeautifulSoup
 
 from config.config import (
     CHECKPOINT_EVERY,
@@ -34,35 +33,19 @@ from config.config import (
 )
 from src.atomic_io import atomic_write_json
 from src.slug import slug_key, slug_keys
+from src.term import cinput as input
+from src.term import cprint as print
 
 logger = logging.getLogger(__name__)
 
 
 # ── HTML parsing ────────────────────────────────────────────────────────────
-# lxml parses these pages roughly 1.4x faster than the stdlib parser, and the
-# golden fixtures in tests/ confirm it produces identical output on every
-# captured real page. The fallback keeps the scraper working on a machine
-# where lxml was never installed, at the old speed.
-try:
-    import lxml  # noqa: F401
-
-    _HTML_PARSER = "lxml"
-except ImportError:  # pragma: no cover - depends on the install
-    _HTML_PARSER = "html.parser"
-
-
-def make_soup(html: str) -> BeautifulSoup:
-    """Parse a page with the fastest parser available.
-
-    Every BeautifulSoup parse in this module goes through here so the choice
-    is made in exactly one place -- a parser swap must never be able to apply
-    to some pages and not others.
-
-    Season pages are the exception and no longer come through here: they are
-    the hot path and go straight to lxml instead. Everything else (series
-    pages, the catalogue, account pages, login) still uses this.
-    """
-    return BeautifulSoup(html, _HTML_PARSER)
+# Every page this module reads is parsed by make_doc, below. BeautifulSoup
+# used to sit alongside it for series, catalogue and account pages; it was
+# removed once the last of those moved across, so there is now one parser and
+# one tree type rather than two of each. lxml was already a hard requirement
+# (see pyproject), so the old html.parser fallback could never fire and went
+# with it.
 
 
 # ── Transient-failure handling ──────────────────────────────────────────────
@@ -467,44 +450,6 @@ _LANGUAGE_FLAG_MAP = {
 }
 
 
-def _is_logged_in(soup: BeautifulSoup) -> bool:
-    """Check if the page indicates a logged-in session."""
-    return soup.select_one("div.avatar a[href*='/user/profil/']") is not None
-
-
-def _check_error_page(soup: BeautifulSoup) -> str | None:
-    """Detect HTTP error pages (404, 502, etc.) returned as HTML.
-
-    Returns an error string like '404' if an error page is detected, None otherwise.
-    """
-    # If the page has series content (season nav), it's a real series page
-    if soup.select_one("#stream ul li a[href*='/staffel-']") or soup.select_one("#stream ul li a[href*='/filme']"):
-        return None
-    # Site-specific soft-404 banner: "Die gewünschte Serie wurde nicht gefunden
-    # oder ist im Moment deaktiviert."
-    alert_box = soup.select_one("div.messageAlert.danger")
-    if alert_box:
-        text = alert_box.get_text(strip=True).lower()
-        if "nicht gefunden" in text or "deaktiviert" in text:
-            return "404"
-    title_tag = soup.find("title")
-    if title_tag:
-        title_text = title_tag.get_text(strip=True)
-        m = _ERROR_TITLE_RE.search(title_text)
-        if m:
-            return m.group("code") or m.group("code2")
-    h2_tag = soup.find("h2")
-    if h2_tag and h2_tag.get_text(strip=True).isdigit():
-        code = h2_tag.get_text(strip=True)
-        if len(code) == 3:
-            return code
-    # Fallback: <p> containing "nicht gefunden" (aniworld.to specific 404)
-    p_tag = soup.find("p")
-    if p_tag and "nicht gefunden" in p_tag.get_text(strip=True).lower():
-        return "404"
-    return None
-
-
 # ── HTML helpers ────────────────────────────────────────────────────────────
 
 
@@ -537,6 +482,101 @@ _XP_LOGGED_IN = f".//*[{_has_class_xpath('avatar')}]//a[contains(@href, '/user/p
 _XP_ACCOUNT_LINK = ".//a[contains(@href, '/user/profil/')]"
 _ACCOUNT_HREF_RE = re.compile(r"/user/profil/([^/?#\s]+)")
 
+# ── Series-page selectors, as XPath ─────────────────────────────────────────
+#
+# These are literal translations of the CSS the series-page helpers used to
+# hand to BeautifulSoup. The move is worth its noise: one series page cost
+# 16.8ms to soup and interrogate, against 2.8ms through lxml -- 6.0x, and it
+# is paid once per series on the event loop, where it blocks every concurrent
+# fetch the pool has in flight. Over a 300-series run that is ~5.0s of stalled
+# loop cut to ~0.85s. Verified field-for-field against the BeautifulSoup
+# output on all 55 captured pages before the switch, and pinned by the golden
+# fixtures afterwards.
+#
+# `:first-of-type` becomes `not(preceding-sibling::ul)`: CSS means "first
+# sibling of its type", not "first in the document", and the two differ on
+# every page whose #stream holds more than one list.
+_XP_AVATAR_LINK = f".//div[{_has_class_xpath('avatar')}]//a[contains(@href, '/user/profil/')]"
+# _detect_subscription_status used `href^=` where _is_logged_in used `href*=`.
+# Kept as two separate expressions rather than unified: the pair only differs
+# on an absolute profile URL, and which of the two is right is a question
+# about the site, not about this refactor. Silently widening one of them here
+# would change what the scraper stores, which is exactly what this change
+# promised not to do.
+_XP_AVATAR_LINK_ROOTED = f".//div[{_has_class_xpath('avatar')}]//a[starts-with(@href, '/user/profil/')]"
+_XP_STREAM_STAFFEL = ".//*[@id='stream']//ul//li//a[contains(@href, '/staffel-')]"
+_XP_STREAM_FILME = ".//*[@id='stream']//ul//li//a[contains(@href, '/filme')]"
+_XP_ALERT_DANGER = f".//div[{_has_class_xpath('messageAlert')}][{_has_class_xpath('danger')}]"
+_XP_NAV_STAFFEL = ".//*[@id='stream']//ul[not(preceding-sibling::ul)]//li//a[contains(@href, '/staffel-')]"
+_XP_NAV_FILME = ".//*[@id='stream']//ul[not(preceding-sibling::ul)]//li//a[contains(@href, '/filme')]"
+_XP_H1_NAME = ".//h1[@itemprop='name']"
+_XP_H1_NAME_SPAN = ".//h1[@itemprop='name']/span"
+_XP_H1_FW_BOLD = f".//h1[{_has_class_xpath('fw-bold')}]"
+_XP_ADD_SERIES = f".//div[{_has_class_xpath('add-series')}]"
+_XP_FAVOURITE_TRUE = f".//li[{_has_class_xpath('setFavourite')}][{_has_class_xpath('true')}]"
+_XP_WATCHLIST_TRUE = f".//li[{_has_class_xpath('setWatchlist')}][{_has_class_xpath('true')}]"
+_XP_ANY_LINK = ".//a[@href]"
+_XP_CATALOGUE_LINKS = ".//*[@id='seriesContainer']//ul//li//a"
+# `>` is a child step, not a descendant one: `div.seriesListContainer > div a`
+# only reaches anchors under a div that is a *direct* child of the container.
+_XP_SERIES_LIST_LINKS = f".//div[{_has_class_xpath('seriesListContainer')}]/div//a"
+_XP_SEASON_NAV_LINKS = ".//*[@id='seasons']//li//a"
+_XP_ANY_SEASON_LINK = ".//a[contains(@href, 'staffel-') or contains(@href, 'season-')]"
+
+
+def _first(doc, xpath):
+    """First node matching `xpath`, or None -- lxml's answer to select_one."""
+    found = doc.xpath(xpath)
+    return found[0] if found else None
+
+
+def _spaced_text(el) -> str:
+    """lxml equivalent of BeautifulSoup's get_text(" ", strip=True).
+
+    The separator is the whole point, and it is why this cannot share
+    _stripped_text: joining with nothing glues "Harry Potter<small>Specials
+    </small>" into one word, which then survives every later cleanup and is
+    stored as the series title.
+    """
+    return " ".join(t.strip() for t in el.itertext() if t.strip())
+
+
+def _is_logged_in(doc) -> bool:
+    """Check if the page indicates a logged-in session."""
+    return _first(doc, _XP_AVATAR_LINK) is not None
+
+
+def _check_error_page(doc) -> str | None:
+    """Detect HTTP error pages (404, 502, etc.) returned as HTML.
+
+    Returns an error string like '404' if an error page is detected, None otherwise.
+    """
+    # If the page has series content (season nav), it's a real series page
+    if _first(doc, _XP_STREAM_STAFFEL) is not None or _first(doc, _XP_STREAM_FILME) is not None:
+        return None
+    # Site-specific soft-404 banner: "Die gewünschte Serie wurde nicht gefunden
+    # oder ist im Moment deaktiviert."
+    alert_box = _first(doc, _XP_ALERT_DANGER)
+    if alert_box is not None:
+        text = _stripped_text(alert_box).lower()
+        if "nicht gefunden" in text or "deaktiviert" in text:
+            return "404"
+    title_tag = _first(doc, ".//title")
+    if title_tag is not None:
+        m = _ERROR_TITLE_RE.search(_stripped_text(title_tag))
+        if m:
+            return m.group("code") or m.group("code2")
+    h2_tag = _first(doc, ".//h2")
+    if h2_tag is not None:
+        code = _stripped_text(h2_tag)
+        if code.isdigit() and len(code) == 3:
+            return code
+    # Fallback: <p> containing "nicht gefunden" (aniworld.to specific 404)
+    p_tag = _first(doc, ".//p")
+    if p_tag is not None and "nicht gefunden" in _stripped_text(p_tag).lower():
+        return "404"
+    return None
+
 
 def _account_name_from_hrefs(hrefs) -> str | None:
     """First account name found among a page's profile links, if any."""
@@ -549,9 +589,9 @@ def _account_name_from_hrefs(hrefs) -> str | None:
     return None
 
 
-def _account_name_from_soup(soup: BeautifulSoup) -> str | None:
+def _account_name_from_doc(doc) -> str | None:
     """Read the logged-in account name off a series/catalogue page."""
-    return _account_name_from_hrefs(a.get("href") for a in soup.find_all("a", href=True))
+    return _account_name_from_hrefs(a.get("href") for a in doc.xpath(_XP_ANY_LINK))
 
 
 def _stripped_text(el) -> str:
@@ -595,14 +635,14 @@ def _parse_episodes(html: str) -> list[dict] | None:
         treat None as a scrape failure -- storing 0 there corrupts the index
         and shows up later as a false "lost all its episodes" mismatch.
     """
-    doc = _build_doc(html)
+    doc = make_doc(html)
     if doc is None:
         # An empty or non-markup body is a failed fetch, not an empty season.
         return None
     return _parse_episodes_from_doc(doc)
 
 
-def _build_doc(html: str):
+def make_doc(html: str):
     """Build the lxml tree for a season page, or None if the body is not markup.
 
     Split out so a caller can run more than one check against a single parse:
@@ -636,7 +676,7 @@ def parse_season_page(html: str, account_name: str | None = None) -> tuple[bool,
     episodes for None first, so it surfaces as the parse failure it is
     rather than as a session expiry.
     """
-    doc = _build_doc(html)
+    doc = make_doc(html)
     if doc is None:
         return False, None
     logged_in = bool(doc.xpath(_XP_LOGGED_IN))
@@ -762,7 +802,7 @@ def _parse_episodes_from_doc(doc) -> list[dict] | None:
     return episodes
 
 
-def _extract_season_links(soup: BeautifulSoup, series_slug: str, base_url: str | None = None) -> list[tuple[str, str]]:
+def _extract_season_links(doc, series_slug: str, base_url: str | None = None) -> list[tuple[str, str]]:
     """Extract season numbers and URLs from the #stream season navigation.
 
     Handles staffel-N seasons and Filme (movies/specials).
@@ -773,8 +813,8 @@ def _extract_season_links(soup: BeautifulSoup, series_slug: str, base_url: str |
     seen = set()
 
     # Primary: href pattern /anime/stream/{slug}/staffel-{num}
-    for a_tag in soup.select("#stream ul:first-of-type li a[href*='/staffel-']"):
-        href = str(a_tag.get("href", ""))
+    for a_tag in doc.xpath(_XP_NAV_STAFFEL):
+        href = str(a_tag.get("href", "") or "")
         m = _STAFFEL_RE.search(href)
         if m and m.group(1) not in seen:
             season_num = m.group(1)
@@ -782,21 +822,20 @@ def _extract_season_links(soup: BeautifulSoup, series_slug: str, base_url: str |
             url = f"{base_url}/anime/stream/{series_slug}/staffel-{season_num}"
             seasons.append((season_num, url))
 
-    # Check for Filme (movies/OVAs/specials)
-    for a_tag in soup.select("#stream ul:first-of-type li a[href*='/filme']"):
-        href = str(a_tag.get("href", ""))
-        if "Filme" not in seen:
-            seen.add("Filme")
-            url = f"{base_url}/anime/stream/{series_slug}/filme"
-            seasons.append(("Filme", url))
+    # Check for Filme (movies/OVAs/specials). Only ever appends once, so this
+    # asks whether such a link exists rather than walking every one of them.
+    if "Filme" not in seen and _first(doc, _XP_NAV_FILME) is not None:
+        seen.add("Filme")
+        url = f"{base_url}/anime/stream/{series_slug}/filme"
+        seasons.append(("Filme", url))
 
     if seasons:
         return seasons
 
     # Fallback: any staffel links on the page
     staffel_pattern = re.compile(rf"/anime/stream/{re.escape(series_slug)}/staffel-(\d+)", re.IGNORECASE)
-    for a_tag in soup.find_all("a", href=True):
-        m = staffel_pattern.search(str(a_tag["href"]))
+    for a_tag in doc.xpath(_XP_ANY_LINK):
+        m = staffel_pattern.search(str(a_tag.get("href", "") or ""))
         if m and m.group(1) not in seen:
             seen.add(m.group(1))
             url = f"{base_url}/anime/stream/{series_slug}/staffel-{m.group(1)}"
@@ -808,20 +847,24 @@ def _extract_season_links(soup: BeautifulSoup, series_slug: str, base_url: str |
 def _heading_text(el) -> str:
     """Return the flattened, normalized text of a heading element.
 
-    Uses a separator-joined get_text() so inline sub-elements (e.g. "Harry
+    Uses a separator-joined flatten so inline sub-elements (e.g. "Harry
     Potter<small>Specials</small>") don't glue themselves to the main text.
-    Does not mutate the parse tree -- safe to call on a soup shared with
+    Does not mutate the parse tree -- safe to call on a tree shared with
     other extractors.
+
+    Tests `el is None` rather than `not el`: an lxml element with no child
+    elements is falsy, so a plain <h1>Title</h1> -- the overwhelmingly common
+    case -- would take the empty branch and drop every title on the page.
     """
-    if not el:
+    if el is None:
         return ""
-    text = " ".join(el.get_text(" ", strip=True).split())
+    text = " ".join(_spaced_text(el).split())
     text = re.sub(r"\s*(?:Staffel|Season|St\.?)\s*\d+.*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*Specials\s*$", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
-def _extract_title(soup: BeautifulSoup) -> str | None:
+def _extract_title(doc) -> str | None:
     """Extract series title from the page.
 
     Tries site-specific heading(s) first, then falls back to generic headings.
@@ -829,52 +872,50 @@ def _extract_title(soup: BeautifulSoup) -> str | None:
     ensures inline tags like <small> do not glue themselves to the main text.
     """
     # aniworld.to preferred headings
-    for selector in ("h1[itemprop='name'] > span", "h1.fw-bold"):
-        el = soup.select_one(selector)
-        text = _heading_text(el)
+    for xpath in (_XP_H1_NAME_SPAN, _XP_H1_FW_BOLD):
+        text = _heading_text(_first(doc, xpath))
         if text:
             return text
 
     # Fallback headings
     for tag in ("h2", "h1"):
-        el = soup.find(tag)
-        text = _heading_text(el)
+        text = _heading_text(_first(doc, f".//{tag}"))
         if text:
             return text
     return None
 
 
-def _count_seasons_from_html(soup: BeautifulSoup) -> int:
+def _count_seasons_from_html(doc) -> int:
     """Return number of distinct seasons found on an aniworld.to series page."""
-    season_links = soup.select("#seasons li a")
+    season_links = doc.xpath(_XP_SEASON_NAV_LINKS)
     if not season_links:
         # Fallback: look for staffel-N or season-N links anywhere in the page.
-        season_links = soup.select("a[href*='staffel-'], a[href*='season-']")
+        season_links = doc.xpath(_XP_ANY_SEASON_LINK)
     labels = set()
     for a in season_links:
-        href = str(a.get("href", ""))
+        href = str(a.get("href", "") or "")
         m = re.search(r"(?:^|/)(?:staffel|season)-(\d+)", href, re.IGNORECASE)
         if m:
             labels.add(int(m.group(1)))
             continue
-        text = a.get_text(strip=True)
+        text = _stripped_text(a)
         m = re.search(r"(?:staffel|season|st\.?)\s*(\d+)", text, re.IGNORECASE)
         if m:
             labels.add(int(m.group(1)))
     return len(labels)
 
 
-def _extract_alt_titles(soup: BeautifulSoup) -> list[str]:
+def _extract_alt_titles(doc) -> list[str]:
     """Extract alternative titles from the series detail page."""
-    alt_el = soup.select_one("h1[itemprop='name']")
-    if alt_el:
-        alt_raw = str(alt_el.get("data-alternativetitles", ""))
+    alt_el = _first(doc, _XP_H1_NAME)
+    if alt_el is not None:
+        alt_raw = str(alt_el.get("data-alternativetitles", "") or "")
         if alt_raw:
             return [t.strip() for t in alt_raw.split(",") if t.strip()]
     return []
 
 
-def _detect_subscription_status(soup: BeautifulSoup) -> tuple[bool | None, bool | None]:
+def _detect_subscription_status(doc) -> tuple[bool | None, bool | None]:
     """Detect subscription and watchlist status from a series page.
 
     Uses aniworld.to's div.add-series container with data-series-favourite
@@ -884,12 +925,12 @@ def _detect_subscription_status(soup: BeautifulSoup) -> tuple[bool | None, bool 
     Returns (subscribed, watchlist) — None if container not found or not logged in.
     """
     # Verify logged-in state (profile avatar)
-    if not soup.select_one("div.avatar a[href^='/user/profil/']"):
+    if _first(doc, _XP_AVATAR_LINK_ROOTED) is None:
         return (None, None)
 
     # Find subscription container
-    container = soup.select_one("div.add-series")
-    if not container:
+    container = _first(doc, _XP_ADD_SERIES)
+    if container is None:
         return (None, None)
 
     subscribed = None
@@ -904,8 +945,8 @@ def _detect_subscription_status(soup: BeautifulSoup) -> tuple[bool | None, bool 
         watchlist = wl_val == "1"
 
     # Cross-validate with CSS classes
-    css_subscribed = soup.select_one("li.setFavourite.true") is not None
-    css_watchlist = soup.select_one("li.setWatchlist.true") is not None
+    css_subscribed = _first(doc, _XP_FAVOURITE_TRUE) is not None
+    css_watchlist = _first(doc, _XP_WATCHLIST_TRUE) is not None
 
     if subscribed is not None and css_subscribed != subscribed:
         logger.warning(
@@ -1198,14 +1239,14 @@ class AniWorldScraper:
             title = entry.get("title", url.split("/")[-1])
             try:
                 resp = await client.get(url, follow_redirects=True)
-                soup = make_soup(resp.text)
-                error_code = _check_error_page(soup)
+                doc = make_doc(resp.text)
+                error_code = _check_error_page(doc) if doc is not None else "unparseable"
                 if error_code:
                     still_empty += 1
                     print(f"  ✓ {title}: still empty ({error_code} — ignored)")
                 else:
-                    has_seasons = soup.select_one("#stream ul li a[href*='/staffel-']") or soup.select_one(
-                        "#stream ul li a[href*='/filme']"
+                    has_seasons = (
+                        _first(doc, _XP_STREAM_STAFFEL) is not None or _first(doc, _XP_STREAM_FILME) is not None
                     )
                     if has_seasons:
                         now_available += 1
@@ -1551,8 +1592,8 @@ class AniWorldScraper:
         if not verify:
             return
         verify_resp = await client.get(_series_list_url(self.site_url))
-        verify_soup = make_soup(verify_resp.text)
-        if not _is_logged_in(verify_soup):
+        verify_doc = make_doc(verify_resp.text)
+        if verify_doc is None or not _is_logged_in(verify_doc):
             await client.aclose()
             raise RuntimeError("Login failed — check credentials")
 
@@ -1584,14 +1625,14 @@ class AniWorldScraper:
     async def _get_all_series(self, client: httpx.AsyncClient) -> list[dict]:
         """Fetch the full anime catalogue from the active host."""
         resp = await self._get(client, _series_list_url(self.site_url))
-        soup = make_soup(resp.text)
-        if not _is_logged_in(soup):
+        doc = make_doc(resp.text)
+        if doc is None or not _is_logged_in(doc):
             raise RuntimeError("Not logged in — cannot fetch anime catalogue")
         series, seen_slugs = [], set()
 
         # Primary: #seriesContainer ul li a
-        for a in soup.select("#seriesContainer ul li a"):
-            href = str(a.get("href", ""))
+        for a in doc.xpath(_XP_CATALOGUE_LINKS):
+            href = str(a.get("href", "") or "")
             m = _ANIME_SLUG_RE.match(href)
             if not m:
                 continue
@@ -1602,12 +1643,12 @@ class AniWorldScraper:
             if slug_key(slug) in seen_slugs:
                 continue
             seen_slugs.add(slug_key(slug))
-            title = a.get_text(strip=True)
+            title = _stripped_text(a)
             if not title:
                 continue
 
             # Extract alternative titles from data attribute
-            alt_titles_raw = str(a.get("data-alternative-title", ""))
+            alt_titles_raw = str(a.get("data-alternative-title", "") or "")
             alt_titles = [t.strip() for t in alt_titles_raw.split(",") if t.strip()] if alt_titles_raw else []
 
             series.append(
@@ -1621,8 +1662,8 @@ class AniWorldScraper:
 
         # Fallback: scan all links if container selector failed
         if not series:
-            for a in soup.find_all("a", href=True):
-                href = str(a["href"])
+            for a in doc.xpath(_XP_ANY_LINK):
+                href = str(a.get("href", "") or "")
                 m = _ANIME_SLUG_RE.match(href)
                 if not m:
                     continue
@@ -1630,7 +1671,7 @@ class AniWorldScraper:
                 if slug_key(slug) in seen_slugs:
                     continue
                 seen_slugs.add(slug_key(slug))
-                title = a.get_text(strip=True)
+                title = _stripped_text(a)
                 if not title:
                     continue
                 series.append(
@@ -1669,13 +1710,13 @@ class AniWorldScraper:
                 logger.warning("Could not fetch %s: %s", base_url, e)
                 continue
 
-            soup = make_soup(resp.text)
-            if not _is_logged_in(soup):
+            doc = make_doc(resp.text)
+            if doc is None or not _is_logged_in(doc):
                 raise RuntimeError(f"Not logged in — cannot fetch {label} page")
 
             # aniworld.to: div.seriesListContainer > div a with h3 for title
-            for entry in soup.select("div.seriesListContainer > div a"):
-                href = str(entry.get("href", ""))
+            for entry in doc.xpath(_XP_SERIES_LIST_LINKS):
+                href = str(entry.get("href", "") or "")
                 m = _ANIME_SLUG_RE.match(href)
                 if not m:
                     continue
@@ -1684,8 +1725,8 @@ class AniWorldScraper:
                     continue
                 seen_slugs.add(slug_key(slug))
 
-                title_el = entry.select_one("h3")
-                title = title_el.get_text(strip=True) if title_el else slug
+                title_el = _first(entry, ".//h3")
+                title = _stripped_text(title_el) if title_el is not None else slug
 
                 series_list.append(
                     {
@@ -1697,8 +1738,8 @@ class AniWorldScraper:
 
             # Fallback: generic link scan
             if len(series_list) == count_before:
-                for link in soup.find_all("a", href=True):
-                    href = str(link.get("href", ""))
+                for link in doc.xpath(_XP_ANY_LINK):
+                    href = str(link.get("href", "") or "")
                     m = _ANIME_SLUG_RE.match(href)
                     if not m:
                         continue
@@ -1706,7 +1747,7 @@ class AniWorldScraper:
                     if slug_key(slug) in seen_slugs:
                         continue
                     seen_slugs.add(slug_key(slug))
-                    title = link.get_text(strip=True) or slug
+                    title = _stripped_text(link) or slug
                     series_list.append(
                         {
                             "title": title,
@@ -1800,17 +1841,26 @@ class AniWorldScraper:
         except httpx.HTTPError as e:
             return self._error_result(info, str(e))
 
-        soup = make_soup(resp.text)
+        # One tree per series page, read seven ways below. This parse used to
+        # be a BeautifulSoup build and was the largest unmeasured cost in a
+        # run: the profiler wrapped the network and the season parse but not
+        # this, so it never showed up. It is ~2.8ms here against ~16.8ms as a
+        # soup, once per series, on the event loop that every concurrent
+        # fetch shares.
+        with self._profiler.phase("parse_series"):
+            doc = make_doc(resp.text)
+        if doc is None:
+            return self._error_result(info, "series page was not markup")
 
         # Detect error pages (404, 502, etc.) before parsing content
-        error_code = _check_error_page(soup)
+        error_code = _check_error_page(doc)
         if error_code:
             reason = f"{error_code} server error" if error_code in _SERVER_ERROR_CODES else f"{error_code} error page"
             logger.warning("Error page detected for %s: %s", url, error_code)
             return self._error_result(info, reason)
 
         # Verify still logged in
-        if not _is_logged_in(soup):
+        if not _is_logged_in(doc):
             # One shared session serves the whole run, so an expiry here would
             # otherwise fail every remaining series. Re-login once and retry
             # this page; only give up if the second look is still logged out.
@@ -1819,24 +1869,27 @@ class AniWorldScraper:
                     resp = await self._get(client, url)
                 except httpx.HTTPError as e:
                     return self._error_result(info, str(e))
-                soup = make_soup(resp.text)
-            if not _is_logged_in(soup):
+                with self._profiler.phase("parse_series"):
+                    retry_doc = make_doc(resp.text)
+                if retry_doc is not None:
+                    doc = retry_doc
+            if not _is_logged_in(doc):
                 logger.error("Session expired while scraping %s", url)
                 return self._error_result(info, "session expired — not logged in")
 
         # This page is proven logged in; use it to learn the account name that
         # the season pages below are then checked against.
-        self._remember_account_name(soup)
+        self._remember_account_name(doc)
 
-        title = _extract_title(soup) or info.get("title", slug)
+        title = _extract_title(doc) or info.get("title", slug)
         if title and title.lower().strip() in _UTILITY_PAGES:
             return self._error_result(info, "utility page")
 
         # Detect subscription/watchlist status from the main series page
-        subscribed, watchlist = _detect_subscription_status(soup)
+        subscribed, watchlist = _detect_subscription_status(doc)
 
         # Extract alt titles
-        alt_titles_from_page = _extract_alt_titles(soup)
+        alt_titles_from_page = _extract_alt_titles(doc)
         # Merge with alt_titles from index page if present
         alt_titles_from_info = info.get("alt_titles", [])
         alt_titles = list(dict.fromkeys(alt_titles_from_info + alt_titles_from_page))
@@ -1848,7 +1901,7 @@ class AniWorldScraper:
         else:
             season_base_url = self.site_url
 
-        season_links = _extract_season_links(soup, slug, season_base_url)
+        season_links = _extract_season_links(doc, slug, season_base_url)
         if not season_links:
             return self._error_result(info, "no seasons found")
 
@@ -1963,7 +2016,7 @@ class AniWorldScraper:
 
     # ── Worker ──────────────────────────────────────────────────────────────
 
-    def _remember_account_name(self, soup) -> None:
+    def _remember_account_name(self, doc) -> None:
         """Learn the account name from a page already proven to be logged in.
 
         The series page is checked for the avatar marker before this runs, so
@@ -1972,7 +2025,7 @@ class AniWorldScraper:
         check follows a rename on its own.
         """
         if self._account_name is None:
-            name = _account_name_from_soup(soup)
+            name = _account_name_from_doc(doc)
             if name:
                 self._account_name = name
                 logger.debug("Account name for season-page checks: %s", name)
@@ -2818,13 +2871,16 @@ class AniWorldScraper:
         }
         try:
             resp = await client.get(url, follow_redirects=True)
-            soup = make_soup(resp.text)
-            error_code = _check_error_page(soup)
+            doc = make_doc(resp.text)
+            if doc is None:
+                result["error"] = "error_page_unparseable"
+                return result
+            error_code = _check_error_page(doc)
             if error_code:
                 result["error"] = f"error_page_{error_code}"
                 return result
-            title = _extract_title(soup)
-            season_count = _count_seasons_from_html(soup)
+            title = _extract_title(doc)
+            season_count = _count_seasons_from_html(doc)
             result["reachable"] = True
             result["title"] = title
             result["season_count"] = season_count

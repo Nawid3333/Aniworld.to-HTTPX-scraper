@@ -28,7 +28,18 @@ from typing import Protocol
 from config.config import DATA_DIR, NUM_WORKERS, SERIES_INDEX_FILE, SITE_URL
 from src.atomic_io import atomic_write_json
 from src.index_manager import IndexManager, get_episode_counts, paginate_list
-from src.scraper import AniWorldScraper, ProgressWriter, _extract_title, _is_logged_in, make_soup
+from src.scraper import (
+    AniWorldScraper,
+    ProgressWriter,
+    _extract_title,
+    _first,
+    _has_class_xpath,
+    _is_logged_in,
+    _stripped_text,
+    make_doc,
+)
+from src.term import cinput as input
+from src.term import cprint as print
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +87,19 @@ def normalize_genre_key(value: object) -> str:
 # ── Site-specific parser ────────────────────────────────────────────────────
 # The only part of this module that differs between the three scrapers.
 
+# lxml translations of the CSS this module used to hand to BeautifulSoup.
+# The genre scan runs once per series page, so it rides the same tree the
+# title and login checks use rather than building a second one.
+_XP_GENRE_ITEMS = f".//div[{_has_class_xpath('genres')}]//li"
+_XP_HIDDEN_BUTTON = f".//button[{_has_class_xpath('hiddenArea')}]"
+_XP_GENRE_ANCHOR = ".//a[@itemprop='genre']"
 
-def _scan_genre_block(soup) -> tuple[list[tuple[str, str]], int, int, int | None]:
+
+def _scan_genre_block(doc) -> tuple[list[tuple[str, str]], int, int, int | None]:
     """One traversal of div.genres li -> (genres, visible, raw_anchors, hidden).
 
     extract_genres() and the truncation check used to each run their own
-    soup.select() over the same block -- three passes over the same handful
+    select() pass over the same block -- three passes over the same handful
     of elements for every one of ~2,462 pages. Measured not to matter (a
     profiled live run put parse at 9.9% of wall time against 90.1% network,
     this project's usual story -- see PhaseProfiler in scraper.py), but doing
@@ -93,28 +111,28 @@ def _scan_genre_block(soup) -> tuple[list[tuple[str, str]], int, int, int | None
     raw_anchors = 0
     hidden: int | None = None
     past_button = False
-    for element in soup.select("div.genres li"):
-        button = element.find("button", class_="hiddenArea")
+    for element in doc.xpath(_XP_GENRE_ITEMS):
+        button = _first(element, _XP_HIDDEN_BUTTON)
         if button is not None:
             past_button = True
-            match = _DIGITS_RE.search(button.get_text())
+            match = _DIGITS_RE.search("".join(button.itertext()))
             hidden = int(match.group(1)) if match else None
             continue
-        anchor = element.find("a", attrs={"itemprop": "genre"})
+        anchor = _first(element, _XP_GENRE_ANCHOR)
         if anchor is None:
             continue
         raw_anchors += 1
         if not past_button:
             visible += 1
-        label = anchor.get_text(strip=True)
-        key = normalize_genre_key(str(anchor.get("href", ""))) or normalize_genre_key(label)
+        label = _stripped_text(anchor)
+        key = normalize_genre_key(str(anchor.get("href", "") or "")) or normalize_genre_key(label)
         if key and key not in seen:
             seen.add(key)
             out.append((key, label or key))
     return out, visible, raw_anchors, hidden
 
 
-def extract_genres(soup) -> list[tuple[str, str]]:
+def extract_genres(doc) -> list[tuple[str, str]]:
     """Return [(key, label), ...] for every genre on a series page.
 
     Selecting anchors by ``itemprop`` (inside _scan_genre_block) reaches past
@@ -123,17 +141,17 @@ def extract_genres(soup) -> list[tuple[str, str]]:
     HTML. Iterating <li> elements' text instead would return "+ 2" as a genre
     and drop the ones after it.
     """
-    return _scan_genre_block(soup)[0]
+    return _scan_genre_block(doc)[0]
 
 
-def _hidden_genre_count(soup) -> int | None:
+def _hidden_genre_count(doc) -> int | None:
     """How many genres the page admits to hiding, or None if it says nothing.
 
     A free tripwire: the site tells us the number, so a markup change that
     starts costing us genres shows up as a warning instead of silently smaller
     numbers. Kept as its own entry point for callers that only want this.
     """
-    return _scan_genre_block(soup)[3]
+    return _scan_genre_block(doc)[3]
 
 
 def _check_truncation(slug: str, visible: int, raw_anchors: int, hidden: int | None) -> None:
@@ -291,13 +309,19 @@ async def _scrape_async(site_url: str | None, data: dict, state: dict, *, refetc
                 try:
                     resp = await scraper._get(client, url)  # noqa: SLF001
                     with scraper._profiler.phase("parse"):  # noqa: SLF001
-                        soup = make_soup(resp.text)
-                        genres, visible, raw_anchors, hidden = _scan_genre_block(soup)
-                        _check_truncation(slug, visible, raw_anchors, hidden)
-                        title = _extract_title(soup) or slug
+                        doc = make_doc(resp.text)
+                        if doc is not None:
+                            genres, visible, raw_anchors, hidden = _scan_genre_block(doc)
+                            _check_truncation(slug, visible, raw_anchors, hidden)
+                            title = _extract_title(doc) or slug
                     if not genres:
+                        # A body that is not markup lands here too. make_soup
+                        # used to hand back an empty tree for it, which read as
+                        # "this page has no genres"; make_doc says None instead.
+                        # Kept on the empty branch rather than promoted to a
+                        # failure, so the tally means what it always meant.
                         state["empty"] += 1
-                    if not state["logged_out"] and not _is_logged_in(soup):
+                    if not state["logged_out"] and doc is not None and not _is_logged_in(doc):
                         state["logged_out"] = True
                         logger.warning("Session expired mid-run; genres still parse anonymously")
                 except Exception as exc:  # noqa: BLE001 - one bad page must never end the run

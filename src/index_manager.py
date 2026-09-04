@@ -19,8 +19,11 @@ from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from config.config import SITE_URL, VALID_SERIES_HOSTS
+from src import term
 from src.atomic_io import atomic_write_json, create_file_backup
 from src.slug import slug_key
+from src.term import cinput as input
+from src.term import cprint as print
 
 logger = logging.getLogger(__name__)
 
@@ -1324,7 +1327,9 @@ def _prompt_episode_mismatches(mismatches, old_data=None, active_site_url=None):
             return False, None
         # Default or choice '1': proceed
     else:
-        choice = input("\nProceed with merge despite warnings? (y/n): ").strip().lower()
+        choice = (
+            input("\n" + term.danger("Proceed with merge despite warnings?") + term.dim(" (y/n): ")).strip().lower()
+        )
         return choice == "y", None
 
     return True, None
@@ -1482,7 +1487,7 @@ def _prompt_change_confirmations(changes, new_dict):
         print("\n" + "─" * term_w)
         print(formatted_changes)
         print("─" * term_w)
-        resp = input("\nAllow subscription/watchlist changes? (y/n): ").strip().lower()
+        resp = input("\n" + term.danger("Allow subscription/watchlist changes?") + term.dim(" (y/n): ")).strip().lower()
         if resp == "y":
             if changes.get("newly_subscribed"):
                 allowed["subscribe"] = True
@@ -2595,9 +2600,12 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                     # series on this list, so the count has to be stated and
                     # confirmed before it runs.
                     remaining_count = len(rows) - i + 1
-                    print(f"\n  [WARN] This deletes {remaining_count} series from the index, including this one.")
-                    print("  Deleted entries lose their stored watch history.")
-                    typed = input(f"  Type 'DELETE {remaining_count}' to confirm: ").strip()
+                    print(
+                        "\n  "
+                        + term.alert(f"⚠ This deletes {remaining_count} series from the index, including this one.")
+                    )
+                    print("  " + term.warn("Deleted entries lose their stored watch history."))
+                    typed = input("  " + term.danger(f"Type 'DELETE {remaining_count}' to confirm: ")).strip()
                     if typed != f"DELETE {remaining_count}":
                         print("  → Not confirmed; nothing deleted. Back to this entry.")
                         apply_to_all = None
@@ -2633,7 +2641,12 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                     print("    Make sure the new entry on the site reflects the same progress,")
                     print("    otherwise the next scrape may report those episodes as unwatched.")
                 if choice == "d":
-                    confirm = input(f'  Confirm delete "{v_title}"? (y/n) [n]: ').strip().lower() or "n"
+                    confirm = (
+                        input("  " + term.danger(f'Confirm delete "{v_title}"?') + term.dim(" (y/n) [n]: "))
+                        .strip()
+                        .lower()
+                        or "n"
+                    )
                 else:
                     confirm = "y"
                 if confirm == "y":

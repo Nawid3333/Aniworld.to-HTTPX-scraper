@@ -26,20 +26,27 @@ from src.genre_stats import (  # noqa: E402
     normalize_genre_key,
     save_genres,
 )
-from src.scraper import _extract_title, make_soup  # noqa: E402
+from src.scraper import _extract_title, _has_class_xpath, make_doc  # noqa: E402
 
 PAGE_DIR = Path(__file__).resolve().parent / "fixtures" / "pages"
+
+# The genre anchors and the "+ N" button, interleaved in document order --
+# an XPath union, which is what a CSS selector list means. Order is the whole
+# point: this test counts anchors up to the button to learn what the page
+# considers visible.
+_GENRE_LI = f".//div[{_has_class_xpath('genres')}]//li"
+_XP_GENRE_OR_BUTTON = f"{_GENRE_LI}//a[@itemprop='genre'] | {_GENRE_LI}//button[{_has_class_xpath('hiddenArea')}]"
 
 
 def load_page(name):
     path = PAGE_DIR / f"series__{name}.html.gz"
     if not path.exists():
         return None
-    return make_soup(gzip.decompress(path.read_bytes()).decode("utf-8"))
+    return make_doc(gzip.decompress(path.read_bytes()).decode("utf-8"))
 
 
-def keys_of(soup):
-    return [key for key, _ in extract_genres(soup)]
+def keys_of(doc):
+    return [key for key, _ in extract_genres(doc)]
 
 
 def series_entry(total, watched, slug):
@@ -63,26 +70,26 @@ class TestHiddenGenresAreCaptured(unittest.TestCase):
     """The single most likely way this feature ships subtly wrong."""
 
     def test_one_piece_yields_every_genre_including_the_hidden_four(self):
-        soup = load_page("one-piece")
-        if soup is None:
+        doc = load_page("one-piece")
+        if doc is None:
             self.skipTest("one-piece fixture not captured")
-        keys = keys_of(soup)
+        keys = keys_of(doc)
         self.assertEqual(len(keys), 11, f"expected 11 genres, got {keys}")
         self.assertIn("komoedie", keys, "a genre after the '+ 4' button was dropped")
 
     def test_bleach_yields_every_genre_including_the_hidden_two(self):
-        soup = load_page("bleach")
-        if soup is None:
+        doc = load_page("bleach")
+        if doc is None:
             self.skipTest("bleach fixture not captured")
-        self.assertEqual(len(keys_of(soup)), 9)
+        self.assertEqual(len(keys_of(doc)), 9)
 
     def test_the_show_more_button_is_never_returned_as_a_genre(self):
         for name in ("one-piece", "bleach", "naruto-shippuden", "a-whisker-away"):
-            soup = load_page(name)
-            if soup is None:
+            doc = load_page(name)
+            if doc is None:
                 continue
             with self.subTest(page=name):
-                for key, label in extract_genres(soup):
+                for key, label in extract_genres(doc):
                     self.assertTrue(key, "empty genre key")
                     self.assertNotIn("+", key)
                     self.assertFalse(label.strip().startswith("+"), f"button text leaked: {label!r}")
@@ -90,26 +97,26 @@ class TestHiddenGenresAreCaptured(unittest.TestCase):
     def test_parsed_count_matches_what_the_page_says_it_hides(self):
         """The page announces the hidden count, so it can check our work."""
         for name in ("one-piece", "bleach", "detektiv-conan", "naruto-shippuden"):
-            soup = load_page(name)
-            if soup is None:
+            doc = load_page(name)
+            if doc is None:
                 continue
-            hidden = genre_stats._hidden_genre_count(soup)
+            hidden = genre_stats._hidden_genre_count(doc)
             if hidden is None:
                 continue
             visible = 0
-            for el in soup.select("div.genres li a[itemprop='genre'], div.genres li button.hiddenArea"):
-                if el.name == "button":
+            for el in doc.xpath(_XP_GENRE_OR_BUTTON):
+                if el.tag == "button":
                     break
                 visible += 1
             with self.subTest(page=name):
-                self.assertEqual(len(extract_genres(soup)), visible + hidden)
+                self.assertEqual(len(extract_genres(doc)), visible + hidden)
 
     def test_no_upper_bound_is_assumed(self):
         """Fixtures sample the site; they do not specify it."""
         counts = {}
         for path in sorted(PAGE_DIR.glob("series__*.html.gz")):
-            soup = make_soup(gzip.decompress(path.read_bytes()).decode("utf-8"))
-            genres = extract_genres(soup)
+            doc = make_doc(gzip.decompress(path.read_bytes()).decode("utf-8"))
+            genres = extract_genres(doc)
             if genres:
                 counts[path.name] = len(genres)
         self.assertTrue(counts, "no fixture produced genres")
@@ -121,15 +128,15 @@ class TestSeriesTitles(unittest.TestCase):
 
     def test_title_is_read_from_the_h1_not_the_url_slug(self):
         for name, expected in (("one-piece", "One Piece"), ("bleach", "Bleach")):
-            soup = load_page(name)
-            if soup is None:
+            doc = load_page(name)
+            if doc is None:
                 self.skipTest(f"{name} fixture not captured")
             with self.subTest(page=name):
-                self.assertEqual(_extract_title(soup), expected)
+                self.assertEqual(_extract_title(doc), expected)
 
     def test_a_page_with_no_usable_heading_falls_back_to_the_slug(self):
-        soup = make_soup("<html><body><p>no heading here</p></body></html>")
-        self.assertIsNone(_extract_title(soup))
+        doc = make_doc("<html><body><p>no heading here</p></body></html>")
+        self.assertIsNone(_extract_title(doc))
 
 
 class TestGenreIdentity(unittest.TestCase):

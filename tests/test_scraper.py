@@ -17,9 +17,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bs4 import BeautifulSoup  # noqa: E402
+import lxml.html  # noqa: E402
 
 from config.config import configure_console  # noqa: E402
+from src import scraper  # noqa: E402
 from src.atomic_io import atomic_write_json  # noqa: E402
 from src.index_manager import (  # noqa: E402
     IndexManager,
@@ -30,13 +31,18 @@ from src.index_manager import (  # noqa: E402
 from src.scraper import (  # noqa: E402
     AniWorldScraper,
     _extract_title,
+    _first,
     _heading_text,
+    _is_logged_in,
     _parse_episodes,
+    _stripped_text,
+    make_doc,
 )
 
 
-def soup(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "html.parser")
+def tree_repr(doc) -> str:
+    """Serialise a tree so a test can prove a reader did not edit it."""
+    return lxml.html.tostring(doc, encoding="unicode")
 
 
 class TempFileCase(unittest.TestCase):
@@ -119,31 +125,38 @@ class TestAtomicWriteJson(TempFileCase):
             self.assertEqual(json.load(f), {"n": 2})
 
 
-# ==================== title extraction must not mutate soup ====================
-# Parse helpers take a pre-parsed soup, shared across extractors on one page --
-# these two land together because the non-mutation fix is what makes that
-# sharing safe.
+# ============= title extraction must not mutate the shared tree ==============
+# Parse helpers take a pre-parsed tree, shared across extractors on one page --
+# these land together because the non-mutation property is what makes that
+# sharing safe. It mattered when the readers were BeautifulSoup and it still
+# matters now they are lxml: one series page is read seven ways.
 class TestExtractTitle(unittest.TestCase):
     def test_heading_text_does_not_mutate_tree(self):
         html = "<div id='x'><h2>\n\t\tHarry Potter\n\t\t\t<small>Specials</small>\n</h2></div>"
-        s = soup(html)
-        before = str(s)
-        text = _heading_text(s.h2)
+        doc = make_doc(html)
+        before = tree_repr(doc)
+        text = _heading_text(_first(doc, ".//h2"))
         self.assertEqual(text, "Harry Potter")
-        self.assertEqual(str(s), before, "_heading_text must not edit the parse tree")
+        self.assertEqual(tree_repr(doc), before, "_heading_text must not edit the parse tree")
 
     def test_inline_tags_separated(self):
         html = "<div id='x'><h1 class='fw-bold'>\n\t\tHarry Potter\n\t\t\t<small>Specials</small>\n</h1></div>"
-        self.assertEqual(_extract_title(soup(html)), "Harry Potter")
+        self.assertEqual(_extract_title(make_doc(html)), "Harry Potter")
 
-    def test_shared_soup_not_mutated_by_extract_title(self):
-        """Once callers share one soup across extractors, _extract_title must
+    def test_a_heading_with_no_child_elements_still_yields_its_title(self):
+        """An lxml element with no children is falsy, so a plain <h1>Title</h1>
+        takes the empty branch under `not el` -- and that is the shape of every
+        real title on the site. Pins the `is None` test the readers use."""
+        self.assertEqual(_extract_title(make_doc("<h1 class='fw-bold'>Bleach</h1>")), "Bleach")
+
+    def test_shared_tree_not_mutated_by_extract_title(self):
+        """Once callers share one tree across extractors, _extract_title must
         not corrupt it for the extractors that run after."""
         html = "<div id='x'><h1 class='fw-bold'>Harry Potter<small>Specials</small></h1></div>"
-        s = soup(html)
-        before = str(s)
-        _extract_title(s)
-        self.assertEqual(str(s), before)
+        doc = make_doc(html)
+        before = tree_repr(doc)
+        _extract_title(doc)
+        self.assertEqual(tree_repr(doc), before)
 
 
 class TestParseEpisodesTakesHtml(unittest.TestCase):
@@ -582,3 +595,63 @@ class TestRemovalRequiresApproval(unittest.TestCase):
         changes = detect_changes(self.old, self.new_missing_season)
         self.assertEqual(changes["removed_seasons"], [("Show", "2")])
         self.assertEqual(changes["removed_episodes"], [], "a vanished season is not N episode removals")
+
+
+# ============== catalogue and account-page link extraction ===================
+# These selectors had no test of their own: every suite that reaches
+# _get_all_series stubs it out wholesale, so the markup-reading half was only
+# ever exercised against the live site. That gap is why the constants behind
+# them could be referenced before they existed and every test still passed.
+# Pinned here against hand-written markup shaped like the real pages.
+class TestCatalogueLinkExtraction(unittest.TestCase):
+    CATALOGUE = """
+    <html><body>
+      <div class='avatar'><a href='/user/profil/tester'>me</a></div>
+      <div id='seriesContainer'>
+        <ul>
+          <li><a href='/anime/stream/one-piece' data-alternative-title='OP, Wan Pisu'>One Piece</a></li>
+          <li><a href='/anime/stream/bleach'>Bleach</a></li>
+          <li><a href='/anime/stream/one-piece'>One Piece (dup)</a></li>
+          <li><a href='/not-an-anime/x'>Nope</a></li>
+        </ul>
+      </div>
+    </body></html>
+    """
+
+    def _catalogue(self, html):
+        doc = make_doc(html)
+        self.assertIsNotNone(doc)
+        return doc
+
+    def test_the_container_links_are_read_with_titles_and_alt_titles(self):
+        doc = self._catalogue(self.CATALOGUE)
+        found = doc.xpath(scraper._XP_CATALOGUE_LINKS)
+        self.assertEqual(len(found), 4)
+        self.assertEqual(_stripped_text(found[0]), "One Piece")
+        self.assertEqual(found[0].get("data-alternative-title"), "OP, Wan Pisu")
+
+    def test_the_avatar_marker_reads_as_logged_in(self):
+        self.assertTrue(_is_logged_in(self._catalogue(self.CATALOGUE)))
+
+    def test_a_catalogue_without_the_container_yields_nothing(self):
+        """The fallback link scan exists precisely for this shape."""
+        doc = self._catalogue("<html><body><ul><li><a href='/anime/stream/x'>X</a></li></ul></body></html>")
+        self.assertEqual(doc.xpath(scraper._XP_CATALOGUE_LINKS), [])
+        self.assertEqual(len(doc.xpath(scraper._XP_ANY_LINK)), 1)
+
+    def test_the_account_list_selector_requires_a_direct_child_div(self):
+        """`div.seriesListContainer > div a` is a child step, not a descendant
+        one -- an anchor nested one level deeper must not be picked up."""
+        html = """
+        <div class='seriesListContainer'>
+          <div><a href='/anime/stream/kept'><h3>Kept</h3></a></div>
+          <section><div><a href='/anime/stream/too-deep'><h3>Too deep</h3></a></div></section>
+        </div>
+        """
+        found = self._catalogue(html).xpath(scraper._XP_SERIES_LIST_LINKS)
+        self.assertEqual([a.get("href") for a in found], ["/anime/stream/kept"])
+
+    def test_the_account_list_title_comes_from_the_nested_h3(self):
+        html = "<div class='seriesListContainer'><div><a href='/anime/stream/x'><h3>  Show  </h3></a></div></div>"
+        anchor = self._catalogue(html).xpath(scraper._XP_SERIES_LIST_LINKS)[0]
+        self.assertEqual(_stripped_text(_first(anchor, ".//h3")), "Show")

@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from src.term import cprint as print
+
 
 def configure_console() -> None:
     """Make arrow/box-drawing output safe on any code page.

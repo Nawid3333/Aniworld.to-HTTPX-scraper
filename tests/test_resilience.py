@@ -1613,3 +1613,55 @@ class TestAUselessBackupDoesNotHideAGoodOne(_IndexLoadCase):
         with contextlib.redirect_stdout(out):
             self._load()
         self.assertNotIn("restored", out.getvalue().lower())
+
+
+class TestASeriesPageThatIsNotMarkupIsAParseFailure(QuietCase):
+    """A body lxml cannot build a tree from ends the series, and says so.
+
+    This is the one behaviour the move off BeautifulSoup deliberately changed.
+    make_soup handed back an empty tree for an empty or non-markup body, so
+    the run fell through to the login check and reported "session expired --
+    not logged in" for what was really a broken response. make_doc returns
+    None, and the caller now names the actual problem. The distinction is not
+    cosmetic: a session expiry triggers a re-login and a retry of every
+    remaining series, which is a lot of work to do about a truncated body.
+    """
+
+    class EmptyBodyClient:
+        def __init__(self, body=""):
+            self.body = body
+            self.calls = 0
+
+        async def get(self, url, **kwargs):
+            self.calls += 1
+            return httpx.Response(200, text=self.body, request=httpx.Request("GET", url))
+
+    def _scrape(self, body):
+        scraper = SCRAPER_CLS()
+        info = {"url": series_url("demo"), "link": series_url("demo"), "title": "Demo"}
+        client = self.EmptyBodyClient(body)
+        return scraper._scrape_one_series(client, info), client  # noqa: SLF001
+
+    def _run(self, body):
+        coro, client = self._scrape(body)
+        return asyncio.run(coro), client
+
+    def test_an_empty_body_is_reported_as_a_parse_failure(self):
+        result, _ = self._run("")
+        self.assertTrue(result.get("_error"))
+        self.assertIn("not markup", result.get("_error_reason", ""))
+
+    def test_a_whitespace_only_body_is_the_same(self):
+        result, _ = self._run("   \n\t  ")
+        self.assertTrue(result.get("_error"))
+        self.assertIn("not markup", result.get("_error_reason", ""))
+
+    def test_it_is_not_mistaken_for_a_session_expiry(self):
+        """The old path called this a logout, which triggered a needless re-login."""
+        result, _ = self._run("")
+        self.assertNotIn("logged in", result.get("_error_reason", ""))
+
+    def test_real_markup_still_gets_past_this_check(self):
+        """The guard must reject only unparseable bodies, not thin ones."""
+        result, _ = self._run("<html><body>ok</body></html>")
+        self.assertNotIn("not markup", result.get("_error_reason", ""))

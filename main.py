@@ -38,7 +38,7 @@ from config.config import (
     configure_console,
     ensure_env_file,
 )
-from src import genre_stats
+from src import genre_stats, term
 from src.index_manager import (
     IndexManager,
     _extract_slug_from_field,
@@ -50,6 +50,8 @@ from src.index_manager import (
 )
 from src.scraper import AniWorldScraper, ScrapingPausedError
 from src.slug import slug_keys
+from src.term import cinput as input
+from src.term import cprint as print
 
 # Global active site URL (set by domain probing)
 ACTIVE_SITE_URL: str | None = None
@@ -277,7 +279,11 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
             print(f"         {seasons} season(s), {watched}/{total} watched")
             print(f"         {series.get('url') or series.get('link', '')}")
 
-        choice = input(f"      keep which? (1-{len(entries)}, s=skip, a=abort): ").strip().lower()
+        choice = (
+            input("      " + term.danger("keep which?") + term.dim(f" (1-{len(entries)}, s=skip, a=abort): "))
+            .strip()
+            .lower()
+        )
         if choice == "a":
             print("      aborted - nothing further changed.")
             break
@@ -451,7 +457,7 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         scraper.site_url = preferred[0]
         print(f"\n→ Active host: {scraper.site_url}")
         if scraper.site_url.startswith("http://"):
-            print("  ⚠ WARNING: Active host is unencrypted (HTTP) — credentials sent in cleartext.")
+            print("  " + term.danger("⚠ WARNING: Active host is unencrypted (HTTP) — credentials sent in cleartext."))
     else:
         scraper.site_url = SITE_URL
         print(f"\n→ Active host: {scraper.site_url} (default)")
@@ -496,7 +502,7 @@ def _check_checkpoint(expected_mode):
         choice = input("Resume from checkpoint? (y/n): ").strip().lower()
         if choice == "y":
             return {"ok": True, "resume": True}
-        discard = input("Discard old checkpoint and start fresh? (y/n): ").strip().lower()
+        discard = input(term.danger("Discard old checkpoint and start fresh?") + term.dim(" (y/n): ")).strip().lower()
         if discard == "y":
             with contextlib.suppress(OSError):
                 os.remove(checkpoint_file)
@@ -505,7 +511,7 @@ def _check_checkpoint(expected_mode):
 
     print(f'\n⚠ A checkpoint exists from a different mode: "{saved_label}"')
     print(f'   You are about to run: "{expected_label}"\n')
-    discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
+    discard = input(term.danger("Discard the old checkpoint and continue?") + term.dim(" (y/n): ")).strip().lower()
     if discard == "y":
         with contextlib.suppress(OSError):
             os.remove(checkpoint_file)
@@ -514,12 +520,24 @@ def _check_checkpoint(expected_mode):
 
 
 # Configure logging with rotation
+_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+
+# Only the console handler is coloured. The rotating file keeps the plain
+# formatter: escape codes in logs/*.log are unreadable and break grep.
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_file_handler.setFormatter(term.PlainFormatter(_LOG_FORMAT))
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(term.ColorFormatter(_LOG_FORMAT))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format=_LOG_FORMAT,
     handlers=[
-        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"),
-        logging.StreamHandler(),
+        _file_handler,
+        _console_handler,
     ],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -545,10 +563,22 @@ def _extract_slug(entry):
     return None
 
 
+def _status_mark(value, width: int = 3) -> str:
+    """A padded ✓/✗/? for the report columns.
+
+    Padding happens first and colour second, so the column keeps its width:
+    an f-string width specifier counts escape codes as visible characters.
+    """
+    if value is None:
+        return f"{'?':<{width}}"
+    glyph = f"{'✓' if value else '✗':<{width}}"
+    return term.ok(glyph) if value else term.err(glyph)
+
+
 def print_header():
-    print("=" * 60)
-    print("  ANIWORLD.TO ANIME SCRAPER & INDEX MANAGER (httpx)")
-    print("=" * 60 + "\n")
+    print(term.style("=" * 60, term._T.CYAN))
+    print(term.step("  ANIWORLD.TO ANIME SCRAPER & INDEX MANAGER (httpx)"))
+    print(term.style("=" * 60, term._T.CYAN) + "\n")
 
 
 def _print_alert_block(entries, heading, advice):
@@ -562,19 +592,19 @@ def _print_alert_block(entries, heading, advice):
     site_url = (ACTIVE_SITE_URL or SITE_URL).rstrip("/")
     entries.sort(key=lambda s: s.get("title", ""))
     print("\n" + "⚠" * 35)
-    print(f"⚠ {len(entries)} {heading}:")
-    print("─" * 70)
+    print(term.alert(f"⚠ {len(entries)} {heading}:"))
+    print(term.dim("─" * 70))
     for s in entries:
         title = s.get("title", "")
         url = s.get("url") or s.get("link")
         if url and not url.startswith("http"):
             url = f"{site_url}{url}"
         if url:
-            print(f"  • {title}\n    {url}")
+            print(f"  • {title}\n    " + term.dim(url))
         else:
             print(f"  • {title}")
-    print("─" * 70)
-    print(f"  {advice}")
+    print(term.dim("─" * 70))
+    print("  " + term.warn(advice))
     print("⚠" * 35)
 
 
@@ -673,9 +703,9 @@ def check_disk_space(min_mb=100):
         stat = shutil.disk_usage(DATA_DIR)
         available_mb = stat.free / (1024 * 1024)
         if available_mb < min_mb:
-            print("\n✗ WARNING: Low disk space!")
-            print(f"  Available: {available_mb:.1f} MB (minimum needed: {min_mb} MB)")
-            print("  Please free up disk space before scraping.\n")
+            print("\n" + term.danger("✗ WARNING: Low disk space!"))
+            print(term.err(f"  Available: {available_mb:.1f} MB (minimum needed: {min_mb} MB)"))
+            print(term.err("  Please free up disk space before scraping.") + "\n")
             return False
         return True
     except Exception as e:
@@ -686,7 +716,7 @@ def check_disk_space(min_mb=100):
 def validate_credentials():
     """Check that credentials are configured."""
     if not EMAIL or not PASSWORD:
-        print("\n✗ ERROR: Credentials not configured!")
+        print("\n" + term.danger("✗ ERROR: Credentials not configured!"))
         print("\nPlease follow these steps:")
         print(f"1. Open the .env file at: {ENV_FILE}")
         print("2. Add your aniworld.to email and password:")
@@ -698,7 +728,7 @@ def validate_credentials():
 
 
 def show_menu():
-    print("\nOptions:")
+    print("\n" + term.step("Options:"))
     print("  1. Scrape all anime")
     print("  2. Scrape only NEW anime")
     print("  3. Scrape unwatched anime")
@@ -1128,13 +1158,15 @@ def _suggest_something_to_watch(idx_mgr: IndexManager | None = None):
         total = series.get("total_episodes", 0)
         sub = series.get("subscribed")
         wl = series.get("watchlist")
-        sub_mark = "✓" if sub else "✗" if sub is not None else "?"
-        wl_mark = "✓" if wl else "✗" if wl is not None else "?"
+        # Padded before colouring: an escape code inside a width specifier
+        # counts as visible characters and collapses the column.
+        sub_mark = _status_mark(sub)
+        wl_mark = _status_mark(wl)
         genres = series_genres.get(title, [])
         genre_str = ", ".join(genre_labels.get(g, g) for g in genres) if genres else "—"
         row = (
             f"    {i:<{idx_w}}  {title:<{title_w}}  {watched}/{total:<{total_w - 2}}"
-            f"  {sub_mark:<3}  {wl_mark:<3}  {genre_str:<{genre_w}}  {link}"
+            f"  {sub_mark}  {wl_mark}  {genre_str:<{genre_w}}  {link}"
         )
         print(row)
     print("\n  Copy a link and open it in your browser to check it out.")
