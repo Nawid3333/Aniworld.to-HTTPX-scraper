@@ -1,9 +1,0 @@
-{
-  "detect_changes/300_series": 0.01058020000346005,
-  "get_episode_counts/300_series": 0.0012990999966859818,
-  "index/json_load_300_series": 0.006832799990661442,
-  "make_soup/real_season_page": 0.02970020001521334,
-  "merge/300_series_x_4_seasons": 0.03903929999796674,
-  "mismatch_scan/300_series": 0.013407899998128414,
-  "parse_season_html/real_season_page": 0.010072300006868318
-}

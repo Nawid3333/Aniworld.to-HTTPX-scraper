@@ -48,6 +48,7 @@ desktop.ini
 
 # Credentials / env files
 config/.env
+tests/benchmark_baseline.json
 
 # Logs
 logs/
