@@ -2550,6 +2550,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
             }
         )
 
+    current_idx = -1
     for i, row in enumerate(rows, 1):
         if skip_all or apply_to_all is not None:
             break
@@ -2821,6 +2822,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                         new_data = verified_new_data
 
             # Show new series alongside so user can spot renames before deciding
+            new_dict = {}
             if new_data is not None:
                 old_titles = set(old_data.keys())
                 if isinstance(new_data, list):
