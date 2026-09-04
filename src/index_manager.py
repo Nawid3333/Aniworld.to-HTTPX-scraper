@@ -574,16 +574,17 @@ class IndexManager:
             with open(self.index_file, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                self.series_index = {s.get("title"): s for s in data if s.get("title") and isinstance(s, dict)}
+                # isinstance first: .get() on a non-dict raises AttributeError,
+                # and the broad handler below turns that into an empty index --
+                # one stray element used to discard every good entry with it.
+                self.series_index = {title: s for s in data if isinstance(s, dict) and (title := s.get("title"))}
             elif isinstance(data, dict):
                 first_item = next(iter(data.values()), None)
                 if first_item and isinstance(first_item, dict) and first_item.get("title"):
                     self.series_index = data
                 else:
                     self.series_index = {
-                        item.get("title"): item
-                        for item in data.values()
-                        if isinstance(item, dict) and item.get("title")
+                        title: item for item in data.values() if isinstance(item, dict) and (title := item.get("title"))
                     }
             else:
                 self.series_index = {}
@@ -644,17 +645,29 @@ class IndexManager:
             try:
                 with open(backup_path, encoding="utf-8") as f:
                     data = json.load(f)
+                recovered = None
                 if isinstance(data, list):
-                    return {s.get("title"): s for s in data if s.get("title") and isinstance(s, dict)}
-                if isinstance(data, dict):
+                    # Same guard order as load_index, and it matters more here:
+                    # the except below catches only JSONDecodeError/OSError, so
+                    # an AttributeError escaped the loop and .bak2/.bak3 were
+                    # never tried.
+                    recovered = {title: s for s in data if isinstance(s, dict) and (title := s.get("title"))}
+                elif isinstance(data, dict):
                     first_item = next(iter(data.values()), None)
                     if first_item and isinstance(first_item, dict) and first_item.get("title"):
-                        return data
-                    return {
-                        item.get("title"): item
-                        for item in data.values()
-                        if isinstance(item, dict) and item.get("title")
-                    }
+                        recovered = data
+                    else:
+                        recovered = {
+                            title: item
+                            for item in data.values()
+                            if isinstance(item, dict) and (title := item.get("title"))
+                        }
+                if recovered:
+                    return recovered
+                # A readable backup holding nothing usable is not a restore.
+                # Returning it anyway ended the search here, so a truncated
+                # .bak1 hid a perfectly good .bak2 behind it.
+                logger.warning("Backup %s held no usable entries; trying the next", backup_path)
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Backup %s also corrupted: %s", backup_path, e)
         return None

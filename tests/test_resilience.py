@@ -4,8 +4,10 @@ Each class here pins one bug that was found by reproducing it, not by reading:
 a failed save deleting the index, a corrupt or missing index loading as empty,
 one transient error failing an entire series, an unexpected worker exception
 discarding the run, a mid-run session expiry failing every series after it, a
-fuzzy title guess silently skipping a new series, and a truncated catalogue
-making the whole index look vanished.
+fuzzy title guess silently skipping a new series, a truncated catalogue
+making the whole index look vanished, one malformed element in the index file
+discarding every good entry alongside it, and a useless newest backup hiding
+a good older one.
 
 They are written against the observable behaviour rather than the internals,
 so a future refactor that keeps the guarantees keeps the tests.
@@ -1434,3 +1436,180 @@ class TestBulkRescrapeIsOneRoundTrip(QuietCase):
         im._rescrape_rows(rows, scraper, {})
         self.assertEqual(len(scraper.calls[0][0]), 2)
         self.assertEqual(rows[1]["v_title"], "Show1")
+
+
+class _IndexLoadCase(TempDirCase):
+    """Shared scaffolding for the two index-loading regressions below.
+
+    Not a test case itself: the helpers live here so that neither class
+    inherits the other one's tests and runs them a second time.
+    """
+
+    JUNK = ["a bare string", 42, None, ["nested", "list"], True]
+
+    def _series(self, title, watched=12):
+        host = sorted(im.VALID_SERIES_HOSTS)[0]
+        path = im._VALID_SERIES_PATH_RE.pattern.split("[")[0]
+        return {
+            "title": title,
+            "url": f"https://{host}{path}{title.lower()}",
+            "seasons": [
+                {
+                    "season": "Season 1",
+                    "episodes": [{"number": n, "watched": n <= watched} for n in range(1, 13)],
+                    "total_episodes": 12,
+                    "watched_episodes": watched,
+                }
+            ],
+        }
+
+    def _write(self, data):
+        with open(self.index_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _corrupt_the_index(self):
+        with open(self.index_path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+
+    def _write_bak2(self, data):
+        with open(self.index_path + ".bak2", "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _load(self):
+        manager = im.IndexManager(self.index_path)
+        manager.load_index()
+        return manager
+
+
+class TestJunkEntriesDoNotDiscardTheIndex(_IndexLoadCase):
+    """One malformed element must cost that element, not the whole index.
+
+    The list branch of the loader called ``.get("title")`` before checking
+    ``isinstance(..., dict)``, so a stray string or number raised
+    AttributeError. The broad handler around the load turned that into an
+    empty index, and the next save wrote the emptiness to disk: one junk
+    element silently destroyed every watch record in the file. The dict
+    branch three lines below always had the guards the right way round,
+    which is what makes this a slip rather than a design.
+    """
+
+    def test_a_stray_element_does_not_take_the_good_entries_with_it(self):
+        self._write([self._series("Kept"), "a bare string", self._series("Also")])
+        self.assertEqual(sorted(self._load().series_index), ["Also", "Kept"])
+
+    def test_every_kind_of_junk_is_skipped_rather_than_fatal(self):
+        for junk in self.JUNK:
+            with self.subTest(junk=junk):
+                self._write([self._series("Kept"), junk])
+                self.assertEqual(sorted(self._load().series_index), ["Kept"])
+
+    def test_the_surviving_entry_keeps_its_watch_history(self):
+        """Reading the title back is not enough if the episodes came back blank."""
+        self._write([self._series("Kept", watched=7), "a bare string"])
+        total, watched = im.get_episode_counts(self._load().series_index["Kept"])
+        self.assertEqual((total, watched), (12, 7))
+
+    def test_an_index_of_nothing_but_junk_loads_empty_instead_of_raising(self):
+        """Empty is the right answer; how it is reached is the point.
+
+        Before the fix this also ended up empty -- by raising and being
+        swallowed -- so asserting only on the result would pass against the
+        bug. The warning is what separates "skipped the junk" from "gave up".
+        """
+        self._write(list(self.JUNK))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            manager = self._load()
+        self.assertEqual(dict(manager.series_index), {})
+        self.assertNotIn("Error loading index", out.getvalue())
+
+    def test_a_title_less_entry_is_dropped_not_stored_under_a_none_key(self):
+        """A None key breaks every later sorted() over the index."""
+        self._write([self._series("Kept"), {"url": "https://example.invalid/x", "seasons": []}])
+        self.assertNotIn(None, self._load().series_index)
+
+    def test_junk_in_a_dict_shaped_index_is_skipped_too(self):
+        self._write({"one": self._series("Kept"), "two": "a bare string"})
+        index = self._load().series_index
+        self.assertNotIn("two", index)
+        self.assertEqual(len(index), 1)
+
+    def test_junk_in_a_backup_does_not_abandon_the_rest_of_it(self):
+        """The restore path is where this bit hardest.
+
+        Its except clause catches only JSONDecodeError and OSError, so the
+        AttributeError escaped the backup loop entirely -- the good entries
+        in that backup were lost and no later backup was tried either.
+        """
+        self._corrupt_the_index()
+        self.write_backup([self._series("FromBackup"), "a bare string"])
+        self.assertEqual(sorted(self._load().series_index), ["FromBackup"])
+
+    def test_a_backup_recovered_through_junk_keeps_its_watch_history(self):
+        self._corrupt_the_index()
+        self.write_backup([self._series("FromBackup", watched=3), 42])
+        total, watched = im.get_episode_counts(self._load().series_index["FromBackup"])
+        self.assertEqual((total, watched), (12, 3))
+
+
+class TestAUselessBackupDoesNotHideAGoodOne(_IndexLoadCase):
+    """The backup search must skip a readable backup that restores nothing.
+
+    .bak1 is the newest copy, so it is tried first -- but a save that failed
+    early can leave it truncated to an empty list, or holding only elements
+    the loader skips. Returning that as the restore ended the search, so
+    .bak2 and .bak3 were never opened even when one of them held the real
+    index. Empty is a legitimate answer only once every backup has been
+    tried.
+    """
+
+    def test_a_backup_of_only_junk_falls_through_to_the_next(self):
+        self._corrupt_the_index()
+        self.write_backup(["a bare string", 42])
+        self._write_bak2([self._series("FromBak2")])
+        self.assertEqual(sorted(self._load().series_index), ["FromBak2"])
+
+    def test_a_backup_truncated_to_an_empty_list_falls_through_too(self):
+        """The likeliest shape: a save that died before writing any entries."""
+        self._corrupt_the_index()
+        self.write_backup([])
+        self._write_bak2([self._series("FromBak2")])
+        self.assertEqual(sorted(self._load().series_index), ["FromBak2"])
+
+    def test_the_fallthrough_also_runs_when_the_index_is_missing_entirely(self):
+        """The missing-file branch reaches the backups by a different route."""
+        if os.path.exists(self.index_path):
+            os.remove(self.index_path)
+        self.write_backup([])
+        self._write_bak2([self._series("FromBak2")])
+        self.assertEqual(sorted(self._load().series_index), ["FromBak2"])
+
+    def test_the_recovered_backup_keeps_its_watch_history(self):
+        self._corrupt_the_index()
+        self.write_backup([])
+        self._write_bak2([self._series("FromBak2", watched=5)])
+        total, watched = im.get_episode_counts(self._load().series_index["FromBak2"])
+        self.assertEqual((total, watched), (12, 5))
+
+    def test_a_good_first_backup_is_still_preferred(self):
+        """The fallthrough must not reorder the backups it does accept."""
+        self._corrupt_the_index()
+        self.write_backup([self._series("FromBak1")])
+        self._write_bak2([self._series("FromBak2")])
+        self.assertEqual(sorted(self._load().series_index), ["FromBak1"])
+
+    def test_when_no_backup_holds_anything_the_index_is_empty(self):
+        self._corrupt_the_index()
+        self.write_backup([])
+        self._write_bak2(["a bare string"])
+        self.assertEqual(dict(self._load().series_index), {})
+
+    def test_and_no_restore_is_claimed_in_that_case(self):
+        """Announcing a restore that recovered nothing is worse than silence."""
+        self._corrupt_the_index()
+        self.write_backup([])
+        self._write_bak2(["a bare string"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self._load()
+        self.assertNotIn("restored", out.getvalue().lower())
