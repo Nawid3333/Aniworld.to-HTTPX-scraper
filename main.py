@@ -578,9 +578,9 @@ def _status_mark(value, width: int = 3) -> str:
 
 
 def print_header():
-    print(term.style("=" * 60, term._T.CYAN))
+    print(term.accent("=" * 60))
     print(term.step("  ANIWORLD.TO ANIME SCRAPER & INDEX MANAGER (httpx)"))
-    print(term.style("=" * 60, term._T.CYAN) + "\n")
+    print(term.accent("=" * 60) + "\n")
 
 
 def _print_alert_block(entries, heading, advice):
@@ -1203,7 +1203,14 @@ def _run_scrape_and_save(
             _probe_sites_before_scrape(scraper)
         scraper.run(**run_kwargs)
 
-        if scraper.series_data:
+        # scraper.series_data may include "_error" placeholder entries (kept
+        # so checkpoint data stays complete across pauses/resumes) alongside
+        # genuine results, so gate on entries that actually succeeded rather
+        # than on the raw list -- otherwise a run where every series failed
+        # (e.g. all retries failing again) is misreported as a success below.
+        successful_data = [s for s in scraper.series_data if isinstance(s, dict) and not s.get("_error")]
+
+        if successful_data:
             if pre_save_hook:
                 pre_save_hook(scraper, pre_index)
 
@@ -1212,8 +1219,10 @@ def _run_scrape_and_save(
             # Everything this run proved alive. A run that fetched no
             # catalogue still scraped something, and what it read is then its
             # only evidence -- enough to keep a freshly scraped entry off the
-            # vanished list the startup report still names.
-            seen_slugs = catalogue_slugs | ({_extract_slug(s) for s in (scraper.series_data or [])} - {None})
+            # vanished list the startup report still names. Only the entries
+            # that actually came back count: a failed fetch proves nothing
+            # about whether the series is still there.
+            seen_slugs = catalogue_slugs | ({_extract_slug(s) for s in successful_data} - {None})
             scope = vanished_scope or ("new_only" if run_kwargs.get("new_only") else "all")
             # True when show_vanished_series ran its decision table over these
             # entries. The startup report lists what is missing from every

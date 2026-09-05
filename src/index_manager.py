@@ -2681,7 +2681,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
 
     # Apply the chosen action to all remaining rows
     if apply_to_all is not None:
-        remaining = rows[current_idx + 1 :] if "current_idx" in locals() else rows
+        remaining = rows[current_idx + 1 :]
         action = apply_to_all
         if action in ("y", "d"):
             print(f"\n  Applying '{action}' to {len(remaining)} remaining entries...")
@@ -2853,8 +2853,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                     print(f"      old: {url}")
                 print(separator)
 
-            new_dict_for_prompt = new_dict if new_data is not None else {}
-            to_delete = _prompt_vanished_table(vanished, new_dict_for_prompt, old_data, scraper=scraper)
+            to_delete = _prompt_vanished_table(vanished, new_dict, old_data, scraper=scraper)
 
             if to_delete and index_file:
                 removed = remove_series_from_index(index_file, to_delete)
@@ -2895,7 +2894,26 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
     """
     old_data = dict(index_manager.series_index)
 
-    new_dict = {s.get("title"): s for s in new_data if s.get("title")} if isinstance(new_data, list) else dict(new_data)
+    # Drop the "_error" placeholders the scraper keeps in series_data so a
+    # checkpoint stays complete across a pause/resume. A series the index
+    # already holds survives one either way -- the placeholder carries no
+    # seasons, so _build_merged_data has nothing to merge and leaves the
+    # stored entry alone. A series the index has *not* seen is the problem:
+    # the placeholder is inserted as a genuine new entry with zero episodes,
+    # which then reports as a real series that has none, and the next
+    # successful scrape reads its whole episode list as newly added. Both
+    # sibling scrapers have filtered these out since their first release;
+    # this one did not, and its runs are the same shape.
+    if isinstance(new_data, list):
+        new_dict = {s.get("title"): s for s in new_data if s.get("title") and not s.get("_error")}
+        skipped_errors = [s for s in new_data if isinstance(s, dict) and s.get("_error")]
+    else:
+        new_dict = {k: v for k, v in dict(new_data).items() if not v.get("_error")}
+        skipped_errors = [v for v in dict(new_data).values() if v.get("_error")]
+
+    if skipped_errors:
+        print(f"\n⚠ Skipping {len(skipped_errors)} failed/error series from save.")
+        logger.warning("Skipped %d error series from save.", len(skipped_errors))
 
     changes = detect_changes(old_data, new_dict)
     logger.info("Detected changes: %s", {k: len(v) for k, v in changes.items()})

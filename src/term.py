@@ -19,8 +19,24 @@ so every existing ``print`` call keeps its shape and only gains colour. Only a
 ("12/24 → 24/24", "wrote 1 URL → batch.txt") is left alone.
 
 Anything that needs a colour the markers cannot express (a whole block of
-danger text, a dimmed hint inside a prompt) calls `danger`, `warn`, `ok`,
-`step` or `dim` directly.
+danger text, a dimmed hint inside a prompt) calls a style function directly:
+
+    err       red             a failure
+    danger    bold red        a failure that stops the run, or a destructive prompt
+    critical  bold magenta    a failure the run cannot continue past
+    warn      yellow          needs attention, not fatal
+    alert     bold yellow     a warning that has to be seen before what is below it
+    ok        green           something succeeded
+    success   bold green      a heading over something that went well
+    step      bold cyan       a step or section heading
+    accent    cyan            a rule, a separator, a name worth picking out
+    title     bold blue       the title line of a boxed report block
+    bold      bold            emphasis with no colour meaning
+    dim       dim             supporting detail
+
+`Style` holds the raw codes behind those. Reach for it only where none of the
+above says what is meant -- if you find yourself repeating one combination,
+it wants a name here instead.
 """
 
 from __future__ import annotations
@@ -31,7 +47,7 @@ import re
 import sys
 
 
-class _T:
+class Style:
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
@@ -105,7 +121,7 @@ def style(text: str, *codes: str) -> str:
     """Wrap text in ANSI codes, or return it untouched when colour is off."""
     if not _COLOR or not text:
         return text
-    return "".join(codes) + text + _T.RESET
+    return "".join(codes) + text + Style.RESET
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -118,37 +134,62 @@ def strip_ansi(text: str) -> str:
 
 def err(text: str) -> str:
     """A failure."""
-    return style(text, _T.RED)
+    return style(text, Style.RED)
 
 
 def danger(text: str) -> str:
     """A failure that stops the run, or a destructive confirmation."""
-    return style(text, _T.BOLD, _T.RED)
+    return style(text, Style.BOLD, Style.RED)
 
 
 def warn(text: str) -> str:
     """Something that needs attention but is not fatal."""
-    return style(text, _T.YELLOW)
+    return style(text, Style.YELLOW)
 
 
 def alert(text: str) -> str:
     """A warning heading that has to be seen before anything below it."""
-    return style(text, _T.BOLD, _T.YELLOW)
+    return style(text, Style.BOLD, Style.YELLOW)
 
 
 def ok(text: str) -> str:
     """Something succeeded."""
-    return style(text, _T.GREEN)
+    return style(text, Style.GREEN)
 
 
 def step(text: str) -> str:
     """A step or section heading."""
-    return style(text, _T.BOLD, _T.CYAN)
+    return style(text, Style.BOLD, Style.CYAN)
 
 
 def dim(text: str) -> str:
     """Supporting detail: input hints, rules, URLs under a title."""
-    return style(text, _T.DIM)
+    return style(text, Style.DIM)
+
+
+def bold(text: str) -> str:
+    """Emphasis with no colour meaning: a label, a count, a name in a list."""
+    return style(text, Style.BOLD)
+
+
+def accent(text: str) -> str:
+    """A rule, a separator, or a name worth picking out of a line."""
+    return style(text, Style.CYAN)
+
+
+def success(text: str) -> str:
+    """A heading over something that went well, as opposed to a single `ok`."""
+    return style(text, Style.BOLD, Style.GREEN)
+
+
+def critical(text: str) -> str:
+    """A failure the run cannot continue past. Matches the CRITICAL: marker."""
+    return style(text, Style.BOLD, Style.MAGENTA)
+
+
+def title(text: str) -> str:
+    """The title line of a boxed report block."""
+    return style(text, Style.BOLD, Style.BLUE)
 
 
 # A prompt's trailing hint -- "(0-2)", "[default: 2]", "(y/n) [n]" -- plus the
@@ -182,15 +223,15 @@ def cinput(text: str = "") -> str:
 # Ordered longest-prefix-first so "✅" is tested before "✓" would ever matter
 # and the spelled-out words cannot be shadowed by a shorter marker.
 _LEAD_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("✗", (_T.RED,)),
-    ("⚠", (_T.YELLOW,)),
-    ("✅", (_T.GREEN,)),
-    ("✓", (_T.GREEN,)),
-    ("→", (_T.BOLD, _T.CYAN)),
-    ("[WARN]", (_T.YELLOW,)),
-    ("WARNING:", (_T.YELLOW,)),
-    ("ERROR:", (_T.RED,)),
-    ("CRITICAL:", (_T.BOLD, _T.MAGENTA)),
+    ("✗", (Style.RED,)),
+    ("⚠", (Style.YELLOW,)),
+    ("✅", (Style.GREEN,)),
+    ("✓", (Style.GREEN,)),
+    ("→", (Style.BOLD, Style.CYAN)),
+    ("[WARN]", (Style.YELLOW,)),
+    ("WARNING:", (Style.YELLOW,)),
+    ("ERROR:", (Style.RED,)),
+    ("CRITICAL:", (Style.BOLD, Style.MAGENTA)),
 )
 
 
@@ -223,11 +264,11 @@ def cprint(*values: object, **kwargs: object) -> None:
 
 
 _LEVEL_STYLES: dict[int, tuple[str, ...]] = {
-    logging.DEBUG: (_T.DIM,),
+    logging.DEBUG: (Style.DIM,),
     logging.INFO: (),
-    logging.WARNING: (_T.YELLOW,),
-    logging.ERROR: (_T.RED,),
-    logging.CRITICAL: (_T.BOLD, _T.MAGENTA),
+    logging.WARNING: (Style.YELLOW,),
+    logging.ERROR: (Style.RED,),
+    logging.CRITICAL: (Style.BOLD, Style.MAGENTA),
 }
 
 

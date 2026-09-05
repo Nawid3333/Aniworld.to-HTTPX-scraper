@@ -42,11 +42,10 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
   older. The code itself uses nothing newer than 3.10 features
   (`zip(strict=True)`, PEP 604 `X | None` annotations evaluated at runtime), so
   3.10 would very likely work — it is simply not tested, so it is not offered.
-- Dependencies: `httpx`, `beautifulsoup4`, `lxml`, `h2`, `python-dotenv`
+- Dependencies: `httpx`, `lxml`, `h2`, `python-dotenv`
 
-`lxml` and `h2` are what make the scraper fast: pages parse ~1.4x quicker than with
-the stdlib parser, and HTTP/2 lets one connection carry many requests. Both fall
-back gracefully if unavailable, at the old speed.
+`lxml` and `h2` are what make the scraper fast: pages parse ~4-6x quicker than with
+BeautifulSoup, and HTTP/2 lets one connection carry many requests.
 
 ## Installation
 
