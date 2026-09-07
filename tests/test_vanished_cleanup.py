@@ -123,10 +123,10 @@ class VanishedCleanupTests(unittest.TestCase):
             self._write_index(index_path, [self._make_index_entry("Alpha", "alpha")])
             self._write_mismatch(mismatch_path, ["alpha"])
 
-            # The prompt now runs the vanished/new decision table, so "n"
-            # answers the table's per-row question (keep) and then its
+            # The prompt now runs the vanished/new decision table, so "k"
+            # answers the table's per-row question (keep) and "n" its
             # follow-up about silencing the entry (no).
-            with patch("builtins.input", return_value="n"), _quiet():
+            with patch("builtins.input", return_value="k"), _quiet():
                 removed = main._prompt_clean_vanished()
 
             self.assertFalse(removed)
@@ -163,7 +163,9 @@ class VanishedCleanupTests(unittest.TestCase):
             )
             self._write_mismatch(mismatch_path, ["alpha"])
 
-            with patch("builtins.input", return_value="y"), _quiet():
+            # The table deletes on "d" and then asks for a y/n confirmation;
+            # "y" alone is no longer a row action, and would re-prompt forever.
+            with patch("builtins.input", side_effect=["d", "y"]), _quiet():
                 removed = main._prompt_clean_vanished()
 
             self.assertTrue(removed)

@@ -32,6 +32,7 @@ from config.config import (
     SITE_URL,
     SITE_URLS,
 )
+from src import term
 from src.atomic_io import atomic_write_json
 from src.slug import slug_key, slug_keys
 from src.term import cinput as input
@@ -2411,6 +2412,66 @@ class AniWorldScraper:
 
         self.series_data = results
 
+    async def _rescrape_empty_series(self, empty: list[dict]) -> list[dict]:
+        """Re-scrape series that came back with 0 episodes, once.
+
+        A 0-episode result is often transient -- a session that expired
+        mid-run, a page served logged out, or a momentary server hiccup --
+        so a single re-fetch frequently recovers the real episode count.
+        Only series that are *still* 0 after this second look are returned,
+        so the caller can raise a genuine alarm instead of a false one.
+        """
+        if not empty:
+            return []
+        print(
+            term.step(
+                f"\n→ Re-scraping {len(empty)} series that reported 0 episodes to confirm they are really empty..."
+            )
+        )
+        client = await self._create_logged_in_client()
+        try:
+            retried: list[dict] = []
+            for s in empty:
+                info = {
+                    "title": s.get("title", ""),
+                    "link": s.get("link", ""),
+                    "url": s.get("url", ""),
+                    "scrape_url": s.get("url", ""),
+                }
+                try:
+                    result = await self._scrape_one_series(client, info)
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    logger.warning(
+                        "Re-scrape of %s failed: %s",
+                        info.get("url", "?"),
+                        exc,
+                    )
+                    retried.append(s)
+                    continue
+                if result.get("_error") or result.get("total_episodes", 0) == 0:
+                    retried.append(s)
+                else:
+                    with self._lock:
+                        for i, existing in enumerate(self.series_data):
+                            if existing.get("url") == s.get("url"):
+                                self.series_data[i] = result
+                                break
+                        # The first pass filed this series under
+                        # "empty_placeholder"; a recovery makes that entry
+                        # stale, and reconcile_failed_series() would persist
+                        # it forever -- a healthy series on the retry-failed
+                        # list. Drop it here while holding the lock.
+                        self.failed_links = [
+                            f
+                            for f in self.failed_links
+                            if not (f.get("url") == s.get("url") and f.get("reason") == "empty_placeholder")
+                        ]
+                    print(term.ok(f"  ✓ {s.get('title', '?')} recovered: {result.get('total_episodes', 0)} episodes"))
+            return retried
+        finally:
+            if not client.is_closed:
+                await client.aclose()
+
     def _ignored_seasons_continue(self) -> bool:
         """After scraping ignored-season anime, check for changes and prompt.
 
@@ -2766,12 +2827,16 @@ class AniWorldScraper:
                 )
             )
 
-            # Alert for empty anime (0 episodes)
-            empty = [s for s in self.series_data if s.get("total_episodes", 0) == 0]
+            # Alert for empty anime (0 episodes) — exclude error results, which
+            # are already on the failed list and belong in the error report,
+            # not in a second pointless scrape and re-alarm.
+            empty = [s for s in self.series_data if s.get("total_episodes", 0) == 0 and not s.get("_error")]
             if empty:
-                print(f"\n⚠ {len(empty)} anime with 0 episodes:")
-                for s in empty:
-                    print(f"  • {s['title']} → {s['url']}")
+                still_empty = asyncio.run(self._rescrape_empty_series(empty))
+                if still_empty:
+                    print(term.danger(f"\n✗ {len(still_empty)} anime still have 0 episodes after re-scraping:"))
+                    for s in still_empty:
+                        print(term.err(f"  • {s['title']} → {s['url']}"))
 
             self.save_checkpoint(include_data=True)
             self.reconcile_failed_series()

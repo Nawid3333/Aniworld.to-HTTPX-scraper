@@ -301,7 +301,9 @@ class CleanupPromptTests(unittest.TestCase):
     def test_confirmed_deletion_removes_only_that_entry(self):
         with tempfile.TemporaryDirectory(prefix="aniworld_slug_") as tmp:
             index_path, idx_mgr = self._setup(tmp)
-            with scripted_input("y", default="n"), captured_output():
+            # "d" selects delete in the table, "y" confirms it; bare "y" is
+            # not a row action any more and would re-prompt forever.
+            with scripted_input("d", "y", default="n"), captured_output():
                 removed = main._prompt_clean_vanished(idx_mgr)
 
             self.assertTrue(removed)

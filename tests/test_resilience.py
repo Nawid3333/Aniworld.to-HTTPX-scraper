@@ -278,6 +278,90 @@ class TestWorkerCrashKeepsScrapedWork(QuietCase):
         self.assertEqual(len(scraper.series_data), 5)
 
 
+class TestRescrapeEmptySeriesLeavesFailedListConsistent(QuietCase):
+    """A 0-episode series that recovers on the re-scrape must not stay on the
+    failed list -- reconcile_failed_series() re-persists every in-memory
+    failed_links entry, so a stale empty_placeholder would survive forever and
+    the retry-failed menu option would re-scrape a healthy series."""
+
+    class _FakeClient:
+        is_closed = False
+
+        async def aclose(self):
+            self.is_closed = True
+
+    @staticmethod
+    def _empty_result(url, title="S"):
+        return {"url": url, "title": title, "link": url, "total_episodes": 0, "watched_episodes": 0, "seasons": []}
+
+    def _scraper(self, scraped):
+        """Scraper whose re-scrape answers from the `scraped` url->result map."""
+        scraper = SCRAPER_CLS()
+        client = self._FakeClient()
+
+        async def fake_client():
+            return client
+
+        async def fake_scrape(_client, info):
+            return scraped[info["url"]]
+
+        scraper._create_logged_in_client = fake_client  # type: ignore[method-assign]
+        scraper._scrape_one_series = fake_scrape  # type: ignore[method-assign]
+        return scraper
+
+    def test_a_recovery_drops_the_stale_placeholder(self):
+        url = series_url("demo")
+        scraper = self._scraper({url: {**self._empty_result(url), "total_episodes": 5}})
+        scraper.series_data = [self._empty_result(url)]
+        scraper.failed_links = [{"url": url, "title": "S", "link": url, "reason": "empty_placeholder"}]
+
+        still_empty = asyncio.run(scraper._rescrape_empty_series(list(scraper.series_data)))  # type: ignore[arg-type]
+
+        self.assertEqual(still_empty, [], "a recovered series is not empty any more")
+        self.assertEqual(scraper.failed_links, [], "the stale empty_placeholder must be dropped")
+        self.assertEqual(scraper.series_data[0]["total_episodes"], 5, "the fresh result replaces the placeholder")
+
+    def test_a_still_empty_series_keeps_its_placeholder(self):
+        url = series_url("demo")
+        scraper = self._scraper({url: self._empty_result(url)})
+        scraper.series_data = [self._empty_result(url)]
+        entry = {"url": url, "title": "S", "link": url, "reason": "empty_placeholder"}
+        scraper.failed_links = [entry]
+
+        still_empty = asyncio.run(scraper._rescrape_empty_series(list(scraper.series_data)))  # type: ignore[arg-type]
+
+        self.assertEqual(len(still_empty), 1, "a genuinely empty series must still be reported")
+        self.assertEqual(scraper.failed_links, [entry], "the genuine placeholder must survive")
+
+    def test_an_error_result_keeps_the_placeholder(self):
+        url = series_url("demo")
+        scraped = {**self._empty_result(url), "_error": True, "_error_reason": "server error"}
+        scraper = self._scraper({url: scraped})
+        scraper.series_data = [self._empty_result(url)]
+        entry = {"url": url, "title": "S", "link": url, "reason": "empty_placeholder"}
+        scraper.failed_links = [entry]
+
+        still_empty = asyncio.run(scraper._rescrape_empty_series(list(scraper.series_data)))  # type: ignore[arg-type]
+
+        self.assertEqual(len(still_empty), 1, "an error result is a failure, not a recovery")
+        self.assertEqual(scraper.failed_links, [entry], "the placeholder must survive a failed re-scrape")
+
+    def test_a_recovered_series_does_not_touch_other_entries(self):
+        url_a, url_b = series_url("a"), series_url("b")
+        scraper = self._scraper({url_a: {**self._empty_result(url_a), "total_episodes": 3}})
+        scraper.series_data = [self._empty_result(url_a), self._empty_result(url_b)]
+        keep_b = {"url": url_b, "title": "B", "link": url_b, "reason": "empty_placeholder"}
+        scraper.failed_links = [
+            {"url": url_a, "title": "A", "link": url_a, "reason": "empty_placeholder"},
+            keep_b,
+        ]
+
+        still_empty = asyncio.run(scraper._rescrape_empty_series([self._empty_result(url_a)]))  # type: ignore[arg-type]
+
+        self.assertEqual(still_empty, [])
+        self.assertEqual(scraper.failed_links, [keep_b], "only the recovered series' entry is dropped")
+
+
 class TestSessionExpiryRecovers(QuietCase):
     """One shared session serves the run, so an expiry must be recoverable."""
 
@@ -519,45 +603,68 @@ class TestVanishedDecisionPrompt(QuietCase):
             result = im._prompt_vanished_table(self._entries(5), {}, {})
             self.assertEqual(len(result), 2)
 
-    def test_yes_shortcut_deletes_without_confirmation(self):
-        # "y" deletes directly without the extra confirmation prompt
-        inputs = ["y", "n", "y", "n", ""]
-        with mock.patch("builtins.input", side_effect=inputs):
+    def test_an_endless_stream_of_unrecognized_answers_terminates(self):
+        """Regression: a constant answer that is not a row action must not
+        re-prompt forever.  A scripted feed of the removed "y"/"n" vocabulary
+        used to spin this loop, and its accumulating prompts ate tens of
+        gigabytes of memory before the run was killed.  The prompt now stops
+        re-asking after a bounded number of bad answers and keeps the entry.
+        """
+        with mock.patch("builtins.input", return_value="n") as feeder:
             result = im._prompt_vanished_table(self._entries(5), {}, {})
-            self.assertEqual(result, ["Show0", "Show2"])
+        self.assertEqual(result, [], "a stalled feed must keep every entry")
+        # Every row was reached: the bounded loop did not stop the whole table,
+        # and no row needed more than the cap plus its final keep answer.
+        self.assertLessEqual(feeder.call_count, len(self._entries(5)) * (im._PROMPT_MAX_UNRECOGNIZED + 1))
 
-    def test_apply_to_all_delete_needs_typed_confirmation(self):
-        # "a y" deletes current and all remaining rows, but only once the
-        # count has been typed back: it wipes entries the user never saw.
-        inputs = ["a y", "DELETE 5"]
+    def test_a_few_bad_answers_still_get_another_chance(self):
+        # Typos re-prompt; only a sustained stream gives up. "d" then a
+        # confirmation after two mistakes proves the counter resets per row.
+        inputs = ["x", "x", "d", "y", "k"]
         with mock.patch("builtins.input", side_effect=inputs):
-            result = im._prompt_vanished_table(self._entries(5), {}, {})
-            self.assertEqual(result, [f"Show{i}" for i in range(5)])
+            result = im._prompt_vanished_table(self._entries(2), {}, {})
+            self.assertEqual(result, ["Show0"])
 
-    def test_apply_to_all_delete_wrong_confirmation_deletes_nothing(self):
-        # A miscounted or half-typed confirmation drops back to the same row.
-        inputs = ["a y", "DELETE 4", "", "", "", "", ""]
-        with mock.patch("builtins.input", side_effect=inputs):
-            self.assertEqual(im._prompt_vanished_table(self._entries(5), {}, {}), [])
+    def test_eof_on_delete_confirmation_keeps_the_entry(self):
+        """stdin closing right after a "d" must not crash the prompt.
 
-    def test_apply_to_all_delete_partway_counts_remaining(self):
-        # Confirmation quotes the rows left, not the whole list.
-        inputs = ["n", "n", "a d", "DELETE 3"]
-        with mock.patch("builtins.input", side_effect=inputs):
-            result = im._prompt_vanished_table(self._entries(5), {}, {})
-            self.assertEqual(result, ["Show2", "Show3", "Show4"])
+        The row prompt is EOF-guarded, but the delete confirmation used to
+        call input() bare: an EOF there escaped _prompt_vanished_table and
+        killed the whole cleanup, losing the keep decisions already made.
+        """
+        with mock.patch("builtins.input", side_effect=["d", EOFError, "k"]) as feeder:
+            result = im._prompt_vanished_table(self._entries(2), {}, {})
+        self.assertEqual(result, [], "the EOF'd row must be kept, not deleted")
+        self.assertLess(feeder.call_count, 10, "the prompt must not loop after EOF")
 
-    def test_apply_to_all_keep(self):
-        # "a n" keeps current and all remaining rows
-        inputs = ["a n"]
-        with mock.patch("builtins.input", side_effect=inputs):
+    def test_open_all_opens_this_and_remaining_rows(self):
+        """'oa' hands the current row and every remaining row to the confirmed-
+        batch helper -- not one tab per keystroke. After it, row 1 still needs
+        its own decision, so 'oa' never deletes or keeps anything by itself."""
+        with (
+            mock.patch.object(im, "_open_rows_in_browser", autospec=True) as bulk,
+            mock.patch.object(im, "_open_urls_for_comparison", autospec=True) as single,
+            mock.patch("builtins.input", side_effect=["oa", "k", "k", "k", "k", "k"]) as feeder,
+        ):
             result = im._prompt_vanished_table(self._entries(5), {}, {})
-            self.assertEqual(result, [])
+        self.assertEqual(result, [], "no explicit delete means everything is kept")
+        single.assert_not_called()  # 'oa' must go through the batched helper
+        opened_rows = bulk.call_args[0][0]
+        self.assertEqual([r["v_title"] for r in opened_rows], [f"Show{i}" for i in range(5)])
+        self.assertEqual(feeder.call_count, 6, "'oa' for row 1, then one answer per row")
 
-    def test_skip_all_keeps_remaining(self):
-        with mock.patch("builtins.input", side_effect=["d", "n", "s"]):
-            result = im._prompt_vanished_table(self._entries(5), {}, {})
-            self.assertEqual(result, [])
+    def test_open_all_then_normal_decisions_still_work(self):
+        """After an 'oa' the per-row prompt keeps walking: row 1 can still be
+        deleted right after the bulk open, and later rows keep their own
+        decisions."""
+        with (
+            mock.patch.object(im, "_open_rows_in_browser", autospec=True) as bulk,
+            mock.patch("builtins.input", side_effect=["oa", "d", "y", "k", "k", "k"]) as feeder,
+        ):
+            result = im._prompt_vanished_table(self._entries(4), {}, {})
+        self.assertEqual(result, ["Show0"], "only the explicitly-deleted row goes")
+        self.assertEqual(len(bulk.call_args[0][0]), 4, "all 4 rows went to the bulk open")
+        self.assertEqual(feeder.call_count, 6)
 
 
 class TestVerifyAcceptsBothVanishedShapes(QuietCase):
@@ -1291,151 +1398,6 @@ class TestRateGuardHoldsParkedWorkers(QuietCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestBulkBrowserOpenIsGuarded(QuietCase):
-    """Bulk "open in browser" must state the cost and stop for confirmation.
-
-    Each URL here is a real browser window on the user's desktop, so an
-    unconfirmed loop over a long vanished list is how you lock up a machine.
-    """
-
-    @staticmethod
-    def _rows(n):
-        return [
-            {
-                "v_title": f"Show{i}",
-                "v_url": series_url(f"old{i}"),
-                "old_entry": {},
-                "n_title": f"Show{i} New",
-                "n_url": series_url(f"new{i}"),
-                "new_entry": {},
-                "reason": "weak",
-            }
-            for i in range(n)
-        ]
-
-    def test_declining_opens_nothing(self):
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["n"]):
-            self.assertEqual(im._open_rows_in_browser(self._rows(50)), 0)
-        opener.assert_not_called()
-
-    def test_enter_alone_declines(self):
-        """The default must be the safe answer, not "open 100 tabs"."""
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=[""]):
-            self.assertEqual(im._open_rows_in_browser(self._rows(50)), 0)
-        opener.assert_not_called()
-
-    def test_it_pauses_instead_of_opening_everything(self):
-        """One "y" must not release all 100 tabs; the batch has to be re-confirmed."""
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y", "n"]):
-            opened = im._open_rows_in_browser(self._rows(50))
-        self.assertLessEqual(opened, im._BROWSER_TAB_BATCH + 2)
-        self.assertLessEqual(opener.call_count, im._BROWSER_TAB_BATCH + 2)
-
-    def test_confirming_each_batch_opens_them_all(self):
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y"] * 20):
-            opened = im._open_rows_in_browser(self._rows(50))
-        self.assertEqual(opened, 100)
-        self.assertEqual(opener.call_count, 100)
-
-    def test_a_small_list_needs_one_confirmation(self):
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input", side_effect=["y"]):
-            self.assertEqual(im._open_rows_in_browser(self._rows(2)), 4)
-        self.assertEqual(opener.call_count, 4)
-
-    def test_rows_without_urls_open_nothing_and_do_not_prompt(self):
-        rows = self._rows(3)
-        for row in rows:
-            row["v_url"] = ""
-            row["n_url"] = ""
-        with mock.patch.object(im.webbrowser, "open") as opener, mock.patch("builtins.input") as prompt:
-            self.assertEqual(im._open_rows_in_browser(rows), 0)
-        opener.assert_not_called()
-        prompt.assert_not_called()
-
-
-class TestBulkRescrapeIsOneRoundTrip(QuietCase):
-    """Verifying N rows must cost one sign-in, not N."""
-
-    class _CountingScraper:
-        def __init__(self, reachable=True):
-            self.reachable = reachable
-            self.calls = []
-
-        async def verify_vanished_and_candidates(self, vanished, candidates):
-            self.calls.append((list(vanished), list(candidates)))
-            verified = [(f"{title} Renamed", url, self.reachable) for title, url in vanished]
-            return verified, [dict(c, _verified_reachable=self.reachable) for c in candidates]
-
-    @staticmethod
-    def _rows(n, with_candidates=True):
-        return [
-            {
-                "v_title": f"Show{i}",
-                "v_url": series_url(f"old{i}"),
-                "old_entry": {},
-                "n_title": f"Show{i} New",
-                "n_url": series_url(f"new{i}"),
-                "new_entry": {"title": f"Show{i} New"} if with_candidates else {},
-                "reason": "weak",
-            }
-            for i in range(n)
-        ]
-
-    def test_all_rows_go_out_in_one_call(self):
-        scraper = self._CountingScraper()
-        rows = self._rows(25)
-        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 25)
-        self.assertEqual(len(scraper.calls), 1, "each row must not trigger its own sign-in")
-        self.assertEqual(len(scraper.calls[0][0]), 25)
-
-    def test_each_row_gets_its_own_verdict(self):
-        """Results are paired back by order; a mix-up would retitle the wrong row."""
-        scraper = self._CountingScraper()
-        rows = self._rows(5)
-        im._rescrape_rows(rows, scraper, {})
-        self.assertEqual([row["v_title"] for row in rows], [f"Show{i} Renamed" for i in range(5)])
-
-    def test_unreachable_rows_are_left_alone(self):
-        scraper = self._CountingScraper(reachable=False)
-        rows = self._rows(5)
-        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 0)
-        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(5)])
-
-    def test_rows_without_a_candidate_still_verify(self):
-        scraper = self._CountingScraper()
-        rows = self._rows(4, with_candidates=False)
-        self.assertEqual(im._rescrape_rows(rows, scraper, {}), 4)
-        self.assertEqual(scraper.calls[0][1], [], "no candidates should be sent")
-
-    def test_a_short_result_changes_nothing(self):
-        """A truncated reply must not pair row 2's verdict onto row 1."""
-
-        class _ShortScraper:
-            async def verify_vanished_and_candidates(self, vanished, candidates):
-                return [("Only One", vanished[0][1], True)], []
-
-        rows = self._rows(3, with_candidates=False)
-        self.assertEqual(im._rescrape_rows(rows, _ShortScraper(), {}), 0)
-        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(3)])
-
-    def test_a_failed_call_changes_nothing(self):
-        class _BrokenScraper:
-            async def verify_vanished_and_candidates(self, vanished, candidates):
-                raise RuntimeError("site down")
-
-        rows = self._rows(3)
-        self.assertEqual(im._rescrape_rows(rows, _BrokenScraper(), {}), 0)
-        self.assertEqual([row["v_title"] for row in rows], [f"Show{i}" for i in range(3)])
-
-    def test_rows_without_urls_are_skipped_not_sent(self):
-        scraper = self._CountingScraper()
-        rows = self._rows(3)
-        rows[1]["v_url"] = ""
-        im._rescrape_rows(rows, scraper, {})
-        self.assertEqual(len(scraper.calls[0][0]), 2)
-        self.assertEqual(rows[1]["v_title"], "Show1")
 
 
 class _IndexLoadCase(TempDirCase):

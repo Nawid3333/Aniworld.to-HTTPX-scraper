@@ -2231,7 +2231,11 @@ def _open_rows_in_browser(rows: list) -> int:
         return 0
 
     print(f"\n  This opens {tab_count} browser tab(s) for {len(rows)} entry(s).")
-    if (input("  Continue? (y/n) [n]: ").strip().lower() or "n") != "y":
+    try:
+        go_ahead = input("  Continue? (y/n) [n]: ").strip().lower() or "n"
+    except EOFError:
+        go_ahead = "n"
+    if go_ahead != "y":
         print("  → Cancelled; no tabs opened.")
         return 0
 
@@ -2239,8 +2243,13 @@ def _open_rows_in_browser(rows: list) -> int:
     since_pause = 0
     for row in rows:
         if since_pause >= _BROWSER_TAB_BATCH:
-            answer = input(f"  {opened} tab(s) open, {tab_count - opened} to go. Continue? (y/n) [n]: ")
-            if (answer.strip().lower() or "n") != "y":
+            try:
+                answer = (
+                    input(f"  {opened} tab(s) open, {tab_count - opened} to go. Continue? (y/n) [n]: ").strip() or "n"
+                ).lower()
+            except EOFError:
+                answer = "n"
+            if answer != "y":
                 print(f"  → Stopped after {opened} tab(s).")
                 return opened
             since_pause = 0
@@ -2416,18 +2425,23 @@ def _status_diff_line(old_entry: dict, new_entry: dict) -> str | None:
     return "⚠ Status differs: " + "  ".join(parts)
 
 
+# How many unrecognized answers one row may absorb before the prompt stops
+# re-asking and keeps the entry. A short run of bad answers is a typo; an
+# endless one is an unattended feed -- a scripted test, a piped command --
+# whose re-prompts used to loop forever, and whose accumulating prompts and
+# warnings ate gigabytes of memory before anything failed.
+_PROMPT_MAX_UNRECOGNIZED = 5
+
+
 def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
     """Show a side-by-side decision table for vanished vs. new series.
 
     For each vanished entry the user can choose:
-      y = delete old entry (same as d)
-      n = keep old entry (same as k)
-      k = keep old entry
       d = delete old entry
-      a <action> = apply the action to all remaining rows (e.g. "a d")
+      k = keep old entry
       r = re-scrape the old URL to verify it live (updates candidate info)
       o = open old + new URLs in browser to compare visually
-      s = skip all remaining entries (keep them)
+      oa = open this and all remaining rows' URLs in confirmed browser batches
 
     Args:
         vanished_entries: list of (title, reason, url) tuples for vanished series.
@@ -2440,14 +2454,14 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
     """
     matched = _match_vanished_to_new(vanished_entries, new_dict)
     to_delete = []
-    apply_to_all = None  # action to apply to all remaining rows
-    skip_all = False
 
     print("\n  Compare each vanished series with its best matching new counterpart.")
-    print(
-        "  Actions per row: [y]es=delete  [n]o=keep  [k]eep  [d]elete  "
-        "[a <action>]=all  [r]escrape  [o]pen URLs  [s]kip all"
-    )
+    print("  Actions:")
+    print("    d   delete this entry")
+    print("    k   keep this entry (default)")
+    print("    r   re-scrape this entry's old URL to verify it's really gone")
+    print("    o   open this entry's old + new URLs in browser")
+    print("    oa  open this and all remaining entries' URLs in confirmed batches")
     print()
 
     # Compute column widths from actual content so every line aligns.
@@ -2550,12 +2564,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
             }
         )
 
-    current_idx = -1
     for i, row in enumerate(rows, 1):
-        if skip_all or apply_to_all is not None:
-            break
-
-        current_idx = i - 1
         v_title = row["v_title"]
         v_url = row["v_url"]
         old_entry = row["old_entry"]
@@ -2567,73 +2576,26 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
         # Print current row
         _print_row(i, v_title, v_url, old_entry, n_title, n_url, new_entry, reason)
 
+        unrecognized = 0
         while True:
             prompt = (
-                f'  [{i}/{len(rows)}] Action for "{v_title}"? '
-                f"(y=delete n=keep k=keep d=delete r=rescrape o=open a <action>=all s=skip all) [n]: "
+                f'  [{i}/{len(rows)}] Action for "{v_title}"? (d=delete k=keep r=rescrape o=open oa=open-all) [k]: '
             )
             try:
-                choice = input(prompt).strip().lower() or "n"
+                choice = input(prompt).strip().lower() or "k"
             except EOFError:
                 # No one is there to answer -- a piped or redirected run. The
                 # loop below re-prompts on anything it does not recognise, so
                 # without this an unattended run spins forever on a closed
                 # stdin. Keeping every entry is the reversible answer.
-                print("  -> No input available; keeping all remaining entries.")
-                skip_all = True
-                break
+                print("  -> No input available; keeping remaining entries.")
+                return to_delete
 
-            if choice == "s":
-                skip_all = True
-                print("  → Skipping all remaining vanished entries.")
-                break
-
-            if choice.startswith("a "):
-                apply_to_all = choice[2:].strip()
-                if apply_to_all not in {"y", "n", "k", "d", "r", "o"}:
-                    print(f"  ⚠ Unknown apply-to-all action '{apply_to_all}'. Use y/n/k/d/r/o.")
-                    apply_to_all = None
-                    continue
-                print(f"  → Apply '{apply_to_all}' to all {len(rows) - i + 1} remaining entries.")
-                # Apply to the current row immediately; the rest are handled after the loop.
-                if apply_to_all in ("y", "d"):
-                    # Deleting "all" is the one irreversible keystroke in this
-                    # loop: it drops every remaining entry without showing them.
-                    # A bad catalogue fetch can put thousands of perfectly good
-                    # series on this list, so the count has to be stated and
-                    # confirmed before it runs.
-                    remaining_count = len(rows) - i + 1
-                    print(
-                        "\n  "
-                        + term.alert(f"⚠ This deletes {remaining_count} series from the index, including this one.")
-                    )
-                    print("  " + term.warn("Deleted entries lose their stored watch history."))
-                    typed = input("  " + term.danger(f"Type 'DELETE {remaining_count}' to confirm: ")).strip()
-                    if typed != f"DELETE {remaining_count}":
-                        print("  → Not confirmed; nothing deleted. Back to this entry.")
-                        apply_to_all = None
-                        continue
-                    total_eps = old_entry.get("total_episodes", 0)
-                    watched_eps = old_entry.get("watched_episodes", 0)
-                    if not total_eps and old_entry.get("seasons"):
-                        total_eps, watched_eps = get_episode_counts(old_entry)
-                    if watched_eps and total_eps:
-                        print(f"  ⚠ {v_title} has watched progress: {watched_eps}/{total_eps} episodes.")
-                    to_delete.append(v_title)
-                    print("  → Marked for deletion.")
-                elif apply_to_all == "o":
-                    _open_urls_for_comparison(v_url, n_url)
-                elif apply_to_all == "r":
-                    _rescrape_row(row, scraper, old_data)
-                else:
-                    print("  → Kept in index.")
-                break
-
-            if choice in ("k", "n"):
+            if choice == "k":
                 print("  → Kept in index.")
                 break
 
-            if choice in ("d", "y"):
+            if choice == "d":
                 # If the old entry had progress, warn the user.
                 total_eps = old_entry.get("total_episodes", 0)
                 watched_eps = old_entry.get("watched_episodes", 0)
@@ -2643,15 +2605,18 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                     print(f"\n  ⚠ This entry has watched progress: {watched_eps}/{total_eps} episodes.")
                     print("    Make sure the new entry on the site reflects the same progress,")
                     print("    otherwise the next scrape may report those episodes as unwatched.")
-                if choice == "d":
+                try:
                     confirm = (
                         input("  " + term.danger(f'Confirm delete "{v_title}"?') + term.dim(" (y/n) [n]: "))
                         .strip()
                         .lower()
                         or "n"
                     )
-                else:
-                    confirm = "y"
+                except EOFError:
+                    # The row prompt is EOF-guarded; this second prompt must be
+                    # too, or stdin closing right after a "d" would crash here.
+                    print("  -> No input available; not deleting this entry.")
+                    break
                 if confirm == "y":
                     to_delete.append(v_title)
                     print("  → Marked for deletion.")
@@ -2661,6 +2626,14 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
 
             if choice == "o":
                 _open_urls_for_comparison(v_url, n_url)
+                continue
+
+            if choice == "oa":
+                # Open this row and every remaining row's URLs, in confirmed
+                # batches (_open_rows_in_browser states the tab count and
+                # pauses every _BROWSER_TAB_BATCH tabs). Then fall through to
+                # the next row: each entry still gets its own d/k decision.
+                _open_rows_in_browser(rows[i - 1 :])
                 continue
 
             if choice == "r":
@@ -2677,31 +2650,14 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                 _print_row(i, v_title, v_url, old_entry, n_title, n_url, new_entry, reason)
                 continue
 
-            print("  ⚠ Unknown choice. Use y/n/k/d/r/o/a/s.")
-
-    # Apply the chosen action to all remaining rows
-    if apply_to_all is not None:
-        remaining = rows[current_idx + 1 :]
-        action = apply_to_all
-        if action in ("y", "d"):
-            print(f"\n  Applying '{action}' to {len(remaining)} remaining entries...")
-            for row in remaining:
-                v_title = row["v_title"]
-                old_entry = row["old_entry"]
-                total_eps = old_entry.get("total_episodes", 0)
-                watched_eps = old_entry.get("watched_episodes", 0)
-                if not total_eps and old_entry.get("seasons"):
-                    total_eps, watched_eps = get_episode_counts(old_entry)
-                if watched_eps and total_eps:
-                    print(f"  ⚠ {v_title} has watched progress: {watched_eps}/{total_eps} episodes.")
-                to_delete.append(v_title)
-            print(f"  → Marked {len(remaining)} entries for deletion.")
-        elif action == "o":
-            _open_rows_in_browser(remaining)
-        elif action == "r":
-            _rescrape_rows(remaining, scraper, old_data)
-        else:
-            print(f"\n  Kept all {len(remaining)} remaining entries in the index.")
+            unrecognized += 1
+            if unrecognized >= _PROMPT_MAX_UNRECOGNIZED:
+                # An endless stream of unrecognized answers is a loop, not a
+                # typist: stop re-asking, keep the entry (the reversible
+                # answer), and move on to the next row.
+                print(f"  → {unrecognized} unrecognized answers in a row; keeping this entry.")
+                break
+            print("  ⚠ Unknown choice. Use k/d/r/o.")
 
     return to_delete
 
