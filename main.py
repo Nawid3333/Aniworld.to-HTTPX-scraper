@@ -67,7 +67,8 @@ def _host_label(site_url):
 def _format_host_rows(hosts):
     """Return a list of table-formatted host status lines.
 
-    hosts is a list of (label, status, count, idx_count, compare_txt) tuples.
+    hosts is a list of (label, status, count, idx_count, missing_count,
+    compare_txt) tuples.
     """
     if not hosts:
         return []
@@ -75,7 +76,7 @@ def _format_host_rows(hosts):
     term_w = max(shutil.get_terminal_size().columns, 80)
     arrow_gap = "  "
 
-    labels = ["Host", "Status", "Series", "Index", "Compare"]
+    labels = ["Host", "Status", "Series", "Index", "Index only", "Compare"]
     cols = {
         "host": max([len(str(label)) for label, *_ in hosts] + [len(labels[0])]),
         "status": max([len("OK" if status else "FAILED") for _, status, *_ in hosts] + [len(labels[1])]),
@@ -84,15 +85,19 @@ def _format_host_rows(hosts):
             [len(f"{idx_count:,}") if idx_count is not None else 1 for _, _, _, idx_count, *_ in hosts]
             + [len(labels[3])]
         ),
+        "missing": max(
+            [len(f"{missing_count:,}") if missing_count is not None else 1 for _, _, _, _, missing_count, *_ in hosts]
+            + [len(labels[4])]
+        ),
         "compare": max(
-            [len(str(compare_txt)) if compare_txt is not None else 1 for *_, compare_txt in hosts] + [len(labels[4])]
+            [len(str(compare_txt)) if compare_txt is not None else 1 for *_, compare_txt in hosts] + [len(labels[5])]
         ),
     }
 
     total = sum(cols.values()) + len(labels) * len(arrow_gap)
     if total > term_w:
         excess = total - term_w
-        trimmable = cols["host"] - len(labels[0]) + cols["compare"] - len(labels[4])
+        trimmable = cols["host"] - len(labels[0]) + cols["compare"] - len(labels[5])
         if trimmable > 0:
             factor = min(excess / trimmable, 1.0)
             cols["host"] = max(
@@ -100,15 +105,15 @@ def _format_host_rows(hosts):
                 int(cols["host"] - (cols["host"] - len(labels[0])) * factor),
             )
             cols["compare"] = max(
-                len(labels[4]),
-                int(cols["compare"] - (cols["compare"] - len(labels[4])) * factor),
+                len(labels[5]),
+                int(cols["compare"] - (cols["compare"] - len(labels[5])) * factor),
             )
 
     def _trunc(text, width):
         text = str(text)
         return text if len(text) <= width else text[: width - 1] + "…"
 
-    sep_parts = ["─" * cols["host"]] + ["─" * cols[key] for key in ["status", "series", "index", "compare"]]
+    sep_parts = ["─" * cols["host"]] + ["─" * cols[key] for key in ["status", "series", "index", "missing", "compare"]]
 
     lines = [
         arrow_gap
@@ -118,16 +123,18 @@ def _format_host_rows(hosts):
                 f"{labels[1]:<{cols['status']}}",
                 f"{labels[2]:<{cols['series']}}",
                 f"{labels[3]:<{cols['index']}}",
-                f"{labels[4]:<{cols['compare']}}",
+                f"{labels[4]:<{cols['missing']}}",
+                f"{labels[5]:<{cols['compare']}}",
             ]
         ),
         arrow_gap + "  ".join(sep_parts),
     ]
 
-    for label, status, count, idx_count, compare_txt in hosts:
+    for label, status, count, idx_count, missing_count, compare_txt in hosts:
         status_txt = "OK" if status else "FAILED"
         count_txt = f"{count:,}" if count is not None else "-"
         idx_txt = f"{idx_count:,}" if idx_count is not None else "-"
+        missing_txt = f"{missing_count:,}" if missing_count is not None else "-"
         cmp_txt = compare_txt if compare_txt is not None else "-"
         lines.append(
             arrow_gap
@@ -137,6 +144,7 @@ def _format_host_rows(hosts):
                     f"{status_txt:<{cols['status']}}",
                     f"{count_txt:<{cols['series']}}",
                     f"{idx_txt:<{cols['index']}}",
+                    f"{missing_txt:<{cols['missing']}}",
                     f"{_trunc(cmp_txt, cols['compare']):<{cols['compare']}}",
                 ]
             )
@@ -348,6 +356,7 @@ def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
                 "site_unique_slugs": None,
                 "only_in_index": [],
                 "only_on_site": [],
+                "missing_count": None,
                 "compare": compare_txt,
             },
         )
@@ -372,6 +381,7 @@ def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
         "site_unique_slugs": len(site_slugs),
         "only_in_index": only_in_index,
         "only_on_site": only_on_site,
+        "missing_count": len(only_in_index),
         "compare": compare_txt,
     }
 
@@ -417,6 +427,7 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         ok = bool(entry.get("ok"))
         count = None
         idx_count = None
+        missing_count = None
         compare_txt = None
 
         if ok:
@@ -428,8 +439,9 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
                 )
                 if report_entry:
                     host_reports.append(report_entry)
+                    missing_count = report_entry.get("missing_count")
 
-        table_rows.append((label, ok, count, idx_count, compare_txt))
+        table_rows.append((label, ok, count, idx_count, missing_count, compare_txt))
 
     for line in _format_host_rows(table_rows):
         print(line)
