@@ -330,24 +330,14 @@ def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
         return None, None, None
 
     diff = idx_count - count
-    if diff == 0:
-        return (
-            idx_count,
-            "match",
-            {
-                "host": site_url,
-                "site_count": count,
-                "site_unique_slugs": count,
-                "only_in_index": [],
-                "only_on_site": [],
-                "compare": "match",
-            },
-        )
-
-    sign = "+" if diff > 0 else ""
-    compare_txt = f"mismatch ({sign}{diff})"
 
     if site_slugs is None:
+        # Without the site's slug list we can only compare raw counts.
+        if diff == 0:
+            compare_txt = "match"
+        else:
+            sign = "+" if diff > 0 else ""
+            compare_txt = f"mismatch ({sign}{diff})"
         logger.warning("Cannot compare slugs because site slug list is unavailable.")
         return (
             idx_count,
@@ -362,9 +352,19 @@ def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
             },
         )
 
+    # Compare the actual slug sets, not just the counts. Equal counts can
+    # still hide a deletion plus an addition (e.g. one series removed and a
+    # new one added), which a count-only check would wrongly report as a
+    # "match".
     index_slugs, index_duplicates, index_entries_without_slug = _collect_index_slugs(idx_mgr)
     only_in_index = sorted(index_slugs - site_slugs)
     only_on_site = sorted(site_slugs - index_slugs)
+
+    if only_in_index or only_on_site:
+        sign = "+" if diff > 0 else ""
+        compare_txt = f"mismatch ({sign}{diff})"
+    else:
+        compare_txt = "match"
 
     report_entry = {
         "host": site_url,
