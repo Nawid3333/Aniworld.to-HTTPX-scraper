@@ -22,7 +22,9 @@ import pytest
 from src.index_manager import (
     IndexManager,
     _find_series,
+    _format_vanished_new_table,
     _get_season_stats,
+    _match_vanished_to_new,
     _score_match,
     detect_changes,
     format_season_ep,
@@ -255,6 +257,87 @@ class TestScoreMatch:
             "https://x/anime/stream/sousou-no-frieren",
         )
         assert score == 1.0
+
+    def test_shared_german_articles_do_not_manufacture_a_match(self):
+        """A real false-positive: both titles only share "der", a filler word.
+
+        Before German stopwords were filtered, "der" counted as a genuine
+        shared token and pushed this pair to 0.38 -- past the old 0.35 floor
+        -- so a "Der kleine Prinz" rename table offered "Surviving Amazonas"
+        as its counterpart. Neither title has anything else in common.
+        """
+        score = _score_match(
+            "Der kleine Prinz (Netflix)",
+            "https://x/anime/stream/der-kleine-prinz-netflix",
+            "Surviving Amazonas - Die Prüfung der Shanenawa",
+            "https://x/anime/stream/surviving-amazonas-die-prufung-der-shanenawa",
+        )
+        assert score < 0.75
+
+    def test_match_vanished_to_new_rejects_scores_below_the_floor(self):
+        """The pairing step must actually enforce 0.75, not just compute it.
+
+        _score_match returning a low number is only half the fix -- this
+        pins the consumer (_match_vanished_to_new) so a future edit can't
+        silently lower its own floor back to something noise clears.
+        """
+        vanished = [("One Piece", "not found", "https://x/anime/stream/one-piece")]
+        new_dict = {"One Punch Man": {"url": "https://x/anime/stream/one-punch-man"}}
+        matched = _match_vanished_to_new(vanished, new_dict)
+        v_title, v_url, n_title, n_url, reason = matched[0]
+        assert n_title is None and reason is None
+
+    @pytest.mark.parametrize(
+        ("v_title", "n_title", "expected_reason"),
+        [
+            ("Wednesday", "Wednesday Addams", None),  # 0.720 -- just under the 0.75 floor
+            ("Money Heist", "Money Heist: Korea", "weak"),  # 0.786
+            ("Cobra Kai", "Cobra Kai 2", "strong"),  # 0.900
+            ("Attack on Titan", "Attack on Titans", "exact"),  # 0.960
+        ],
+    )
+    def test_match_vanished_to_new_tags_each_tier_correctly(self, v_title, n_title, expected_reason):
+        """Pins the reason boundaries (0.75/0.85/0.95) against real titles.
+
+        Each score above was checked against _score_match before being pinned
+        here, so a future change to the tier cutoffs or to the scoring itself
+        shows up as a wrong tag -- what the user actually sees in the table --
+        not just as a silently different raw number.
+        """
+        vanished = [(v_title, "not found", "")]
+        new_dict = {n_title: {"url": ""}}
+        matched = _match_vanished_to_new(vanished, new_dict)
+        assert matched[0][4] == expected_reason
+
+
+class TestFormatVanishedNewTable:
+    """The compact summary table that sits above the interactive prompt.
+
+    A vanished entry with no candidate above the pairing floor is common now
+    that the floor is 0.75 -- it must be reported as unmatched, never as a
+    silently "paired" row with blank New-counterpart columns claiming things
+    are complete when they are not.
+    """
+
+    def test_an_unmatched_vanished_entry_is_not_counted_as_paired(self):
+        matched = [("One Piece", "https://x/anime/stream/one-piece", None, None, None)]
+        lines, extra_lines = _format_vanished_new_table(matched)
+        assert any("0/1" in line and "unmatched" in line for line in lines)
+        assert not any("One Piece" in line for line in lines)
+        assert extra_lines == []
+
+    def test_the_status_line_survives_even_with_zero_pairs(self):
+        """Previously this returned an empty table when nothing paired,
+        silently dropping the "X unmatched" line the user needs to see."""
+        matched = [("One Piece", "https://x/anime/stream/one-piece", None, None, None)]
+        lines, _extra_lines = _format_vanished_new_table(matched)
+        assert lines != []
+
+    def test_a_genuine_pair_still_renders_the_full_table(self):
+        matched = [("Frieren", "https://x/anime/stream/frieren", "Frieren", "https://x/anime/stream/frieren", "exact")]
+        lines, _extra_lines = _format_vanished_new_table(matched)
+        assert any("Frieren" in line for line in lines)
+        assert any("1/1" in line and "complete" in line for line in lines)
 
 
 @pytest.mark.skipif(not SUPPORTS_SUBSCRIPTIONS, reason="this site has no subscribe/watchlist state")

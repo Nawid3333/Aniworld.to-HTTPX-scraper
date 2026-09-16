@@ -1882,6 +1882,64 @@ def _extract_slug(entry):
     return None
 
 
+# English filler words plus German articles/prepositions/conjunctions -- this
+# is a German-language site, so "der"/"die"/"und" etc. would otherwise count
+# as a shared token between two completely unrelated titles.
+_TITLE_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "from",
+    "with",
+    "by",
+    "no",
+    "san",
+    "chan",
+    "kun",
+    "sama",
+    "der",
+    "die",
+    "das",
+    "den",
+    "dem",
+    "des",
+    "ein",
+    "eine",
+    "einer",
+    "eines",
+    "einem",
+    "einen",
+    "und",
+    "oder",
+    "von",
+    "zu",
+    "im",
+    "am",
+    "mit",
+    "auf",
+    "aus",
+    "nach",
+    "bei",
+    "um",
+    "durch",
+    "ist",
+    "sind",
+    "war",
+    "waren",
+    "nicht",
+    "sich",
+    "fur",
+    "fuer",
+}
+
+
 def _normalize_match_key(title: str) -> str:
     """Return a lowercase, stripped title with year and common words removed."""
     if not title:
@@ -1889,27 +1947,7 @@ def _normalize_match_key(title: str) -> str:
     lowered = title.lower()
     lowered = re.sub(r"\(\d{4}\)", " ", lowered)
     lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "of",
-        "to",
-        "in",
-        "on",
-        "at",
-        "from",
-        "with",
-        "by",
-        "no",
-        "san",
-        "chan",
-        "kun",
-        "sama",
-    }
-    tokens = [t for t in lowered.split() if t and t not in stopwords]
+    tokens = [t for t in lowered.split() if t and t not in _TITLE_STOPWORDS]
     return " ".join(sorted(set(tokens)))
 
 
@@ -1990,7 +2028,7 @@ def _match_keys(title: str, url_or_slug: str = "") -> set[str]:
         slug = re.sub(r"https?://[^/]+", "", slug)
         slug = re.sub(r"/anime/stream/", "", slug)
         slug = re.sub(r"[^a-z0-9\-]", " ", slug)
-        slug_tokens = " ".join(sorted({t for t in slug.split("-") if len(t) > 2}))
+        slug_tokens = " ".join(sorted({t for t in slug.split("-") if len(t) > 2 and t not in _TITLE_STOPWORDS}))
     if slug_tokens:
         keys.add(slug_tokens)
 
@@ -2060,13 +2098,13 @@ def _match_vanished_to_new(vanished_entries, new_dict):
                 best_score = score
                 best_idx = idx
 
-        if best is not None and best_score >= 0.35:
+        if best is not None and best_score >= 0.75:
             used_new.add(best_idx)
             n_data = new_dict[best]
             n_url = n_data.get("url", n_data.get("link", ""))
             if best_score >= 0.95:
                 reason = "exact"
-            elif best_score >= 0.65:
+            elif best_score >= 0.85:
                 reason = "strong"
             else:
                 reason = "weak"
@@ -2090,14 +2128,29 @@ def _format_vanished_new_table(matched):
 
     paired_rows = []
     extra_rows = []
+    total_vanished = 0
     for v_title, v_url, n_title, n_url, reason in matched:
         if reason == "extra" or not v_title:
             extra_rows.append((n_title or "", n_url or ""))
             continue
+        total_vanished += 1
+        if not n_title:
+            # No candidate cleared the pairing floor -- counted below as
+            # unmatched, but not printed as a row with blank columns.
+            continue
         paired_rows.append((v_title or "", v_url or "", n_title or "", n_url or "", reason or ""))
 
+    matched_count = len(paired_rows)
+    unmatched_count = total_vanished - matched_count
+    if total_vanished == 0:
+        status = "  No vanished series to match."
+    elif unmatched_count == 0:
+        status = f"  Matched: {matched_count}/{total_vanished} vanished series (complete ✓)"
+    else:
+        status = f"  Matched: {matched_count}/{total_vanished} vanished series ({unmatched_count} unmatched ⚠)"
+
     if not paired_rows:
-        return [], _format_extra_new_series_lines(extra_rows)
+        return [status], _format_extra_new_series_lines(extra_rows)
 
     gap = "  │  "
     term_w = max(shutil.get_terminal_size().columns, 80)
@@ -2136,15 +2189,6 @@ def _format_vanished_new_table(matched):
             else:
                 lines.append(f"       {'':<{left_w}}{gap}{_trunc(ru, right_w):<{right_w}}")
         lines.append("")
-    total_vanished = sum(1 for v_title, _, _, _, _ in matched if v_title)
-    matched_count = len(paired_rows)
-    unmatched_count = total_vanished - matched_count
-    if total_vanished == 0:
-        status = "  No vanished series to match."
-    elif unmatched_count == 0:
-        status = f"  Matched: {matched_count}/{total_vanished} vanished series (complete ✓)"
-    else:
-        status = f"  Matched: {matched_count}/{total_vanished} vanished series ({unmatched_count} unmatched ⚠)"
     lines.append(status)
     return lines, _format_extra_new_series_lines(extra_rows)
 
