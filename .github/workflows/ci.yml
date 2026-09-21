@@ -36,6 +36,15 @@ jobs:
           pip install -r requirements.txt
           pip install ".[dev]"
 
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Format
+        run: python -m ruff format --check .
+
+      - name: Type check
+        run: python -m pyright
+
       - name: Test
         # As in release.yml: the suite runs without credentials and without the
         # captured fixtures, which are not in git; the tests needing either
