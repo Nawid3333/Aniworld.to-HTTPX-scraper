@@ -56,21 +56,14 @@ commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.c
 testpaths = ["tests"]
 # Quiet, but with the short traceback style that actually fits on a screen.
 addopts = "-q --tb=short"
-markers = [
-    "benchmark: a timing test, skipped unless --benchmark is passed",
-]
+markers = ["benchmark: a timing test, skipped unless --benchmark is passed"]
 
 [tool.coverage.run]
 source = ["main", "src", "config"]
 branch = true
 # Helper scripts that talk to the live site on purpose. They are tools, not
 # code under test, and including them makes the coverage number meaningless.
-omit = [
-    "tests/*",
-    "*/capture_fixtures.py",
-    "*/probe_*.py",
-    "*/manual_*.py",
-]
+omit = ["tests/*", "*/capture_fixtures.py", "*/probe_*.py", "*/manual_*.py"]
 
 [tool.coverage.report]
 show_missing = true
