@@ -1,8 +1,18 @@
 # Bumps the version and cuts a release automatically, driven by Conventional
-# Commits on every push to main. python-semantic-release inspects the
-# commits since the last tag: a `fix:` bumps patch, `feat:` bumps minor, a
-# "BREAKING CHANGE:" footer bumps major; anything else (chore:, ci:, docs:,
-# test:, refactor:, ...) does not trigger a release at all.
+# Commits, but only after the CI workflow (lint, format, type check, tests)
+# has passed on that exact commit -- ci.yml and this workflow used to both
+# trigger independently on `push: branches: [main]`, which meant a broken
+# commit could get auto-tagged and released before, or even if, CI failed.
+# Triggering on `workflow_run: ["CI"]` instead makes this wait for that run
+# to finish, and the job condition below restricts it to a *successful* CI
+# run that was itself triggered by a push to main (not a pull_request run).
+# Checking out `head_sha` (not just `main`) pins this to the exact commit CI
+# validated, in case main moved again before this fired.
+#
+# python-semantic-release inspects the commits since the last tag: a `fix:`
+# bumps patch, `feat:` bumps minor, a "BREAKING CHANGE:" footer bumps major;
+# anything else (chore:, ci:, docs:, test:, refactor:, ...) does not trigger
+# a release at all.
 #
 # This only bumps pyproject.toml, commits, tags, and publishes the GitHub
 # Release -- release.yml (triggered by `release: published`) still does the
@@ -15,8 +25,9 @@
 name: Auto Release
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 concurrency:
   group: auto-release
@@ -27,6 +38,10 @@ permissions:
 
 jobs:
   release:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -34,6 +49,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ secrets.RELEASE_PAT }}
 
       - name: Python Semantic Release
