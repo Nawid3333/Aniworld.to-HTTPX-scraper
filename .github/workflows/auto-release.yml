@@ -6,8 +6,11 @@
 # Triggering on `workflow_run: ["CI"]` instead makes this wait for that run
 # to finish, and the job condition below restricts it to a *successful* CI
 # run that was itself triggered by a push to main (not a pull_request run).
-# Checking out `head_sha` (not just `main`) pins this to the exact commit CI
-# validated, in case main moved again before this fired.
+# Checks out `head_branch` (main), not `head_sha`: python-semantic-release
+# refuses to release from a detached HEAD ("cannot match any release
+# groups"), which checking out a bare SHA produces. workflow_run fires
+# right after CI completes, so in practice this is still the commit CI
+# just validated.
 #
 # python-semantic-release inspects the commits since the last tag: a `fix:`
 # bumps patch, `feat:` bumps minor, a "BREAKING CHANGE:" footer bumps major;
@@ -49,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.workflow_run.head_branch }}
           token: ${{ secrets.RELEASE_PAT }}
 
       - name: Python Semantic Release
