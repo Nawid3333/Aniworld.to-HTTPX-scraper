@@ -40,7 +40,7 @@ class TestMakeDoc(unittest.TestCase):
         searchable with .//table. lxml.html.fromstring returns a bare
         fragment root and would fail this; document_fromstring must not."""
         doc = make_doc("<table class='seasonEpisodesList'><tr></tr></table>")
-        self.assertIsNotNone(doc)
+        assert doc is not None
         self.assertTrue(doc.xpath(".//table"), "fragment was not wrapped; .//table matched nothing")
 
     def test_a_full_page_parses(self):
@@ -90,6 +90,7 @@ class TestXPathContract(unittest.TestCase):
 
     def test_xpath_returns_a_list_not_a_scalar(self):
         doc = make_doc("<html><body><h1>A</h1></body></html>")
+        assert doc is not None
         result = doc.xpath(".//h1")
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 1)

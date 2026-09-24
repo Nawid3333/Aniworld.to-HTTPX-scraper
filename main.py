@@ -1267,7 +1267,7 @@ def _run_scrape_and_save(
                 # User already confirmed deletion in the integrity dialog — proceed directly
                 n = len(result["urls"])
                 print(f"\n→ Deleting {n} critical series from index before rescraping...")
-                remove_series_from_index(SERIES_INDEX_FILE, result["titles"])
+                remove_series_from_index(SERIES_INDEX_FILE, result["series"])
                 print(f"\n→ Rescraping {n} critical series...\n")
                 _run_scrape_and_save(
                     run_kwargs={"url_list": result["urls"], "parallel": False},
@@ -1346,7 +1346,7 @@ def _run_scrape_and_save(
                 active_site_url=ACTIVE_SITE_URL,
             )
             if isinstance(result, dict) and result.get("rescrape"):
-                remove_series_from_index(SERIES_INDEX_FILE, result["titles"])
+                remove_series_from_index(SERIES_INDEX_FILE, result["series"])
                 for url, title in zip(result["urls"], result["titles"], strict=False):
                     scraper.failed_links.append(
                         {
@@ -1644,7 +1644,7 @@ def _append_urls_to_batch_file(urls_file, urls):
     return fresh, len(urls) - len(fresh)
 
 
-def _show_ongoing_and_export(report, index_manager):
+def _show_ongoing_and_export(report):
     """Show ongoing anime and offer to export their URLs to series_urls.txt"""
     ongoing_count = report["categories"]["ongoing"]["count"]
     if ongoing_count == 0:
@@ -1667,9 +1667,7 @@ def _show_ongoing_and_export(report, index_manager):
     # between the report and a batch file that should already be current.
     try:
         urls = []
-        for title in ongoing_titles:
-            series_data = index_manager.series_index.get(title, {})
-            url = series_data.get("url") or series_data.get("link")
+        for url in report["categories"]["ongoing"]["urls"]:
             if url:
                 if not url.startswith("http"):
                     url = f"https://aniworld.to{url}"
@@ -1797,7 +1795,7 @@ def generate_report():
             _print_report_summary(report, report_file)
             logger.info("Full report generated")
             print_completed_series_alerts(index_manager)
-            _show_ongoing_and_export(report, index_manager)
+            _show_ongoing_and_export(report)
 
         elif choice == "2":
             print("\n→ Subscription/watchlist report")
@@ -1833,7 +1831,7 @@ def generate_report():
             _print_report_summary(report, report_file, filter_name)
             logger.info("Filtered report generated: %s", filter_name)
             print_completed_series_alerts(index_manager)
-            _show_ongoing_and_export(report, index_manager)
+            _show_ongoing_and_export(report)
 
         else:
             print("⚠ Invalid choice")
@@ -1847,7 +1845,13 @@ def _inject_disappeared_series(scraper, pre_index, source):
     """Inject stubs for series no longer on account pages so merge can prompt."""
     discovered_slugs = {_extract_slug(s) for s in (scraper.all_discovered_series or [])} - {None}
     failed_slugs = {_extract_slug(fl) for fl in scraper.failed_links if isinstance(fl, dict)} - {None}
-    scraped_titles = {s.get("title") for s in scraper.series_data if s.get("title")}
+    # By slug, not title: two series can share a title, and matching on it
+    # cleared the flag on whichever one the scrape returned instead.
+    scraped_by_slug = {}
+    for item in scraper.series_data:
+        item_slug = _extract_slug(item)
+        if item_slug:
+            scraped_by_slug.setdefault(item_slug, item)
 
     for field, sources in [
         ("watchlist", ("watchlist", "both")),
@@ -1862,17 +1866,14 @@ def _inject_disappeared_series(scraper, pre_index, source):
             slug = _extract_slug(entry)
             if not slug or slug in discovered_slugs or slug in failed_slugs:
                 continue
-            if title in scraped_titles:
+            if slug in scraped_by_slug:
                 # Already scraped — just flip the flag
-                for item in scraper.series_data:
-                    if item.get("title") == title:
-                        item[field] = False
-                        break
+                scraped_by_slug[slug][field] = False
             else:
                 stub = copy.deepcopy(entry)
                 stub[field] = False
                 scraper.series_data.append(stub)
-                scraped_titles.add(title)
+                scraped_by_slug[slug] = stub
             injected.append(title)
         if injected:
             print(f"\n  ⚠ {len(injected)} anime no longer {field} (will prompt for confirmation):")

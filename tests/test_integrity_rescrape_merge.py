@@ -107,6 +107,7 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
         rescrape = {
             "urls": ["https://aniworld.to/anime/stream/critical"],
             "titles": ["Critical"],
+            "series": {"Critical": _series("Critical", 1, [True, True])},
         }
         with (
             mock.patch.object(im, "_prompt_change_confirmations", return_value=dict(ALLOW_EVERYTHING)),
@@ -120,6 +121,8 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertTrue(result.get("rescrape"))
         self.assertEqual(result["titles"], ["Critical"])
+        # main.py deletes by these entries, so they must be handed back too.
+        self.assertEqual([s["title"] for s in result["series"]], ["Critical"])
 
     def test_declining_the_save_also_cancels_the_rescrape(self):
         """Declining the final save must not still delete and rescrape.
@@ -133,6 +136,7 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
         rescrape = {
             "urls": ["https://aniworld.to/anime/stream/critical"],
             "titles": ["Critical"],
+            "series": {"Critical": _series("Critical", 1, [True, True])},
         }
         with (
             mock.patch.object(im, "_prompt_change_confirmations", return_value=dict(ALLOW_EVERYTHING)),

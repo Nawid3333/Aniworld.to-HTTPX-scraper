@@ -148,12 +148,54 @@ def _validate_series_entry(series, title=""):
     return True
 
 
+def _series_identity(entry):
+    """Return what makes two index entries the same series: title and slug together.
+
+    Title alone is not unique -- aniworld.to can list two different series under one name -- and keying on it let each
+    scrape of one overwrite the other, so a new-only scrape offered the missing
+    one forever. Slug alone would quietly fold a renamed series into its old
+    entry, which is the decision the duplicate-slug prompt leaves to the user.
+    """
+    return entry.get("title"), _extract_slug(entry)
+
+
+def _series_keyer(*collections):
+    """Return a function giving each entry its dict key across *collections*.
+
+    The key is the title, because every prompt prints it. A title that more
+    than one series uses gets the slug appended, e.g. "Title [slug]", so the
+    two stay apart. Collections compared against each other must share one
+    keyer, or the same series could be keyed plainly on one side and with its
+    slug on the other.
+    """
+    slugs_by_title = defaultdict(set)
+    for entries in collections:
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("title"):
+                slugs_by_title[entry["title"]].add(_extract_slug(entry))
+
+    def key_of(entry):
+        title = entry["title"]
+        if len(slugs_by_title.get(title, ())) > 1:
+            return f"{title} [{_extract_slug(entry) or '?'}]"
+        return title
+
+    return key_of
+
+
+def _key_series(entries, key_of=None):
+    """Return {key: entry} for the titled entries in *entries*; see _series_keyer."""
+    entries = [e for e in entries if isinstance(e, dict) and e.get("title")]
+    key_of = key_of or _series_keyer(entries)
+    return {key_of(e): e for e in entries}
+
+
 def _find_series(new_data, title):
-    """Look up a series by title in either a dict or list."""
+    """Look up a series by its key in either a dict or list."""
     if isinstance(new_data, dict):
         return new_data.get(title)
     if isinstance(new_data, list):
-        return next((s for s in new_data if s.get("title") == title), None)
+        return _key_series(new_data).get(title)
     return None
 
 
@@ -239,7 +281,7 @@ def group_episodes_by_season(episode_list, new_data, prefix="[+]"):
         grouped[(title, season)].append(ep_num)
 
     if isinstance(new_data, list):
-        new_data_dict = {s.get("title"): s for s in new_data}
+        new_data_dict = _key_series(new_data)
     elif isinstance(new_data, dict):
         new_data_dict = new_data
     else:
@@ -267,10 +309,7 @@ def _detect_housekeeping_changes(old_data, new_dict):
     'added'  = seasons where ep0 will be removed and ignored flag set.
     'removed' = seasons where the ignored flag will be cleared.
     """
-    if isinstance(old_data, list):
-        old_map = {s.get("title"): s for s in old_data if s and s.get("title")}
-    else:
-        old_map = dict(old_data) if old_data else {}
+    old_map = _key_series(old_data) if isinstance(old_data, list) else dict(old_data or {})
 
     added = {}  # title -> [season_labels]
     removed = {}  # title -> [season_labels]
@@ -348,17 +387,15 @@ def detect_changes(old_data, new_data):
         "removed_seasons": [],
     }
 
-    old_titles = (
-        set(old_data.keys()) if isinstance(old_data, dict) else {s.get("title") for s in old_data if s.get("title")}
-    )
-    new_titles = (
-        set(new_data.keys()) if isinstance(new_data, dict) else {s.get("title") for s in new_data if s.get("title")}
-    )
+    if isinstance(old_data, list) or isinstance(new_data, list):
+        old_entries = old_data if isinstance(old_data, list) else list(old_data.values())
+        new_entries = new_data if isinstance(new_data, list) else list(new_data.values())
+        key_of = _series_keyer(old_entries, new_entries)
+        old_data = _key_series(old_entries, key_of)
+        new_data = _key_series(new_entries, key_of)
 
-    if isinstance(old_data, list):
-        old_data = {s.get("title"): s for s in old_data}
-    if isinstance(new_data, list):
-        new_data = {s.get("title"): s for s in new_data}
+    old_titles = set(old_data.keys())
+    new_titles = set(new_data.keys())
 
     # Sorted, not raw set order. Python randomises string hashing per
     # process, so the same scrape listed its changes in a different order
@@ -456,6 +493,8 @@ def show_changes(
     new_data=None,
 ):
     """Display changes with pagination and smart season grouping."""
+    if isinstance(new_data, list):
+        new_data = _key_series(new_data)
 
     total = 0
     for k, v in changes.items():
@@ -578,19 +617,13 @@ class IndexManager:
         try:
             with open(self.index_file, encoding="utf-8") as f:
                 data = json.load(f)
+            # _key_series skips non-dict elements: .get() on one raises
+            # AttributeError, and the broad handler below turns that into an
+            # empty index -- one stray element used to discard every good entry.
             if isinstance(data, list):
-                # isinstance first: .get() on a non-dict raises AttributeError,
-                # and the broad handler below turns that into an empty index --
-                # one stray element used to discard every good entry with it.
-                self.series_index = {title: s for s in data if isinstance(s, dict) and (title := s.get("title"))}
+                self.series_index = _key_series(data)
             elif isinstance(data, dict):
-                first_item = next(iter(data.values()), None)
-                if first_item and isinstance(first_item, dict) and first_item.get("title"):
-                    self.series_index = data
-                else:
-                    self.series_index = {
-                        title: item for item in data.values() if isinstance(item, dict) and (title := item.get("title"))
-                    }
+                self.series_index = _key_series(data.values())
             else:
                 self.series_index = {}
 
@@ -613,7 +646,9 @@ class IndexManager:
                             moved = True
                 rehosted += bool(moved)
                 validated_index[title] = series
-            self.series_index = validated_index
+            # Re-keyed without the rejected entries, so a series only carries
+            # its slug in its key while another valid one shares its title.
+            self.series_index = _key_series(validated_index.values())
             if rehosted:
                 print(f"[INFO] Repointed {rehosted} index entry(s) to {SITE_URL} (stored host no longer configured).")
                 logger.warning("Repointed %d index entry(s) to %s", rehosted, SITE_URL)
@@ -651,22 +686,13 @@ class IndexManager:
                 with open(backup_path, encoding="utf-8") as f:
                     data = json.load(f)
                 recovered = None
+                # _key_series skips non-dict elements, and that matters here:
+                # the except below catches only JSONDecodeError/OSError, so an
+                # AttributeError escaped the loop and .bak2/.bak3 were never tried.
                 if isinstance(data, list):
-                    # Same guard order as load_index, and it matters more here:
-                    # the except below catches only JSONDecodeError/OSError, so
-                    # an AttributeError escaped the loop and .bak2/.bak3 were
-                    # never tried.
-                    recovered = {title: s for s in data if isinstance(s, dict) and (title := s.get("title"))}
+                    recovered = _key_series(data)
                 elif isinstance(data, dict):
-                    first_item = next(iter(data.values()), None)
-                    if first_item and isinstance(first_item, dict) and first_item.get("title"):
-                        recovered = data
-                    else:
-                        recovered = {
-                            title: item
-                            for item in data.values()
-                            if isinstance(item, dict) and (title := item.get("title"))
-                        }
+                    recovered = _key_series(data.values())
                 if recovered:
                     return recovered
                 # A readable backup holding nothing usable is not a restore.
@@ -727,6 +753,7 @@ class IndexManager:
             series_list.append(
                 {
                     "title": s.get("title", ""),
+                    "url": s.get("url") or s.get("link", ""),
                     "watched_episodes": watched_eps,
                     "total_episodes": total_eps,
                     "is_incomplete": is_incomplete,
@@ -879,6 +906,9 @@ class IndexManager:
                 "ongoing": {
                     "count": len(ongoing_series),
                     "titles": [s["title"] for s in ongoing_sorted],
+                    # Parallel to "titles". The URL, not the title, is what
+                    # finds the series again: two series can share a title.
+                    "urls": [s["url"] for s in ongoing_sorted],
                     "details": [
                         {
                             "title": s["title"],
@@ -1000,10 +1030,7 @@ def _detect_episode_count_mismatches(old_data, new_dict):
     similarly-named shows are not confused. Series whose slug changed are
     skipped here and handled by the vanished/rename logic instead.
     """
-    if isinstance(old_data, list):
-        old_map = {s.get("title"): s for s in old_data if s and s.get("title")}
-    else:
-        old_map = dict(old_data) if old_data else {}
+    old_map = _key_series(old_data) if isinstance(old_data, list) else dict(old_data or {})
 
     # Build old lookup by stable match key; also keep a title-only fallback.
     old_by_key: dict[str, dict] = {}
@@ -1182,10 +1209,7 @@ def _extract_critical_series_for_rescrape(mismatches, old_data, active_site_url=
     if not critical:
         return {"urls": [], "titles": [], "series": {}}
 
-    if isinstance(old_data, list):
-        old_map = {s.get("title"): s for s in old_data if s and s.get("title")}
-    else:
-        old_map = dict(old_data) if old_data else {}
+    old_map = _key_series(old_data) if isinstance(old_data, list) else dict(old_data or {})
 
     base_url = (active_site_url or "https://aniworld.to").rstrip("/")
     urls = []
@@ -1969,29 +1993,27 @@ def _series_match_key(title: str, url_or_slug: str = "") -> str:
     return " | ".join(parts)
 
 
-def remove_series_from_index(index_file, titles_to_remove):
-    """Remove series entries from the index file by title.
+def remove_series_from_index(index_file, series_to_remove):
+    """Remove the given index entries from the index file.
 
-    Loads the index under a file lock, filters out entries whose title is in the
-    removal set, and atomically writes back.
-    Returns the number of entries actually removed.
+    Entries are matched on title and slug together (see _series_identity).
+    Matching on title alone deleted every series sharing the title, including
+    ones the user never saw in the prompt. Atomically writes back and returns
+    the number of entries actually removed.
     """
-    if not titles_to_remove or not os.path.exists(index_file):
+    if not series_to_remove or not os.path.exists(index_file):
         return 0
-    removal_set = set(titles_to_remove)
+    removal_set = {_series_identity(entry) for entry in series_to_remove}
     try:
         with open(index_file, encoding="utf-8") as f:
             data = json.load(f)
 
-        if isinstance(data, list):
-            filtered = [entry for entry in data if entry.get("title") not in removal_set]
-            removed = len(data) - len(filtered)
-        elif isinstance(data, dict):
-            filtered_dict = {k: v for k, v in data.items() if k not in removal_set}
-            removed = len(data) - len(filtered_dict)
-            filtered = list(filtered_dict.values())
-        else:
+        if isinstance(data, dict):
+            data = list(data.values())
+        if not isinstance(data, list):
             return 0
+        filtered = [entry for entry in data if not (isinstance(entry, dict) and _series_identity(entry) in removal_set)]
+        removed = len(data) - len(filtered)
 
         if removed > 0:
             _atomic_write_json(index_file, filtered)
@@ -2370,9 +2392,12 @@ def _rescrape_rows(rows: list, scraper, old_data: dict) -> int:
     for row, (new_v_title, new_v_url, reachable) in zip(actionable, verified_vanished, strict=True):
         v_title = row["v_title"]
         if reachable:
+            # Only the displayed title follows the site. The row still stands
+            # for the same index entry, so old_entry and the row's key stay put:
+            # looking the entry up again by the fetched title found a different
+            # series whenever another one already used that title.
             row["v_title"] = new_v_title
             row["v_url"] = new_v_url or row["v_url"]
-            row["old_entry"] = old_data.get(new_v_title, row["old_entry"])
             print(f"  ✓ {v_title}: old URL still reachable. Title now: {new_v_title}")
             updated.add(id(row))
         else:
@@ -2494,7 +2519,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
         scraper: optional scraper instance for live re-scraping of old URLs.
 
     Returns:
-        list of titles confirmed for deletion.
+        list of old_data keys confirmed for deletion.
     """
     matched = _match_vanished_to_new(vanished_entries, new_dict)
     to_delete = []
@@ -2598,6 +2623,9 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
         new_entry = new_dict.get(n_title, {}) if n_title else {}
         rows.append(
             {
+                # The old_data key this row decides. v_title is display text
+                # and can change under a live re-scrape; the key cannot.
+                "key": v_title,
                 "v_title": v_title,
                 "v_url": v_url,
                 "old_entry": old_entry,
@@ -2662,7 +2690,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                     print("  -> No input available; not deleting this entry.")
                     break
                 if confirm == "y":
-                    to_delete.append(v_title)
+                    to_delete.append(row["key"])
                     print("  → Marked for deletion.")
                 else:
                     print("  → Not deleted.")
@@ -2789,14 +2817,13 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
         # Only offer deletion for full catalog scopes
         if scrape_scope in ("all", "new_only"):
             # Optional live verification of vanished/rename URLs for accuracy
+            old_identities = {_series_identity(entry) for entry in old_data.values()}
             if new_data is not None and scraper is not None:
-                old_titles = set(old_data.keys())
-                if isinstance(new_data, list):
-                    candidate_entries = [s for s in new_data if s.get("title") and s.get("title") not in old_titles]
-                else:
-                    candidate_entries = [
-                        s for s in new_data.values() if s.get("title") and s.get("title") not in old_titles
-                    ]
+                candidate_entries = [
+                    s
+                    for s in (new_data if isinstance(new_data, list) else new_data.values())
+                    if s.get("title") and _series_identity(s) not in old_identities
+                ]
                 if candidate_entries:
                     try:
                         ask = (
@@ -2824,12 +2851,9 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
             # Show new series alongside so user can spot renames before deciding
             new_dict = {}
             if new_data is not None:
-                old_titles = set(old_data.keys())
-                if isinstance(new_data, list):
-                    new_dict = {s.get("title"): s for s in new_data if s.get("title")}
-                else:
-                    new_dict = dict(new_data)
-                incoming_new = [t for t in new_dict if t and t not in old_titles]
+                new_entries = list(new_data if isinstance(new_data, list) else new_data.values())
+                new_dict = _key_series(new_entries, _series_keyer(old_data.values(), new_entries))
+                incoming_new = [s for s in new_dict.values() if _series_identity(s) not in old_identities]
                 if incoming_new:
                     matched = _match_vanished_to_new(vanished, new_dict)
                     table_lines, extra_lines = _format_vanished_new_table(matched)
@@ -2856,7 +2880,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
             to_delete = _prompt_vanished_table(vanished, new_dict, old_data, scraper=scraper)
 
             if to_delete and index_file:
-                removed = remove_series_from_index(index_file, to_delete)
+                removed = remove_series_from_index(index_file, [old_data[key] for key in to_delete])
                 print(f"  ✓ Removed {removed} series from index.")
             elif to_delete:
                 print(f"  ⚠ {len(to_delete)} series marked for deletion but no index_file provided.")
@@ -2892,8 +2916,6 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
         False: Merge cancelled
         dict: Rescrape workflow triggered (with keys: 'rescrape', 'urls', 'titles')
     """
-    old_data = dict(index_manager.series_index)
-
     # Drop the "_error" placeholders the scraper keeps in series_data so a
     # checkpoint stays complete across a pause/resume. A series the index
     # already holds survives one either way -- the placeholder carries no
@@ -2904,12 +2926,17 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
     # successful scrape reads its whole episode list as newly added. Both
     # sibling scrapers have filtered these out since their first release;
     # this one did not, and its runs are the same shape.
-    if isinstance(new_data, list):
-        new_dict = {s.get("title"): s for s in new_data if s.get("title") and not s.get("_error")}
-        skipped_errors = [s for s in new_data if isinstance(s, dict) and s.get("_error")]
-    else:
-        new_dict = {k: v for k, v in dict(new_data).items() if not v.get("_error")}
-        skipped_errors = [v for v in dict(new_data).values() if v.get("_error")]
+    new_entries = list(new_data if isinstance(new_data, list) else dict(new_data).values())
+    skipped_errors = [s for s in new_entries if isinstance(s, dict) and s.get("_error")]
+    new_entries = [s for s in new_entries if isinstance(s, dict) and not s.get("_error")]
+
+    # One keyer over both sides: a series the scrape brings in under a title
+    # the index already uses gets its slug in the key on both sides, so it is
+    # diffed and merged as its own series instead of over the other one.
+    old_entries = list(index_manager.series_index.values())
+    key_of = _series_keyer(old_entries, new_entries)
+    old_data = _key_series(old_entries, key_of)
+    new_dict = _key_series(new_entries, key_of)
 
     if skipped_errors:
         print(f"\n⚠ Skipping {len(skipped_errors)} failed/error series from save.")
@@ -2962,6 +2989,9 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
                 "rescrape": True,
                 "urls": rescrape_data["urls"],
                 "titles": rescrape_data["titles"],
+                # The entries themselves, for remove_series_from_index: a title
+                # alone would also delete any other series sharing it.
+                "series": list(rescrape_data["series"].values()),
             }
         elif not proceed:
             print("✗ Merge cancelled due to episode count mismatches.")
@@ -3038,7 +3068,7 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
             if input("Apply these changes? (y/n): ").strip().lower() != "y":
                 print("✗ Changes discarded.")
                 return False
-            index_manager.series_index = merged
+            index_manager.series_index = _key_series(merged.values())
             index_manager.save_index()
             print(f"✓ Saved {len(merged)} series to index")
             return pending_rescrape or True
@@ -3064,7 +3094,9 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
         logger.info("User discarded changes. Nothing saved.")
         return False
 
-    index_manager.series_index = merged
+    # Keyed as a fresh load would key it: a declined new series no longer
+    # shares a title with anything, so its namesake loses the slug suffix.
+    index_manager.series_index = _key_series(merged.values())
     index_manager.save_index()
     print(f"✓ Saved {len(merged)} series to index")
     logger.info("Saved %d series to index", len(merged))
