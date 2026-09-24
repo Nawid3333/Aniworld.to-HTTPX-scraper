@@ -1,0 +1,107 @@
+# Once a month, checks the live site for changes that would break the
+# scraper: the login form, the series and season page parsers and, when the
+# credential secrets are set, the real login, catalogue and account pages.
+# tests/site_check.py documents each check; run it locally the same way.
+#
+# One issue labelled "site-check" tracks the result. A failing run opens it
+# (or comments on the open one), and the first passing run closes it. A run
+# that could not reach the site says so in the same issue rather than
+# claiming the layout changed: GitHub's runners are sometimes refused by
+# bot protection that a home connection never meets.
+#
+# Credentials are optional. Without them only public pages are checked. To
+# add them: Settings > Secrets and variables > Actions > New repository
+# secret, one each for ANIWORLD_EMAIL and ANIWORLD_PASSWORD. The report never includes
+# the account name or anything read from the account's pages.
+#
+# Scheduled workflows run from the default branch only, and GitHub pauses
+# them in a public repository after 60 days without a commit; re-enable it
+# from the Actions tab if that happens.
+name: Site check
+
+on:
+  schedule:
+    # 06:23 UTC on the 3rd of every month. Off the hour, when fewer
+    # scheduled runs are queued and a late start is less likely.
+    - cron: "23 6 3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: site-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check the live site
+        id: check
+        env:
+          ANIWORLD_EMAIL: ${{ secrets.ANIWORLD_EMAIL }}
+          ANIWORLD_PASSWORD: ${{ secrets.ANIWORLD_PASSWORD }}
+        run: |
+          set +e
+          python tests/site_check.py --report site-check.md
+          code=$?
+          set -e
+          if [ ! -s site-check.md ]; then
+            printf '### Site check crashed\n\nSee the workflow log.\n' > site-check.md
+            code=3
+          fi
+          cat site-check.md >> "$GITHUB_STEP_SUMMARY"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ steps.check.outputs.code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=site-check
+          gh label create "$label" --color D93F0B \
+            --description "Opened by the monthly site check" 2>/dev/null || true
+          issue=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          printf '%s\n\n[Workflow run](%s)\n' "$(cat site-check.md)" "$RUN_URL" > issue-body.md
+
+          case "$CODE" in
+            0)
+              if [ -n "$issue" ]; then
+                gh issue close "$issue" --comment "Every check passes again. $RUN_URL"
+              fi
+              exit 0
+              ;;
+            1) title="Site check: the site changed in a way the scraper depends on" ;;
+            2) title="Site check: the site could not be checked" ;;
+            *) title="Site check: the check itself crashed" ;;
+          esac
+
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" --title "$title"
+            gh issue comment "$issue" --body-file issue-body.md
+          else
+            gh issue create --title "$title" --label "$label" --body-file issue-body.md
+          fi
+
+      - name: Fail the run on a failed or crashed check
+        # Marks the run red in the Actions tab, and GitHub emails about a
+        # failed scheduled run. An unreachable site stays green: the issue
+        # already says so, and nothing in the code needs fixing.
+        if: steps.check.outputs.code == '1' || steps.check.outputs.code == '3'
+        run: exit 1

@@ -336,6 +336,25 @@ Fixtures under `tests/fixtures/` are captured from the live site and are not in
 git. Regenerate them with `python tests/capture_fixtures.py` (needs working
 credentials); the tests that use them skip when they are absent.
 
+### Monthly site check
+
+`.github/workflows/site-check.yml` runs `tests/site_check.py` on the 3rd of
+every month. It runs this scraper's own login probe and page parsers against
+the live site. If one of them would fail, it opens an issue labelled
+`site-check`, and the first passing run closes it again. A site that blocks
+GitHub's runners is reported as unreachable, not as a change. Run it yourself
+any time:
+
+```bash
+python tests/site_check.py
+```
+
+Without credentials it checks the login form and one public series and season
+page. With `ANIWORLD_EMAIL` and `ANIWORLD_PASSWORD` (read from your `.env`
+locally, or set as repository secrets for the workflow) it also logs in and
+checks the catalogue and account pages. It never changes anything, and its
+report holds no account details.
+
 ## Project Structure
 
 ```
@@ -362,6 +381,7 @@ credentials); the tests that use them skip when they are absent.
     ├── capture_fixtures.py      # Regenerates fixtures from the live site
     ├── conftest.py              # sys.path, --benchmark flag, shared fixtures
     ├── fixture_spec.py          # Which parser outputs the fixtures pin
+    ├── site_check.py            # Monthly live-site check (see Development)
     ├── manual_picker_demo.py    # Manual harness for the genre picker
     └── test_*.py                # The suite itself (see Development)
 ```

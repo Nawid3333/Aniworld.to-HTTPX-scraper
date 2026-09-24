@@ -41,7 +41,11 @@ include = ["config*", "src*"]
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
-commit_message = "chore(release): {version}"
+# [skip ci]: this commit only changes the version line, and CI already passed
+# on the commit being released. Without it the bump re-ran the whole Windows
+# suite, and then auto-release.yml again, only to find nothing to release.
+# release.yml still runs: it starts on the published release, not a push.
+commit_message = "chore(release): {version} [skip ci]"
 commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
 
 # ==================== TESTS ====================
