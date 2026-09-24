@@ -18,6 +18,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -357,8 +358,11 @@ class TargetsTests(unittest.TestCase):
     def test_the_url_is_rebuilt_on_the_active_host_not_the_catalogue_one(self):
         """The catalogue hard-codes the primary host; a probed mirror wins."""
         ((_slug, url),) = genre_stats._targets(FakeScraper(), [self._entry("one-piece")])
-        self.assertTrue(url.startswith("https://mirror.test"))
-        self.assertNotIn("primary.test", url)
+        # Assert on the parsed host, not a substring: startswith would also
+        # accept https://mirror.test.evil.com (CodeQL
+        # py/incomplete-url-substring-sanitization).
+        self.assertEqual(urlparse(url).hostname, "mirror.test")
+        self.assertNotIn("primary.test", urlparse(url).hostname)
 
     def test_an_ignored_series_is_not_fetched(self):
         targets = genre_stats._targets(FakeScraper(ignored={"one-piece"}), [self._entry("one-piece")])
