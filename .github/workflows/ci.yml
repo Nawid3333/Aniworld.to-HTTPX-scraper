@@ -8,6 +8,18 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Runnable by hand from the Actions tab on any branch, e.g. to check a
+  # feature branch before opening a PR. Only a push to main can lead to a
+  # release: auto-release.yml checks the triggering event.
+  workflow_dispatch:
+
+# A newer push to the same branch or PR makes the older run pointless, so it
+# is cancelled instead of finishing on a Windows runner. On main that is
+# safe for releases too: auto-release.yml skips the cancelled run, and the run
+# for the newer commit releases every commit since the last tag.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,6 +30,9 @@ jobs:
     # been run on, so keeping CI on the same runner means a green CI run
     # actually predicts a green release build.
     runs-on: windows-latest
+    # A test that hangs on a network call would otherwise hold the runner for
+    # GitHub's 6-hour default. The whole job normally takes a few minutes.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v7

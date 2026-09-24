@@ -20,6 +20,7 @@ permissions:
 jobs:
   package:
     runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         # bash on Windows too: the upload step relies on glob expansion, which
