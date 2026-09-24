@@ -49,10 +49,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checked out at the hard-coded main branch, not head_branch from the
+      # workflow_run event: event data is attacker-controlled if a malicious
+      # PR ever runs this workflow, and only the job's `if:` guard stood
+      # between it and a privileged checkout. The comment block above explains
+      # why main (not the SHA CI validated) is intentional there.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_branch }}
+          ref: main
           token: ${{ secrets.RELEASE_PAT }}
 
       - name: Python Semantic Release
