@@ -52,9 +52,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -80,11 +79,32 @@ jobs:
         # skip themselves.
         run: python -m pytest
 
+  # Known vulnerabilities in the dependencies as they are actually installed.
+  # requirements.txt is unpinned, so GitHub's dependency graph cannot know which
+  # versions get installed; pip-audit resolves them the way pip does and checks
+  # each against the PyPI advisory database. Weekly and by hand only: a new
+  # advisory is news, but it should not block releasing an unrelated fix.
+  audit:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+          cache: pip
+
+      - name: pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --progress-spinner off
+
   # Scheduled runs only: a push or PR that fails is already in front of whoever
   # made it. One issue while the weekly check is red, assigned to the owner with
   # an @mention so it is emailed, closed by the first green scheduled run.
   report:
-    needs: test
+    needs: [test, audit]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -95,7 +115,7 @@ jobs:
       - name: Open or close the weekly-check issue
         env:
           GH_TOKEN: ${{ github.token }}
-          RESULT: ${{ needs.test.result }}
+          RESULT: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
           OWNER: ${{ github.repository_owner }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -122,7 +142,7 @@ jobs:
           {
             printf '@%s The weekly check failed: %s\n\n' "$OWNER" "$RUN_URL"
             printf 'Failed: %s\n\n' "${failed:-see the run}"
-            printf 'Every scheduled run installs the newest dependency releases (requirements.txt is unpinned) and tests Python 3.11 and the newest stable Python (3.x). If only the 3.x job failed, the newest Python broke something; if both failed, a dependency release did - the run log shows which versions were installed.\n\n'
+            printf 'Every scheduled run installs the newest dependency releases (requirements.txt is unpinned) and tests Python 3.11 and the newest stable Python (3.x). If only the 3.x job failed, the newest Python broke something; if both failed, a dependency release did - the run log shows which versions were installed. If the audit job failed, pip-audit found a known vulnerability in a dependency: its log names the package, the advisory and the fixed version.\n\n'
             printf 'This issue closes on its own once a scheduled run is green again.\n'
           } > "$RUNNER_TEMP/body.md"
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"

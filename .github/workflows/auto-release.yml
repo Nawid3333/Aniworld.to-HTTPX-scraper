@@ -55,14 +55,14 @@ jobs:
       # PR ever runs this workflow, and only the job's `if:` guard stood
       # between it and a privileged checkout. The comment block above explains
       # why main (not the SHA CI validated) is intentional there.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: main
           token: ${{ secrets.RELEASE_PAT }}
 
       - name: Python Semantic Release
-        uses: python-semantic-release/python-semantic-release@v10.6.2
+        uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
         with:
           github_token: ${{ secrets.RELEASE_PAT }}
           git_committer_name: "github-actions[bot]"

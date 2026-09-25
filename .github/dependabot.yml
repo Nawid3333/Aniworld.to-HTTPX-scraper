@@ -13,11 +13,12 @@ updates:
     labels:
       - 'dependencies'
 
-  # Workflow actions pin a major tag, so v7.x fixes arrive on their own but a
-  # new major never does. Without this the pins simply rot: checkout and
-  # setup-python sat three majors behind until a Node 20 deprecation warning
-  # made it visible. Dependabot opens a PR when v8 lands, which is a decision
-  # rather than a surprise.
+  # Workflow actions are pinned to a commit SHA (with the version as a comment),
+  # so a moved or hijacked tag cannot change what runs. Nothing arrives on its
+  # own any more; without this the pins would rot (checkout and setup-python
+  # once sat three majors behind until a Node 20 deprecation warning made it
+  # visible). Dependabot updates the SHA and the comment together; minor and
+  # patch releases come as one grouped PR a week, a new major on its own.
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:
@@ -25,3 +26,6 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - 'dependencies'
+    groups:
+      actions-minor-and-patch:
+        update-types: ['minor', 'patch']
