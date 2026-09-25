@@ -8,6 +8,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, against whatever is newest: requirements.txt is unpinned, so every
+  # run installs the latest release of each dependency, and the matrix below
+  # includes the newest stable Python. When a scheduled run fails, the report
+  # job opens an issue. A scheduled run never releases: auto-release.yml only
+  # acts on push runs.
+  schedule:
+    - cron: '0 6 * * 1'
   # Runnable by hand from the Actions tab on any branch, e.g. to check a
   # feature branch before opening a PR. Only a push to main can lead to a
   # release: auto-release.yml checks the triggering event.
@@ -17,8 +24,9 @@ on:
 # is cancelled instead of finishing on a Windows runner. On main that is
 # safe for releases too: auto-release.yml skips the cancelled run, and the run
 # for the newer commit releases every commit since the last tag.
+# Per event as well, so a scheduled run and a push never cancel each other.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -26,6 +34,15 @@ permissions:
 
 jobs:
   test:
+    name: test (Python ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor in requires-python - testing the oldest supported
+        # version is what catches a newer-only API slipping in. 3.x is the newest
+        # stable release, which is what a fresh install, and the maintainer's own
+        # machine, actually runs.
+        python-version: ['3.11', '3.x']
     # Matches release.yml: windows-latest is the only platform this suite has
     # been run on, so keeping CI on the same runner means a green CI run
     # actually predicts a green release build.
@@ -39,10 +56,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          # The floor declared in requires-python, as in release.yml: testing
-          # the oldest supported version is what catches a newer-only API
-          # slipping in.
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install
@@ -65,3 +79,50 @@ jobs:
         # captured fixtures, which are not in git; the tests needing either
         # skip themselves.
         run: python -m pytest
+
+  # Scheduled runs only: a push or PR that fails is already in front of whoever
+  # made it. One issue while the weekly check is red, assigned to the owner with
+  # an @mention so it is emailed, closed by the first green scheduled run.
+  report:
+    needs: test
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or close the weekly-check issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.test.result }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='Weekly check failed: newest Python or dependencies'
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ "$RESULT" = success ]; then
+            if [ -n "$open" ]; then
+              gh issue close "$open" --repo "$GITHUB_REPOSITORY" --comment "Green again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          if [ "$RESULT" != failure ]; then
+            echo "Test result: $RESULT - nothing to report."
+            exit 0
+          fi
+          if [ -n "$open" ]; then
+            echo "Still failing; already reported in #$open."
+            exit 0
+          fi
+          failed=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')
+          {
+            printf '@%s The weekly check failed: %s\n\n' "$OWNER" "$RUN_URL"
+            printf 'Failed: %s\n\n' "${failed:-see the run}"
+            printf 'Every scheduled run installs the newest dependency releases (requirements.txt is unpinned) and tests Python 3.11 and the newest stable Python (3.x). If only the 3.x job failed, the newest Python broke something; if both failed, a dependency release did - the run log shows which versions were installed.\n\n'
+            printf 'This issue closes on its own once a scheduled run is green again.\n'
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"
