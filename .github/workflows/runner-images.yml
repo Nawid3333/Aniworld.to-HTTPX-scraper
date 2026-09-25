@@ -1,0 +1,232 @@
+name: Runner images
+
+# GitHub moves ubuntu-latest and windows-latest to a new OS version every year or two
+# (ubuntu-latest goes from 24.04 to 26.04 in November 2026, actions/runner-images#14748),
+# and a new image can break a workflow that passed the day before: a tool removed, a
+# path moved, a smaller /tmp. This runs CI on the new image before and after the
+# switch, and only speaks up when something needs editing.
+#
+# Once a day it reads GitHub's list of images (the actions/runner-images README): the
+# image behind each -latest label this repository relies on (windows-latest), and the
+# newest generally available one. Then:
+# - Next image: once a newer image exists than -latest gives, CI runs on it, a
+#   warning before the switch.
+# - The switch: when -latest moves, CI runs on the image it now gives, once more.
+# Each is tested once: a green run is recorded as an Actions cache entry
+# (runner-image-next-... / runner-image-latest-...) and later runs find it and stop. A
+# failing image is retried every day until it passes. A failure opens one issue per
+# image, assigned to the owner with an @mention; the first green run on that image
+# closes it. Run by hand to test both again regardless.
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: runner-images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The runners this repository uses; only a change to these triggers a run.
+  OSES: windows
+
+jobs:
+  detect:
+    name: Find the current and newest runner images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      latest-linux: ${{ steps.images.outputs.latest-linux }}
+      latest-windows: ${{ steps.images.outputs.latest-windows }}
+      next-linux: ${{ steps.images.outputs.next-linux }}
+      next-windows: ${{ steps.images.outputs.next-windows }}
+      latest-images: ${{ steps.images.outputs.latest-images }}
+      next-images: ${{ steps.images.outputs.next-images }}
+      latest-key: ${{ steps.images.outputs.latest-key }}
+      next-key: ${{ steps.images.outputs.next-key }}
+      latest-tested: ${{ steps.latest.outputs.cache-hit }}
+      next-tested: ${{ steps.next.outputs.cache-hit }}
+    steps:
+      - name: Read the image list
+        id: images
+        run: |
+          set -euo pipefail
+          readme=$(curl -fsS --retry 3 https://raw.githubusercontent.com/actions/runner-images/main/README.md)
+          # One table row per image: the x64 ones that are generally available, not a
+          # preview, beta or deprecated image.
+          rows=$(grep -E '^\|.*\| x64 \|' <<< "$readme" | grep -viE 'preview|beta|deprecated' || true)
+          # The backticks are literal: the table writes each label as `ubuntu-24.04`.
+          # shellcheck disable=SC2016
+          labels() { grep -oE '`[a-z0-9.-]+`' | tr -d '`' | grep -E "^$1\$" || true; }
+          newest() { labels "$1" <<< "$rows" | sort -V | tail -1; }
+          latest() { grep -F "\`$2\`" <<< "$rows" | labels "$1" | head -1; }
+          latest_linux=$(latest 'ubuntu-[0-9]{2}\.[0-9]{2}' ubuntu-latest)
+          next_linux=$(newest 'ubuntu-[0-9]{2}\.[0-9]{2}')
+          latest_windows=$(latest 'windows-[0-9]{4}' windows-latest)
+          next_windows=$(newest 'windows-[0-9]{4}')
+          for value in "$latest_linux" "$next_linux" "$latest_windows" "$next_windows"; do
+            if [ -z "$value" ]; then
+              echo "::error::Could not read the images from the runner-images README; its table may have changed."
+              exit 1
+            fi
+          done
+          # The images that matter here, as one name: the cache key and the issue title.
+          latest_images=""
+          next_images=""
+          for os in $OSES; do
+            case "$os" in
+              linux) latest_images+="${latest_images:+, }$latest_linux"; next_images+="${next_images:+, }$next_linux" ;;
+              windows) latest_images+="${latest_images:+, }$latest_windows"; next_images+="${next_images:+, }$next_windows" ;;
+            esac
+          done
+          echo "-latest gives: ubuntu-latest=$latest_linux windows-latest=$latest_windows"
+          echo "Newest available: $next_linux, $next_windows"
+          echo "Used here ($OSES): latest [$latest_images], next [$next_images]"
+          {
+            echo "latest-linux=$latest_linux"
+            echo "latest-windows=$latest_windows"
+            echo "next-linux=$next_linux"
+            echo "next-windows=$next_windows"
+            echo "latest-images=$latest_images"
+            echo "next-images=$next_images"
+            echo "latest-key=runner-image-latest-${latest_images//, /-}"
+            echo "next-key=runner-image-next-${next_images//, /-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Current image already tested?
+        id: latest
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .runner-image-tested
+          key: ${{ steps.images.outputs.latest-key }}
+          lookup-only: true
+
+      - name: Next image already tested?
+        id: next
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .runner-image-tested
+          key: ${{ steps.images.outputs.next-key }}
+          lookup-only: true
+
+  latest:
+    name: On the image -latest gives
+    needs: detect
+    if: needs.detect.outputs.latest-tested != 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    with:
+      linux-runner: ${{ needs.detect.outputs.latest-linux }}
+      windows-runner: ${{ needs.detect.outputs.latest-windows }}
+
+  next:
+    name: On the next image
+    needs: detect
+    if: >
+      needs.detect.outputs.next-images != needs.detect.outputs.latest-images &&
+      (needs.detect.outputs.next-tested != 'true' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    with:
+      linux-runner: ${{ needs.detect.outputs.next-linux }}
+      windows-runner: ${{ needs.detect.outputs.next-windows }}
+
+  # Only after a green run, so an image is never recorded as tested while it fails.
+  record-latest:
+    name: Record the current image as tested
+    needs: [detect, latest]
+    if: needs.latest.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "${{ needs.detect.outputs.latest-images }}" > .runner-image-tested
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .runner-image-tested
+          key: ${{ needs.detect.outputs.latest-key }}
+
+  record-next:
+    name: Record the next image as tested
+    needs: [detect, next]
+    if: needs.next.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "${{ needs.detect.outputs.next-images }}" > .runner-image-tested
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .runner-image-tested
+          key: ${{ needs.detect.outputs.next-key }}
+
+  report:
+    needs: [detect, latest, next]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or close the runner image issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DETECT: ${{ needs.detect.result }}
+          LATEST: ${{ needs.latest.result }}
+          NEXT: ${{ needs.next.result }}
+          LATEST_IMAGES: ${{ needs.detect.outputs.latest-images }}
+          NEXT_IMAGES: ${{ needs.detect.outputs.next-images }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          open_issue() { # title -> number of the open issue with that title, if any
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title == \"$1\") | .number" | head -1
+          }
+          report() { # result, images, what the image is to -latest
+            local result=$1 images=$2 role=$3 title number
+            if [ "$result" != success ] && [ "$result" != failure ]; then
+              echo "$images: ${result:-not run} - nothing to report."
+              return
+            fi
+            title="CI fails on runner image $images"
+            number=$(open_issue "$title")
+            if [ "$result" = success ]; then
+              if [ -n "$number" ]; then
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Green on $images now: $RUN_URL"
+              fi
+              return
+            fi
+            if [ -n "$number" ]; then
+              echo "$images still failing; already reported in #$number."
+              return
+            fi
+            {
+              printf '@%s CI fails on **%s**, %s: %s\n\n' "$OWNER" "$images" "$role" "$RUN_URL"
+              printf 'The same workflow passes on the previous image, so something on the new one differs: a tool or package removed or updated, a path moved, a smaller disk or /tmp. The run log names the failing step; the image'"'"'s release notes at https://github.com/actions/runner-images/releases list what changed, and its announcements are the issues there.\n\n'
+              printf 'This issue closes on its own once a run on %s passes (the check retries daily).\n' "$images"
+            } > "$RUNNER_TEMP/body.md"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"
+          }
+
+          if [ "$DETECT" != success ]; then
+            title='Runner images check cannot read the image list'
+            if [ -z "$(open_issue "$title")" ]; then
+              printf '@%s The daily runner images check could not work out which images -latest gives, so it is not watching for a switch: %s\n\nThe runner-images README table it reads has probably changed format; the detect step in .github/workflows/runner-images.yml needs adjusting. This issue does not close on its own.\n' \
+                "$OWNER" "$RUN_URL" > "$RUNNER_TEMP/body.md"
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"
+            fi
+            exit 0
+          fi
+          report "$LATEST" "$LATEST_IMAGES" 'the image -latest now gives, so pushes fail there too until this is fixed'
+          report "$NEXT" "$NEXT_IMAGES" 'the next image: -latest does not give it yet, but will (GitHub announces the date in actions/runner-images), so this is a warning before it does'

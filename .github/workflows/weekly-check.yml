@@ -1,0 +1,95 @@
+# The weekly check: every Monday the test suite from ci.yml runs against whatever
+# is newest, plus a vulnerability audit of the dependencies.
+name: Weekly check
+
+on:
+  # Weekly, against whatever is newest: requirements.txt is unpinned, so every
+  # run installs the latest release of each dependency, and ci.yml's matrix
+  # includes the newest stable Python. When a scheduled run fails, the report
+  # job opens an issue. A scheduled run never releases: auto-release.yml only
+  # acts on push runs.
+  schedule:
+    - cron: '0 6 * * 1'
+  # By hand from the Actions tab, e.g. to see whether a fix made it green again.
+  # Only a scheduled run opens or closes the issue.
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # Known vulnerabilities in the dependencies as they are actually installed.
+  # requirements.txt is unpinned, so GitHub's dependency graph cannot know which
+  # versions get installed; pip-audit resolves them the way pip does and checks
+  # each against the PyPI advisory database. Weekly and by hand only: a new
+  # advisory is news, but it should not block releasing an unrelated fix, which
+  # is why it is here and not in ci.yml.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+          cache: pip
+
+      - name: pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --progress-spinner off
+
+  # Scheduled runs only: a push or PR that fails is already in front of whoever
+  # made it. One issue while the weekly check is red, assigned to the owner with
+  # an @mention so it is emailed, closed by the first green scheduled run.
+  report:
+    needs: [test, audit]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or close the weekly-check issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='Weekly check failed: newest Python or dependencies'
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ "$RESULT" = success ]; then
+            if [ -n "$open" ]; then
+              gh issue close "$open" --repo "$GITHUB_REPOSITORY" --comment "Green again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          if [ "$RESULT" != failure ]; then
+            echo "Test result: $RESULT - nothing to report."
+            exit 0
+          fi
+          if [ -n "$open" ]; then
+            echo "Still failing; already reported in #$open."
+            exit 0
+          fi
+          failed=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')
+          {
+            printf '@%s The weekly check failed: %s\n\n' "$OWNER" "$RUN_URL"
+            printf 'Failed: %s\n\n' "${failed:-see the run}"
+            printf 'Every scheduled run installs the newest dependency releases (requirements.txt is unpinned) and tests Python 3.11 and the newest stable Python (3.x). If only the 3.x job failed, the newest Python broke something; if both failed, a dependency release did - the run log shows which versions were installed. If the audit job failed, pip-audit found a known vulnerability in a dependency: its log names the package, the advisory and the fixed version.\n\n'
+            printf 'This issue closes on its own once a scheduled run is green again.\n'
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"
