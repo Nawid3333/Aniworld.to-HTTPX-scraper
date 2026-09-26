@@ -1218,16 +1218,19 @@ def _extract_critical_series_for_rescrape(mismatches, old_data, active_site_url=
 
     for mismatch in critical:
         title = mismatch["title"]
+        entry = old_map.get(title) or {}
+        url = entry.get("url") or entry.get("link")
+        if not url:
+            # Skipped from both lists, not just urls: main.py zips the two
+            # into the retry list, so a title without a URL used to shift
+            # every later title onto the wrong series' URL.
+            logger.warning("Cannot rescrape %s: the index has no URL for it", title)
+            continue
+        if not url.startswith("http"):
+            url = f"{base_url}{url}"
         titles.append(title)
-
-        if title in old_map:
-            entry = old_map[title]
-            url = entry.get("url") or entry.get("link")
-            if url:
-                if not url.startswith("http"):
-                    url = f"{base_url}{url}"
-                urls.append(url)
-                series_data[title] = entry
+        urls.append(url)
+        series_data[title] = entry
 
     return {
         "urls": urls,

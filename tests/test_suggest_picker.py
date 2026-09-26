@@ -77,12 +77,13 @@ class TestSuggestPicker(unittest.TestCase):
             _series("Comedy Hour", total=12),
             _series("Mixed Bag", total=12),
         ]
+        # Keyed by slug, as genre_stats writes genre_index.json.
         genre_data = {
             "labels": {"action": "Action", "comedy": "Comedy"},
             "series": {
-                "Action Hero": ["action"],
-                "Comedy Hour": ["comedy"],
-                "Mixed Bag": ["action", "comedy"],
+                "action-hero": ["action"],
+                "comedy-hour": ["comedy"],
+                "mixed-bag": ["action", "comedy"],
             },
         }
         out = self._capture(index, genre_key="action", genre_data=genre_data)
@@ -90,6 +91,24 @@ class TestSuggestPicker(unittest.TestCase):
         self.assertIn("Mixed Bag", out)
         self.assertNotIn("Comedy Hour", out)
         self.assertIn("2 suggestion(s) from 2 unwatched anime", out)
+
+    def test_genres_are_found_by_slug_even_when_the_title_differs(self):
+        """Regression: the lookup used the title, which is rarely the key.
+
+        On the real index that found genres for 2 of 2,490 anime.
+        """
+        index = [_series("Wäldern", total=12, url="https://aniworld.to/anime/stream/waldern")]
+        genre_data = {"labels": {"drama": "Drama"}, "series": {"waldern": ["drama"]}}
+        out = self._capture(index, genre_key="drama", genre_data=genre_data)
+        self.assertIn("1 suggestion(s) from 1 unwatched", out)
+        self.assertIn("Drama", out)
+
+    def test_the_genres_column_shows_each_series_genres(self):
+        index = [_series("Action Hero", total=12)]
+        genre_data = {"labels": {"action": "Action"}, "series": {"action-hero": ["action"]}}
+        out = self._capture(index, genre_key="all", genre_data=genre_data)
+        row = next(line for line in out.splitlines() if "Action Hero" in line)
+        self.assertIn("Action", row.replace("Action Hero", ""))
 
     def test_no_candidates_message(self):
         """When nothing is unwatched, a clear message is printed."""

@@ -158,5 +158,25 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
         )
 
 
+class TestRescrapeListsStayInStep(unittest.TestCase):
+    """main.py zips "urls" and "titles" into the retry list, pair by pair.
+
+    A critical series the index holds no URL for used to add its title but no
+    URL, so every title after it landed on the wrong series' URL.
+    """
+
+    def test_a_series_without_a_url_is_left_out_of_both_lists(self):
+        old = {
+            "No Url": {"title": "No Url"},
+            "Has Url": {"title": "Has Url", "url": "https://example.test/x/has-url"},
+        }
+        mismatches = [{"title": "No Url", "severity": "critical"}, {"title": "Has Url", "severity": "critical"}]
+        with self.assertLogs(im.logger, "WARNING"):
+            result = im._extract_critical_series_for_rescrape(mismatches, old)
+        self.assertEqual(result["titles"], ["Has Url"])
+        self.assertEqual(result["urls"], ["https://example.test/x/has-url"])
+        self.assertEqual(list(result["series"]), ["Has Url"])
+
+
 if __name__ == "__main__":
     unittest.main()
