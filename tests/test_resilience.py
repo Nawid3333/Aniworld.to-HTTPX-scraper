@@ -1022,6 +1022,9 @@ class TestStartupProbeFetchesHostsTogether(QuietCase):
             mock.patch.object(main, "SITE_URLS", self.HOSTS),
             mock.patch.object(main, "_probe_hosts", fake_probe),
             mock.patch.object(main, "_fetch_catalogue_info_for_hosts", fake_fetch),
+            # No host serving now starts a countdown; answer it with "skip to
+            # the menu" so the fallback choice below is what gets tested.
+            mock.patch.object(main, "_wait_before_host_retry", lambda *args, **kwargs: False),
         ):
             main._probe_sites_before_scrape(scraper, idx_mgr=self._empty_index())
         return scraper.site_url

@@ -199,6 +199,90 @@ def _fetch_catalogue_info_for_hosts(scraper, site_urls):
         return {}
 
 
+# Seconds to wait before checking the hosts again when none of them served its
+# series list. A site under maintenance answers 500 for a while and is usually
+# back within a minute or two, so the first waits are short. After the last one
+# the wait stays at that length, and the checks go on until a host serves or
+# the user skips to the menu.
+_HOST_RETRY_DELAYS = (15, 30, 60)
+
+
+def _poll_key():
+    """Return a key the user has pressed, or None when there is none. Never waits.
+
+    Enter comes back as a newline. On Windows a single keypress is enough;
+    other terminals hand input over a line at a time, so there a key arrives
+    once Enter follows it. Without a terminal nothing is ever pressed, so a
+    piped run simply waits out the countdown.
+    """
+    if sys.stdin is None or not sys.stdin.isatty():
+        return None
+    try:
+        import msvcrt
+    except ImportError:
+        import select
+
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        return sys.stdin.readline().strip()[:1] or "\n"
+    if not msvcrt.kbhit():
+        return None
+    ch = msvcrt.getwch()
+    if ch in ("\x00", "\xe0"):
+        # Arrow and function keys arrive as two codes; drop both.
+        msvcrt.getwch()
+        return None
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    return "\n" if ch == "\r" else ch
+
+
+def _countdown(seconds, message, keys, read_key=None, sleep=None):
+    """Count `seconds` down on one line; return the key that ended it early.
+
+    `message` is redrawn in place once a second with ``{seconds}`` filled in,
+    so the wait is visible without scrolling the screen. Only a key in `keys`
+    ends it early -- any other key is ignored, so a stray press cannot cut the
+    wait short. Returns None when the time runs out.
+    """
+    read_key = read_key or _poll_key
+    sleep = sleep or time.sleep
+    width = len(str(seconds))
+    try:
+        for remaining in range(seconds, 0, -1):
+            print("\r  " + message.format(seconds=f"{remaining:>{width}}"), end="", flush=True)
+            for _ in range(10):
+                key = read_key()
+                if key is not None and key.lower() in keys:
+                    return key.lower()
+                sleep(0.1)
+        return None
+    finally:
+        print()
+
+
+def _wait_before_host_retry(attempt, reachable, total, read_key=None, sleep=None):
+    """Say no host served, count down to the next check, and return whether to check.
+
+    The wait grows with each failed attempt up to the last of
+    _HOST_RETRY_DELAYS. Enter checks at once; s returns False, which goes on to
+    the menu without a serving host -- what every failed start did before.
+    """
+    delay = _HOST_RETRY_DELAYS[min(attempt, len(_HOST_RETRY_DELAYS) - 1)]
+    print(
+        f"\n  ✗ Attempt {attempt + 1}: no host served its series list "
+        f"({reachable} of {total} reachable). The site is probably down for maintenance."
+    )
+    key = _countdown(
+        delay,
+        "Checking again in {seconds}s   [Enter] check now   [s] skip to the menu ",
+        keys=("\n", "s"),
+        read_key=read_key,
+        sleep=sleep,
+    )
+    return key != "s"
+
+
 def _collect_index_slugs(idx_mgr):
     """Collect slugs from the local index, including entries without a slug."""
     index_slugs_list = []
@@ -393,7 +477,9 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
 
     For AniWorld.to, we only have a single SITE_URL (no fallback).
     This function checks if the primary URL is reachable and optionally
-    fetches series count for display.
+    fetches series count for display. When no host serves, it counts down
+    and checks again (_wait_before_host_retry) until one does or the user
+    skips to the menu.
     """
     global ACTIVE_SITE_URL  # pylint: disable=global-statement
 
@@ -408,14 +494,28 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         idx_mgr = IndexManager(SERIES_INDEX_FILE)
 
     print("\n→ Checking host availability...\n")
-    results = _probe_hosts(scraper, site_urls)
+    attempt = 0
+    while True:
+        results = _probe_hosts(scraper, site_urls)
 
-    probe_by_url = {r.get("site_url"): r for r in results}
-    ok_hosts = [url for url in site_urls if probe_by_url.get(url, {}).get("ok")]
-    # Every reachable host's catalogue in one concurrent round. Unreachable
-    # hosts are left out, so a dead mirror still costs only its probe rather
-    # than a second full timeout.
-    catalogue = _fetch_catalogue_info_for_hosts(scraper, ok_hosts)
+        probe_by_url = {r.get("site_url"): r for r in results}
+        ok_hosts = [url for url in site_urls if probe_by_url.get(url, {}).get("ok")]
+        # Every reachable host's catalogue in one concurrent round. Unreachable
+        # hosts are left out, so a dead mirror still costs only its probe
+        # rather than a second full timeout.
+        catalogue = _fetch_catalogue_info_for_hosts(scraper, ok_hosts)
+
+        # A site under maintenance answers 500 for a while and then comes
+        # back. Every host failing used to drop straight into the menu with
+        # nothing fetched, and the only way to check again was to restart the
+        # program. Now it waits with a visible countdown and checks again,
+        # until a host serves or the user skips.
+        if any(count is not None for count, _ in catalogue.values()):
+            break
+        if not _wait_before_host_retry(attempt, reachable=len(ok_hosts), total=len(site_urls)):
+            break
+        attempt += 1
+        print("\n→ Checking host availability again...\n")
 
     host_counts = {}
     table_rows = []
@@ -441,7 +541,10 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
                     host_reports.append(report_entry)
                     missing_count = report_entry.get("missing_count")
 
-        table_rows.append((label, ok, count, idx_count, missing_count, compare_txt))
+        # OK means the host served its series list. Answering the probe is not
+        # enough: a host under maintenance answers it and then fails the login
+        # with a 500, and the table used to show that host as OK.
+        table_rows.append((label, count is not None, count, idx_count, missing_count, compare_txt))
 
     for line in _format_host_rows(table_rows):
         print(line)
