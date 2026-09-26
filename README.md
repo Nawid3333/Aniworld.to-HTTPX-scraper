@@ -151,6 +151,7 @@ All optional, with sensible defaults. Set them in `.env`.
 | ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ANIWORLD_MAX_WORKERS`        | `8`     | Concurrent scraping sessions. The default was measured on a representative sample of this catalogue, not guessed — higher is not faster, and past the peak it only adds load. |
 | `ANIWORLD_SEASON_CONCURRENCY` | `4`     | Season pages fetched at once per series. Total requests in flight is workers x this.                                                                                          |
+| `ANIWORLD_HTTP2` | `1` | `0` switches from one multiplexed HTTP/2 connection to parallel HTTP/1.1 connections. Only change it if `tests/throughput_sweep.py` shows HTTP/1.1 is faster for you. |
 | `ANIWORLD_CHECKPOINT_EVERY`   | `25`    | Save resume state every N anime.                                                                                                                                              |
 | `ANIWORLD_PROFILE`            | unset   | Set to `1` to print where a run's time actually went (network vs parse vs disk).                                                                                              |
 | `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `.env`, because it is what locates that file. |
@@ -322,6 +323,7 @@ pip install -e ".[dev]"     # pytest + ruff
 | `python -m pytest`                                       | The suite. Benchmarks are excluded, so it stays fast.     |
 | `python -m pytest --cov`                                 | With a branch-coverage report.                            |
 | `python -m pytest --benchmark`                           | Adds the timing benchmarks.                               |
+| `python tests/throughput_sweep.py`                        | Live, read-only worker/transport sweep: finds where the site, not your PC, sets the pace. |
 | `python -m pytest --benchmark -m benchmark --benchmark-update` | Re-records the timing baseline.                     |
 | `ruff check . && ruff format --check .`                  | Lint and formatting.                                      |
 
