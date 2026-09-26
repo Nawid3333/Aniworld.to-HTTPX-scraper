@@ -2969,6 +2969,22 @@ class AniWorldScraper:
             result["error"] = f"exception_{exc}"
         return result
 
+    async def fetch_series(self, url: str) -> dict:
+        """Scrape one series by URL, outside any run, and return its entry.
+
+        The vanished-series prompt uses this to read a replacement the user
+        named, and to read it again after they fixed it on the site. It signs
+        in on a client of its own, so it needs no run in progress, and returns
+        the same entry shape a run would -- including the "_error" result, so
+        callers must check that flag before trusting it.
+        """
+        infos = self._series_list_from_urls([url])
+        client = await self._create_logged_in_client()
+        try:
+            return await self._scrape_one_series(client, infos[0])
+        finally:
+            await client.aclose()
+
     async def verify_vanished_and_candidates(
         self,
         vanished_entries: list[tuple[str, ...]],

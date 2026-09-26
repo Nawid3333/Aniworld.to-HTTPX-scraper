@@ -148,6 +148,21 @@ def _validate_series_entry(series, title=""):
     return True
 
 
+def _is_scrape_result(entry):
+    """True for an entry a scrape produced -- not a catalogue stub, not a failure.
+
+    A scrape result always carries a "seasons" list, even an empty one. The
+    series lists a run reads from the catalogue carry only title, link and
+    url. bs.to once appended such stubs to a run's results for series it had
+    already scraped, and wherever the results were keyed by title the stub
+    came last and won: a six-episode series was offered as a replacement with
+    no episodes, and the save would have added it to the index with none.
+    "_error" placeholders are not results either; they stand in for a series
+    that failed so a checkpoint stays complete.
+    """
+    return isinstance(entry, dict) and not entry.get("_error") and isinstance(entry.get("seasons"), list)
+
+
 def _series_identity(entry):
     """Return what makes two index entries the same series: title and slug together.
 
@@ -2030,6 +2045,124 @@ def remove_series_from_index(index_file, series_to_remove):
         return 0
 
 
+def _replacement_index_entry(old_entry, new_entry, now):
+    """Return the index entry for a confirmed replacement.
+
+    The site's data is the record, so the entry is the replacement as scraped,
+    laid out the way the merge lays out a newly added series, with its
+    counters derived from the episode lists. Only the date the series was
+    first indexed carries over from the entry it replaces, because it is the
+    same series.
+    """
+    seasons = copy.deepcopy(new_entry.get("seasons", []))
+    for season in seasons:
+        if isinstance(season, dict):
+            sync_season_counts(season)
+    total_eps, watched_eps = get_episode_counts({"seasons": seasons})
+    duration = new_entry.get("scrape_duration_seconds")
+    return {
+        "url": new_entry.get("url", ""),
+        "link": new_entry.get("link", ""),
+        "subscribed": bool(new_entry.get("subscribed")),
+        "watchlist": bool(new_entry.get("watchlist")),
+        "title": new_entry.get("title", ""),
+        "title_ger": new_entry.get("title_ger", ""),
+        "title_eng": new_entry.get("title_eng", ""),
+        "alt_titles": new_entry.get("alt_titles", []),
+        "total_seasons": len(seasons),
+        "total_episodes": total_eps,
+        "watched_episodes": watched_eps,
+        "unwatched_episodes": total_eps - watched_eps,
+        "avg_scrape_seconds": round(duration, 3) if isinstance(duration, (int, float)) and duration > 0 else None,
+        "added_date": old_entry.get("added_date") or now,
+        "last_updated": now,
+        "seasons": seasons,
+        "scrape_duration_seconds": duration,
+    }
+
+
+def replace_series_in_index(index_file, replacements):
+    """Swap vanished index entries for their confirmed replacements, in one write.
+
+    *replacements* is a list of (old_entry, new_entry) pairs; new_entry is the
+    replacement as the site showed it when the user confirmed. The old entry
+    is matched on title and slug, as remove_series_from_index does, and the
+    replacement takes its place -- unless the index already holds the
+    replacement's URL. Then only the old entry goes, and the existing one is
+    left for the scrape's own merge to update under its own prompts.
+
+    Removal and insertion share one atomic write. Deleting here and leaving
+    the addition to the later new-series prompt would lose the series the
+    moment that prompt was declined.
+
+    Returns (removed, added).
+    """
+    if not replacements or not os.path.exists(index_file):
+        return 0, 0
+    try:
+        with open(index_file, encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            data = list(data.values())
+        if not isinstance(data, list):
+            return 0, 0
+        new_by_old = {_series_identity(old): new for old, new in replacements}
+        indexed_slugs = {_extract_slug(entry) for entry in data if isinstance(entry, dict)} - {None}
+        now = datetime.now().isoformat()
+        result = []
+        removed = added = 0
+        for entry in data:
+            new_entry = new_by_old.get(_series_identity(entry)) if isinstance(entry, dict) else None
+            if new_entry is None:
+                result.append(entry)
+                continue
+            removed += 1
+            slug = _extract_slug(new_entry)
+            if slug is None or slug in indexed_slugs:
+                continue
+            indexed_slugs.add(slug)
+            result.append(_replacement_index_entry(entry, new_entry, now))
+            added += 1
+
+        if removed > 0:
+            _atomic_write_json(index_file, result)
+            logger.info(
+                "Replaced %d vanished series in index (%d replacement(s) added): %s",
+                removed,
+                added,
+                [(old.get("url"), new.get("url")) for old, new in replacements][:10],
+            )
+        return removed, added
+    except (json.JSONDecodeError, OSError):
+        return 0, 0
+
+
+def _refresh_run_entries(new_data, fresh_entries):
+    """Put re-scraped replacements over this run's older copies, in place.
+
+    The save that follows the vanished table diffs this run's data against
+    the index. A replacement the user fixed on the site and re-scraped at the
+    prompt would otherwise be diffed in the state the run first read, and the
+    save would offer to undo the fix it had just been shown.
+    """
+    fresh_by_slug = {}
+    for entry in fresh_entries:
+        slug = _extract_slug(entry)
+        if slug is not None:
+            fresh_by_slug[slug] = entry
+    if isinstance(new_data, list):
+        for idx, entry in enumerate(new_data):
+            slug = _extract_slug(entry) if isinstance(entry, dict) else None
+            if slug in fresh_by_slug:
+                new_data[idx] = fresh_by_slug[slug]
+    elif isinstance(new_data, dict):
+        for key, entry in list(new_data.items()):
+            slug = _extract_slug(entry) if isinstance(entry, dict) else None
+            if slug in fresh_by_slug:
+                new_data[key] = fresh_by_slug[slug]
+
+
 def _match_keys(title: str, url_or_slug: str = "") -> set[str]:
     """Return normalized match keys for a title.
 
@@ -2084,19 +2217,109 @@ def _score_match(v_title: str, v_url: str, n_title: str, n_url: str) -> float:
     return best
 
 
-def _match_vanished_to_new(vanished_entries, new_dict):
+# Episode titles that name a position rather than a story ("Folge 3",
+# "Episode 12", a bare number). Unrelated series share these all the time, so
+# they are no evidence that one series replaced another.
+_GENERIC_EPISODE_TITLE_RE = re.compile(r"^(?:episode|folge|ep\.?|teil|part|kapitel|chapter)?\s*\d*$")
+
+# How many distinctive episode titles a vanished entry needs, and what share
+# of them a new series must carry, before the episode lists alone may suggest
+# a pairing. The minimum keeps a one-episode special from pairing by accident.
+_EPISODE_EVIDENCE_MIN_TITLES = 3
+_EPISODE_EVIDENCE_FLOOR = 0.9
+
+
+def _episode_titles(episode) -> set[str]:
+    """Return every title an episode carries, folded for comparison.
+
+    This site stores ``title_ger`` and ``title_eng``; the bs.to sibling
+    stores one ``title``. Reading all three keeps this helper the same in each.
+    """
+    if not isinstance(episode, dict):
+        return set()
+    titles = set()
+    for field in ("title", "title_ger", "title_eng"):
+        value = episode.get(field)
+        if isinstance(value, str) and value.strip():
+            titles.add(" ".join(value.casefold().split()))
+    return titles
+
+
+def _counted_episodes(season) -> list:
+    """Return a season's episodes, minus an episode 0 the index ignores."""
+    if not isinstance(season, dict):
+        return []
+    episodes = [ep for ep in season.get("episodes", []) if isinstance(ep, dict)]
+    if season.get("ignored_episode_0"):
+        episodes = [ep for ep in episodes if ep.get("number") != 0]
+    return episodes
+
+
+def _distinctive_episode_titles(entry) -> set[str]:
+    """Return the episode titles of *entry* that could identify the series."""
+    titles = set()
+    for season in (entry or {}).get("seasons", []):
+        for ep in _counted_episodes(season):
+            titles |= {t for t in _episode_titles(ep) if not _GENERIC_EPISODE_TITLE_RE.match(t)}
+    return titles
+
+
+def _episode_overlap(old_entry, new_entry) -> float:
+    """Return the share of the old entry's episode titles the new entry also has.
+
+    0.0 when the old entry has too few distinctive titles to say anything.
+    Titles are compared as a set rather than by season and number, because a
+    replacement page often renumbers -- a "Specials" season appears, or two
+    seasons are folded into one -- while the episode titles stay the same.
+    """
+    old_titles = _distinctive_episode_titles(old_entry)
+    if len(old_titles) < _EPISODE_EVIDENCE_MIN_TITLES:
+        return 0.0
+    return len(old_titles & _distinctive_episode_titles(new_entry)) / len(old_titles)
+
+
+def _rename_candidates(new_dict, old_data):
+    """Return the entries of *new_dict* that could replace a vanished series.
+
+    Only a series whose URL the index does not hold yet can be one. A full
+    scrape hands back every series it read, not just the new ones, and pairing
+    against all of them offered long-indexed series as "new counterparts" and
+    listed the whole catalogue as new series not linked to vanished entries.
+    Anything that is not a scrape result is left out too -- the "_error"
+    placeholders a run keeps for series it failed to read, and catalogue
+    stubs: neither carries episodes, so there is nothing to compare.
+    """
+    indexed = {_extract_slug(entry) for entry in (old_data or {}).values()} - {None}
+    return {
+        key: entry
+        for key, entry in (new_dict or {}).items()
+        if _is_scrape_result(entry) and _extract_slug(entry) not in indexed
+    }
+
+
+def _match_vanished_to_new(vanished_entries, new_dict, old_data=None):
     """Pair each vanished series with the best matching new series, if any.
+
+    A candidate qualifies on its title (a score of at least 0.75) or on its
+    episodes: when *old_data* holds the vanished entry, a new series carrying
+    nearly all of its distinctive episode titles is paired even though the
+    title changed beyond what the title score can see. Episode evidence
+    outranks a title-only match, since a similar name is common and the same
+    episode list is not.
 
     Args:
         vanished_entries: list of (title, reason, url) tuples. A bare
             (title, url) pair is also accepted, so an older report or a
             caller that has no vanish reason cannot break the pairing.
         new_dict: dict title -> series data for newly scraped series.
+        old_data: optional dict title -> index entry, keyed like the vanished
+            titles. Without it, pairing falls back to titles alone.
 
     Returns:
         list of (vanished_title, vanished_url, new_title, new_url, reason)
         tuples. `reason` here is the match quality -- 'exact', 'strong',
-        'weak', or None -- not the vanish reason that came in.
+        'weak', 'episodes' (paired on episode titles alone), or None -- not
+        the vanish reason that came in.
     """
     new_titles = list(new_dict.keys())
     used_new = set()
@@ -2107,9 +2330,10 @@ def _match_vanished_to_new(vanished_entries, new_dict):
             v_title, _vanish_reason, v_url = item
         else:
             v_title, v_url = item
+        old_entry = (old_data or {}).get(v_title) or {}
 
         best = None
-        best_score = 0.0
+        best_rank = None
         best_idx = -1
 
         for idx, n_title in enumerate(new_titles):
@@ -2118,25 +2342,33 @@ def _match_vanished_to_new(vanished_entries, new_dict):
             n_data = new_dict[n_title]
             n_url = n_data.get("url", n_data.get("link", ""))
             score = _score_match(v_title, v_url, n_title, n_url)
-            if score > best_score:
+            by_episodes = bool(old_entry) and _episode_overlap(old_entry, n_data) >= _EPISODE_EVIDENCE_FLOOR
+            if score < 0.75 and not by_episodes:
+                continue
+            rank = (by_episodes, score)
+            if best_rank is None or rank > best_rank:
                 best = n_title
-                best_score = score
+                best_rank = rank
                 best_idx = idx
 
-        if best is not None and best_score >= 0.75:
+        if best_rank is not None:
             used_new.add(best_idx)
             n_data = new_dict[best]
             n_url = n_data.get("url", n_data.get("link", ""))
+            best_score = best_rank[1]
             if best_score >= 0.95:
                 reason = "exact"
             elif best_score >= 0.85:
                 reason = "strong"
-            else:
+            elif best_score >= 0.75:
                 reason = "weak"
+            else:
+                reason = "episodes"
             matched.append((v_title, v_url, best, n_url, reason))
         else:
             matched.append((v_title, v_url, None, None, None))
 
+    # Append any unmatched new series as "extra" rows
     for idx, n_title in enumerate(new_titles):
         if idx not in used_new:
             n_data = new_dict[n_title]
@@ -2427,6 +2659,247 @@ def _rescrape_row(row: dict, scraper, old_data: dict) -> bool:
     return _rescrape_rows([row], scraper, old_data) > 0
 
 
+def _fetch_series_live(scraper, url: str) -> dict | None:
+    """Scrape one series by URL right now; return its entry, or None on failure."""
+    if scraper is None:
+        print("  ⚠ No scraper available to read it from the site.")
+        return None
+    print(f"  → Scraping {url} ...")
+    try:
+        # asyncio.run for the same reason as in _rescrape_rows: this prompt is
+        # only reached from the synchronous CLI path, so no loop is running.
+        entry = asyncio.run(scraper.fetch_series(url))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Live scrape of replacement %s failed: %s", url, exc)
+        print(f"  ✗ Could not scrape it: {exc}")
+        return None
+    if not isinstance(entry, dict) or entry.get("_error"):
+        reason = entry.get("_error_reason") if isinstance(entry, dict) else None
+        print(f"  ✗ Could not scrape it{': ' + reason if reason else ''}.")
+        return None
+    return entry
+
+
+def _episode_ranges(numbers) -> str:
+    """Return episode numbers as compact ranges: [1, 2, 3, 7] -> "1-3, 7"."""
+    ranges = []
+    for number in sorted(numbers):
+        if ranges and number == ranges[-1][1] + 1:
+            ranges[-1][1] = number
+        else:
+            ranges.append([number, number])
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
+
+
+def _replacement_differences(old_entry: dict, new_entry: dict) -> tuple[list[str], int]:
+    """Compare an index entry with the site's entry for its replacement.
+
+    Seasons are paired by label and episodes by number; for each pair the
+    episode list, the titles and the watched state are compared, and so are
+    the Sub/WL flags on the sites that have them. The site is the record: this
+    only reports where the index and the site disagree, so the user can fix the
+    site and read it again before anything replaces the old entry.
+
+    Returns (lines, differences): one line per season or flag, plus indented
+    detail lines, and how many individual differences were found. Zero means
+    the site shows exactly what the index holds.
+    """
+
+    def by_label(entry):
+        seasons = {}
+        for season in (entry or {}).get("seasons", []):
+            if isinstance(season, dict):
+                seasons[str(season.get("season", "?"))] = season
+        return seasons
+
+    def by_number(season):
+        episodes = {}
+        for position, ep in enumerate(_counted_episodes(season)):
+            number = ep.get("number")
+            episodes[number if isinstance(number, int) else -(position + 1)] = ep
+        return episodes
+
+    def counts(episodes):
+        return f"{len(episodes)} episode(s), {sum(1 for ep in episodes.values() if ep.get('watched'))} watched"
+
+    old_seasons = by_label(old_entry)
+    new_seasons = by_label(new_entry)
+    lines = []
+    differences = 0
+    for label in list(old_seasons) + [label for label in new_seasons if label not in old_seasons]:
+        name = f"Season {label}" if label.isdigit() else label
+        old_eps = by_number(old_seasons[label]) if label in old_seasons else None
+        new_eps = by_number(new_seasons[label]) if label in new_seasons else None
+        if new_eps is None:
+            lines.append(f"⚠ {name}: only in the index ({counts(old_eps)})")
+            differences += 1
+            continue
+        if old_eps is None:
+            lines.append(f"⚠ {name}: only on the site ({counts(new_eps)})")
+            differences += 1
+            continue
+
+        shared = [n for n in old_eps if n in new_eps]
+        problems = []
+        missing = [n for n in old_eps if n not in new_eps]
+        if missing:
+            problems.append(f"missing on the site: episode(s) {_episode_ranges(missing)}")
+        extra = [n for n in new_eps if n not in old_eps]
+        if extra:
+            problems.append(f"only on the site: episode(s) {_episode_ranges(extra)}")
+        renamed = [
+            n
+            for n in shared
+            if _episode_titles(old_eps[n])
+            and _episode_titles(new_eps[n])
+            and not _episode_titles(old_eps[n]) & _episode_titles(new_eps[n])
+        ]
+        if renamed:
+            problems.append(f"titles differ: episode(s) {_episode_ranges(renamed)}")
+        watched_on_index = [n for n in shared if old_eps[n].get("watched") and not new_eps[n].get("watched")]
+        if watched_on_index:
+            problems.append(
+                f"watched in the index, unwatched on the site: episode(s) {_episode_ranges(watched_on_index)}"
+            )
+        watched_on_site = [n for n in shared if new_eps[n].get("watched") and not old_eps[n].get("watched")]
+        if watched_on_site:
+            problems.append(
+                f"unwatched in the index, watched on the site: episode(s) {_episode_ranges(watched_on_site)}"
+            )
+
+        summary = f"{name}: index {counts(old_eps)}  |  site {counts(new_eps)}"
+        lines.append(("⚠ " if problems else "✓ ") + summary)
+        lines.extend(f"    {problem}" for problem in problems)
+        differences += len(problems)
+
+    for field, label in (("subscribed", "Sub"), ("watchlist", "WL")):
+        if field in old_entry or field in new_entry:
+            old_flag, new_flag = bool(old_entry.get(field)), bool(new_entry.get(field))
+            if old_flag != new_flag:
+                lines.append(f"⚠ {label}: index {'✓' if old_flag else '✗'}  |  site {'✓' if new_flag else '✗'}")
+                differences += 1
+    return lines, differences
+
+
+def _choose_replacement(
+    row: dict, old_data: dict, new_dict: dict, scraper, taken: dict, url: str | None = None
+) -> dict | None:
+    """Compare a vanished row with its replacement and ask to replace it.
+
+    The replacement is *url* -- the new entry the row shows, for the "s"
+    action -- or, when that is None, a URL the user pastes, for the "l"
+    action. Its data comes from this run's scrape when the run read it, or
+    from a live scrape when it did not. The comparison with the index entry is
+    printed and every difference flagged; the user can open the link, fix
+    things on the site, and re-scrape it as often as needed. Nothing is
+    replaced without an explicit "y", exact match or not.
+
+    Args:
+        row: the table row being decided.
+        old_data: dict key -> index entry.
+        new_dict: dict key -> every series this run scraped.
+        scraper: optional scraper, needed for live scrapes.
+        taken: slug -> vanished title, for replacements already chosen in
+            this table, so one series cannot replace two entries.
+        url: the replacement to compare with; None asks for one.
+
+    Returns:
+        The replacement's entry as the site last showed it, or None if the
+        user cancelled or the replacement could not be read.
+    """
+    if url is None:
+        try:
+            url = input("  Paste the replacement's URL (Enter = cancel): ").strip()
+        except EOFError:
+            print("  -> No input available; not replacing this entry.")
+            return None
+        if not url:
+            print("  → Cancelled.")
+            return None
+
+    slug = _extract_slug({"url": url})
+    if slug is None:
+        print(f"  ⚠ Not a series URL: {url}")
+        return None
+    if slug == _extract_slug(row["old_entry"]) or slug == _extract_slug({"url": row["v_url"] or ""}):
+        print("  ⚠ That is this entry's own URL.")
+        return None
+    if slug in taken:
+        print(f'  ⚠ Already chosen as the replacement for "{taken[slug]}".')
+        return None
+
+    # Only a scrape result can stand for the site. A series the run failed to
+    # read, or only listed, is read live like one the run skipped.
+    site_entry = next((e for e in new_dict.values() if _is_scrape_result(e) and _extract_slug(e) == slug), None)
+    source = "this run's scrape"
+    if site_entry is None:
+        fetch_url = scraper.normalize_to_series_url(url) if scraper is not None else url
+        site_entry = _fetch_series_live(scraper, fetch_url)
+        source = "scraped just now"
+        if site_entry is None:
+            return None
+    already_indexed = next(
+        (key for key, entry in old_data.items() if key != row["key"] and _extract_slug(entry) == slug), None
+    )
+
+    unrecognized = 0
+    show_report = True
+    while True:
+        new_title = site_entry.get("title") or url
+        new_url = site_entry.get("url", site_entry.get("link", url))
+        if show_report:
+            print(f"\n  Replacement: {new_title}")
+            print(f"    {new_url}  ({source})")
+            if already_indexed:
+                print(f'    Already in the index as "{already_indexed}": replacing removes only the old entry,')
+                print("    and the scrape's own prompts update the existing one.")
+            lines, differences = _replacement_differences(row["old_entry"], site_entry)
+            print("  Index (old) vs. site (new):")
+            for line in lines or ["(no seasons on either side)"]:
+                print(f"    {line}")
+            if differences:
+                print(
+                    f"  ⚠ {differences} difference(s). If the site is wrong, fix it there "
+                    "(o opens the link), then r re-scrapes it."
+                )
+            else:
+                print("  ✓ The site matches the index.")
+            show_report = False
+
+        try:
+            choice = (
+                input(f'  Replace "{row["v_title"]}" with "{new_title}"? (y=replace o=open r=re-scrape n=cancel) [n]: ')
+                .strip()
+                .lower()
+                or "n"
+            )
+        except EOFError:
+            print("  -> No input available; not replacing this entry.")
+            return None
+
+        if choice == "y":
+            return site_entry
+        if choice == "n":
+            print("  → Not replaced.")
+            return None
+        if choice == "o":
+            _open_urls_for_comparison("", new_url)
+            continue
+        if choice == "r":
+            fresh = _fetch_series_live(scraper, new_url)
+            if fresh is not None:
+                site_entry = fresh
+                source = "scraped just now"
+                show_report = True
+            continue
+
+        unrecognized += 1
+        if unrecognized >= _PROMPT_MAX_UNRECOGNIZED:
+            print(f"  → {unrecognized} unrecognized answers in a row; not replacing this entry.")
+            return None
+        print("  ⚠ Unknown choice. Use y/o/r/n.")
+
+
 def _series_progress_line(entry: dict) -> str:
     """Return the same progress summary the scraper uses per series.
 
@@ -2505,32 +2978,50 @@ def _status_diff_line(old_entry: dict, new_entry: dict) -> str | None:
 _PROMPT_MAX_UNRECOGNIZED = 5
 
 
-def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
+def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None, replacements=None):
     """Show a side-by-side decision table for vanished vs. new series.
 
     For each vanished entry the user can choose:
       d = delete old entry
       k = keep old entry
+      s = swap: replace the old entry with the new one the row shows, after
+          comparing the two (offered only when the row shows one)
+      l = link: replace the old entry with a series whose URL the user
+          pastes, after comparing the two
       r = re-scrape the old URL to verify it live (updates candidate info)
       o = open old + new URLs in browser to compare visually
       oa = open this and all remaining rows' URLs in confirmed browser batches
 
+    Both replacing actions show the comparison first and replace only on an
+    explicit "y".
+
     Args:
-        vanished_entries: list of (title, reason, url) tuples for vanished series.
-        new_dict: dict title -> series data for newly scraped series.
+        vanished_entries: list of (title, url) or (title, reason, url) tuples.
+        new_dict: dict title -> series data for every series this run scraped.
+            Only those whose URL the index does not hold yet are suggested as
+            counterparts; the rest can still be named with "l".
         old_data: dict title -> series data for the current index.
         scraper: optional scraper instance for live re-scraping of old URLs.
+        replacements: optional list that receives (old_data key, replacement
+            entry) for each confirmed replacement. Those keys are not in the
+            returned delete list; applying them is the caller's job.
 
     Returns:
         list of old_data keys confirmed for deletion.
     """
-    matched = _match_vanished_to_new(vanished_entries, new_dict)
+    matched = _match_vanished_to_new(vanished_entries, _rename_candidates(new_dict, old_data), old_data)
     to_delete = []
+    if replacements is None:
+        replacements = []
+    # slug -> vanished title, so one series cannot be chosen to replace two.
+    taken = {}
 
     print("\n  Compare each vanished series with its best matching new counterpart.")
     print("  Actions:")
     print("    d   delete this entry")
     print("    k   keep this entry (default)")
+    print("    s   swap: replace this entry with the new one shown in its row (compare first, then y/n)")
+    print("    l   link: replace this entry with a series whose URL you paste (compare first, then y/n)")
     print("    r   re-scrape this entry's old URL to verify it's really gone")
     print("    o   open this entry's old + new URLs in browser")
     print("    oa  open this and all remaining entries' URLs in confirmed batches")
@@ -2565,7 +3056,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
         ),
     )
     sep = " │ "
-    match_w = 7
+    match_w = len("episodes")
     status_w = 12
     indent = "  "
     num_w = 3
@@ -2653,8 +3144,12 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
 
         unrecognized = 0
         while True:
+            # "s" swaps to the new entry the row shows, so a row without one
+            # does not offer it.
+            swap = "s=swap-to-new " if n_url else ""
             prompt = (
-                f'  [{i}/{len(rows)}] Action for "{v_title}"? (d=delete k=keep r=rescrape o=open oa=open-all) [k]: '
+                f'  [{i}/{len(rows)}] Action for "{v_title}"? '
+                f"(d=delete k=keep {swap}l=link-url r=rescrape o=open oa=open-all) [k]: "
             )
             try:
                 choice = input(prompt).strip().lower() or "k"
@@ -2725,6 +3220,19 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                 _print_row(i, v_title, v_url, old_entry, n_title, n_url, new_entry, reason)
                 continue
 
+            if (choice == "s" and n_url) or choice == "l":
+                # "s" compares with the new entry the row shows; "l" asks for
+                # a URL. Either way nothing is replaced without a "y".
+                chosen = _choose_replacement(
+                    row, old_data, new_dict, scraper, taken, url=n_url if choice == "s" else None
+                )
+                if chosen is None:
+                    continue
+                taken[_extract_slug(chosen)] = v_title
+                replacements.append((row["key"], chosen))
+                print(f'  → Marked for replacement by "{chosen.get("title") or chosen.get("url")}".')
+                break
+
             unrecognized += 1
             if unrecognized >= _PROMPT_MAX_UNRECOGNIZED:
                 # An endless stream of unrecognized answers is a loop, not a
@@ -2732,7 +3240,10 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None):
                 # answer), and move on to the next row.
                 print(f"  → {unrecognized} unrecognized answers in a row; keeping this entry.")
                 break
-            print("  ⚠ Unknown choice. Use k/d/r/o.")
+            if choice == "s":
+                print("  ⚠ This row shows no new entry to swap to; use l to paste the replacement's URL.")
+            else:
+                print("  ⚠ Unknown choice. Use d/k/s/l/r/o/oa.")
 
     return to_delete
 
@@ -2744,6 +3255,10 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
     If index_file is provided, confirmed deletions are removed from disk.
 
     Args:
+        new_data: list/dict of this run's scraped series. A replacement the
+            user re-scraped at the prompt overwrites this run's older copy of
+            it here, in place, so the save that follows works from what the
+            site shows now.
         scraper: optional scraper instance used to re-verify vanished and
             candidate URLs before matching.
 
@@ -2753,6 +3268,9 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
     if scrape_scope not in ("all", "new_only", "watchlist", "subscribed", "both"):
         return []
 
+    # The caller's own list, kept before verification can rebind new_data to
+    # a verified copy: re-scraped replacements are written back into this one.
+    run_data = new_data
     vanished = []
     corrupt_entries = []
 
@@ -2854,11 +3372,13 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
             # Show new series alongside so user can spot renames before deciding
             new_dict = {}
             if new_data is not None:
-                new_entries = list(new_data if isinstance(new_data, list) else new_data.values())
+                new_entries = [
+                    s for s in (new_data if isinstance(new_data, list) else new_data.values()) if _is_scrape_result(s)
+                ]
                 new_dict = _key_series(new_entries, _series_keyer(old_data.values(), new_entries))
-                incoming_new = [s for s in new_dict.values() if _series_identity(s) not in old_identities]
-                if incoming_new:
-                    matched = _match_vanished_to_new(vanished, new_dict)
+                candidates = _rename_candidates(new_dict, old_data)
+                if candidates:
+                    matched = _match_vanished_to_new(vanished, candidates, old_data)
                     table_lines, extra_lines = _format_vanished_new_table(matched)
                     for line in table_lines:
                         print(line)
@@ -2867,7 +3387,7 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                     print(
                         f"\n  Compare {len(vanished)} vanished series with "
                         "their possible new counterparts above. "
-                        "Use the interactive prompts below to delete old entries."
+                        "Use the interactive prompts below to delete or replace old entries."
                     )
                 else:
                     for i, (title, reason, url) in enumerate(vanished, 1):
@@ -2880,24 +3400,35 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                     print(f"      old: {url}")
                 print(separator)
 
-            to_delete = _prompt_vanished_table(vanished, new_dict, old_data, scraper=scraper)
+            replacements = []
+            to_delete = _prompt_vanished_table(vanished, new_dict, old_data, scraper=scraper, replacements=replacements)
 
             if to_delete and index_file:
                 removed = remove_series_from_index(index_file, [old_data[key] for key in to_delete])
                 print(f"  ✓ Removed {removed} series from index.")
             elif to_delete:
                 print(f"  ⚠ {len(to_delete)} series marked for deletion but no index_file provided.")
-            else:
+            elif not replacements:
                 print("  ✓ No series removed — all vanished entries preserved.")
 
+            if replacements and index_file:
+                pairs = [(old_data[key], entry) for key, entry in replacements]
+                removed, added = replace_series_in_index(index_file, pairs)
+                _refresh_run_entries(run_data, [entry for _, entry in replacements])
+                already = f" ({removed - added} replacement(s) were already indexed)" if added < removed else ""
+                print(f"  ✓ Replaced {removed} series in index{already}.")
+            elif replacements:
+                print(f"  ⚠ {len(replacements)} series marked for replacement but no index_file provided.")
+
             logger.info(
-                "Vanished series: %d not found in scope '%s', %d deleted by user",
+                "Vanished series: %d not found in scope '%s', %d deleted, %d replaced by user",
                 len(vanished),
                 scrape_scope,
                 len(to_delete),
+                len(replacements),
             )
 
-            delete_set = set(to_delete)
+            delete_set = set(to_delete) | {key for key, _ in replacements}
             return [(title, reason) for title, reason, _ in vanished if title not in delete_set]
 
         # For account scopes (subscribed/watchlist/both), informational only
@@ -2931,7 +3462,11 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
     # this one did not, and its runs are the same shape.
     new_entries = list(new_data if isinstance(new_data, list) else dict(new_data).values())
     skipped_errors = [s for s in new_entries if isinstance(s, dict) and s.get("_error")]
-    new_entries = [s for s in new_entries if isinstance(s, dict) and not s.get("_error")]
+    # A catalogue stub is not a scrape result: keyed by title it would shadow
+    # the real entry for the same series, and on its own it would be added as
+    # a series with no episodes. See _is_scrape_result.
+    skipped_stubs = [s for s in new_entries if isinstance(s, dict) and not s.get("_error") and not _is_scrape_result(s)]
+    new_entries = [s for s in new_entries if _is_scrape_result(s)]
 
     # One keyer over both sides: a series the scrape brings in under a title
     # the index already uses gets its slug in the key on both sides, so it is
@@ -2944,6 +3479,13 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
     if skipped_errors:
         print(f"\n⚠ Skipping {len(skipped_errors)} failed/error series from save.")
         logger.warning("Skipped %d error series from save.", len(skipped_errors))
+    if skipped_stubs:
+        print(f"\n⚠ Skipping {len(skipped_stubs)} series that were listed but never scraped.")
+        logger.warning(
+            "Skipped %d unscraped catalogue entries from save: %s",
+            len(skipped_stubs),
+            [s.get("title") for s in skipped_stubs][:10],
+        )
 
     changes = detect_changes(old_data, new_dict)
     logger.info("Detected changes: %s", {k: len(v) for k, v in changes.items()})
