@@ -98,7 +98,9 @@ class TestSeasonPagesParsedOnce(unittest.TestCase):
 
         result, parses = _run(client, relogin=relogin)
         self.assertFalse(result.get("_error"), result)
-        self.assertEqual(parses, 2 * len(SEASONS), "the first read once, the refetch once")
+        # Every page once, the anonymous one once more on the no-login re-read
+        # (still anonymous here), then every page once after the re-login.
+        self.assertEqual(parses, 2 * len(SEASONS) + 1)
         self.assertEqual(result["watched_episodes"], 1, "the fresh pages must be the ones stored")
 
     def test_a_failed_relogin_does_not_parse_again(self):
@@ -106,7 +108,9 @@ class TestSeasonPagesParsedOnce(unittest.TestCase):
         result, parses = _run(client, relogin=mock.AsyncMock(return_value=False))
         self.assertTrue(result.get("_error"))
         self.assertIn("not logged in", result["_error_reason"])
-        self.assertEqual(parses, len(SEASONS))
+        # Every page once plus the anonymous one's re-read; nothing after the
+        # failed re-login.
+        self.assertEqual(parses, len(SEASONS) + 1)
 
     def test_a_failed_fetch_is_reported_as_one_and_not_parsed(self):
         client = _Client({"1": RuntimeError("connection dropped"), "2": season_html(True)})

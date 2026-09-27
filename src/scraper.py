@@ -8,6 +8,7 @@ import difflib
 import json
 import logging
 import os
+import random
 import re
 import signal
 import sys
@@ -58,6 +59,9 @@ _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 3
 # How many times one run may recover from a mid-run session expiry.
 _MAX_RELOGINS = 3
+# A page that comes back logged out is read once more after this long
+# (seconds, jittered) before the session is blamed; see _reread_page.
+_ANON_REREAD_DELAY = (1.0, 2.0)
 # A catalogue this much smaller than the local index is treated as suspect
 # and reported to the user before anything is called vanished.
 _CATALOGUE_WARN_RATIO = 0.95
@@ -1016,6 +1020,13 @@ class AniWorldScraper:
         self._use_parallel: bool = True
         self._lock = threading.Lock()
         self._relogin_count = 0
+        # Bumped whenever a worker refreshes or confirms the shared session, so
+        # workers that queued behind it reuse that result instead of repeating
+        # it. Separate from _relogin_count, which counts only real logins.
+        self._session_generation = 0
+        # Set once the login cap is spent and the session still reads logged
+        # out, so the rest of the run stops re-checking a session known dead.
+        self._session_dead = False
         self._last_pause_check = 0.0
         self._pause_cached = False
         self.paused = False
@@ -1883,6 +1894,12 @@ class AniWorldScraper:
 
         # Verify still logged in
         if not _is_logged_in(doc):
+            # Read it once more, after a short pause and without logging in,
+            # before blaming the session: see _reread_page.
+            reread = await self._reread_page(client, url)
+            if reread is not None and _is_logged_in(reread):
+                doc = reread
+        if not _is_logged_in(doc):
             # One shared session serves the whole run, so an expiry here would
             # otherwise fail every remaining series. Re-login once and retry
             # this page; only give up if the second look is still logged out.
@@ -1940,6 +1957,8 @@ class AniWorldScraper:
         # rather than by any later sanity check on the numbers. Re-login and
         # refetch once, exactly as the series page above does; only give up if
         # the second read is still anonymous.
+        if self._any_season_logged_out(season_pages):
+            season_pages = await self._reread_anonymous_seasons(client, season_links, season_pages)
         if self._any_season_logged_out(season_pages):
             if await self._relogin_shared_client(client):
                 season_pages = self._parse_season_pages(await self._fetch_season_pages(client, season_links))
@@ -2071,6 +2090,54 @@ class AniWorldScraper:
                 parsed.append(parse_season_page(page, self._account_name))
         return parsed
 
+    async def _reread_page(self, client, url):
+        """Fetch `url` once more after a short jittered pause; its tree, or None.
+
+        Under load a site can render a page anonymous for an instant while the
+        session itself stays valid. Captured on bs.to (#4): 25 of 24,975 pages,
+        in bursts at single instants, each a normal 200 of the right page with
+        the login form instead of the logout link -- and 21,470 logged-in pages
+        after the first, with no re-login at all. Treating every such page as
+        an expired session cost a real login POST per page and, once
+        _MAX_RELOGINS was spent, failed the series outright. A second read is
+        the cheap way to tell a flicker from an expiry.
+
+        Never a way around the login check: the caller still uses the result
+        only if it carries the logged-in marker, and falls back to the re-login
+        path otherwise. None on a transport error, for the same fallback.
+        """
+        await asyncio.sleep(random.uniform(*_ANON_REREAD_DELAY))
+        try:
+            resp = await self._get(client, url)
+        except httpx.HTTPError:
+            return None
+        with self._profiler.phase("parse_series"):
+            return make_doc(resp.text)
+
+    async def _reread_anonymous_seasons(self, client, season_links, parsed_pages) -> list:
+        """Re-read, once and without logging in, only the season pages that came back anonymous.
+
+        The season-page counterpart of _reread_page: a series with one flickered
+        page out of fifty refetches that one page, not all fifty. The results
+        replace the anonymous ones in place and go through the same logged-out
+        screen afterwards, so a page that is still anonymous still leads to the
+        re-login path and, failing that, to a failed series -- never to stored
+        "unwatched" rows.
+        """
+        stale = [
+            i
+            for i, page in enumerate(parsed_pages)
+            if not isinstance(page, BaseException) and page[1] is not None and not page[0]
+        ]
+        if not stale:
+            return parsed_pages
+        await asyncio.sleep(random.uniform(*_ANON_REREAD_DELAY))
+        fresh = self._parse_season_pages(await self._fetch_season_pages(client, [season_links[i] for i in stale]))
+        merged = list(parsed_pages)
+        for i, page in zip(stale, fresh, strict=True):
+            merged[i] = page
+        return merged
+
     @staticmethod
     def _any_season_logged_out(parsed_pages) -> bool:
         """True if any successfully fetched season page came back anonymous.
@@ -2087,6 +2154,20 @@ class AniWorldScraper:
                 return True
         return False
 
+    async def _session_still_valid(self, client) -> bool:
+        """True if the shared session still reads as logged in; False on any doubt.
+
+        Reads the page a login is verified against. Any failure to fetch or
+        parse it counts as "not valid", so the caller falls back to logging in
+        exactly as before.
+        """
+        try:
+            resp = await self._get(client, _series_list_url(self.site_url))
+        except Exception:  # pylint: disable=broad-exception-caught
+            return False
+        doc = make_doc(resp.text)
+        return doc is not None and _is_logged_in(doc)
+
     async def _relogin_shared_client(self, client) -> bool:
         """Log the shared session back in after an expiry, at most once at a time.
 
@@ -2097,12 +2178,25 @@ class AniWorldScraper:
         first one re-logs in and the rest simply reuse the result.
         """
         async with self._client_lock:
-            attempt = self._relogin_count
-        if attempt >= _MAX_RELOGINS:
+            generation = self._session_generation
+        if self._session_dead:
             return False
         async with self._client_lock:
-            if self._relogin_count != attempt:
-                return True  # someone else just refreshed it
+            if self._session_generation != generation:
+                return True  # someone else just refreshed or confirmed it
+            self._session_generation += 1
+            # A page rendered anonymous does not mean the session expired: on
+            # bs.to it was a transient flicker every time (#4), and each login
+            # POST sent into a live session is exactly the traffic that made a
+            # sibling site refuse logins. Check the session on the same page a
+            # login is verified against; only a session that really reads as
+            # logged out gets a login, and only those count against the cap.
+            if await self._session_still_valid(client):
+                logger.info("A page came back logged out but the session is still valid; not logging in again")
+                return True
+            if self._relogin_count >= _MAX_RELOGINS:
+                self._session_dead = True
+                return False
             self._relogin_count += 1
             try:
                 await self._login_client(client)

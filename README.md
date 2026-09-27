@@ -8,7 +8,7 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
 
 ## Features
 
-- **Multi-session parallel scraping** — 10 concurrent httpx sessions by default (configurable in `config/config.py` or via the `ANIWORLD_MAX_WORKERS` env var)
+- **Multi-session parallel scraping** — 16 concurrent workers over HTTP/1.1 by default (configurable in `config/config.py` or via the `ANIWORLD_MAX_WORKERS` env var)
 - **Smart per-series ETA estimation** — each series stores its own `avg_scrape_seconds` (exponential moving average for ETA prediction) and `scrape_duration_seconds` (actual duration of the most recent scrape) in the index. ETA is predicted by summing those per-series averages for the remaining work, then blended with the live session rate (historical 85%→45% as progress increases). Because the database is stable, per-series history is the best predictor.
 - **Checkpoint & resume** — automatically saves progress every 25 anime; resume after interruptions (Ctrl+C safe)
 - **New anime detection** — detects newly added anime on your account and lists them before scraping
@@ -44,8 +44,9 @@ Uses **httpx** (no browser needed) with a multi-session architecture for fast, p
   3.10 would very likely work — it is simply not tested, so it is not offered.
 - Dependencies: `httpx`, `lxml`, `h2`, `python-dotenv`
 
-`lxml` and `h2` are what make the scraper fast: pages parse ~4-6x quicker than with
-BeautifulSoup, and HTTP/2 lets one connection carry many requests.
+`lxml` is what keeps the scraper fast: pages parse ~4-6x quicker than with
+BeautifulSoup. `h2` is only needed if you switch HTTP/2 back on (`ANIWORLD_HTTP2=1`);
+the default is parallel HTTP/1.1 connections, which this site serves ~50% faster.
 
 ## Installation
 
@@ -140,7 +141,7 @@ Built-in fallback hosts: `aniworld.cc`, `186.2.175.111` (HTTP, no TLS).
 Scraping parallelism can be adjusted via the `ANIWORLD_MAX_WORKERS` environment variable or in `config/config.py`:
 
 ```python
-NUM_WORKERS = 10  # Number of parallel httpx sessions
+NUM_WORKERS = 16  # Number of parallel workers
 ```
 
 ## Tuning
@@ -149,12 +150,28 @@ All optional, with sensible defaults. Set them in `.env`.
 
 | Variable                      | Default | What it does                                                                                                                                                                  |
 | ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ANIWORLD_MAX_WORKERS`        | `8`     | Concurrent scraping sessions. The default was measured on a representative sample of this catalogue, not guessed — higher is not faster, and past the peak it only adds load. |
+| `ANIWORLD_MAX_WORKERS`        | `16`    | Concurrent scraping sessions. Measured, not guessed: over HTTP/1.1 throughput peaks at 16, where one CPU core is nearly saturated; past 24 it falls. |
 | `ANIWORLD_SEASON_CONCURRENCY` | `4`     | Season pages fetched at once per series. Total requests in flight is workers x this.                                                                                          |
-| `ANIWORLD_HTTP2`              | `1`     | `0` (or `false`/`off`) trades one multiplexed HTTP/2 connection for parallel HTTP/1.1 ones. Change it only if `tests/throughput_sweep.py` shows HTTP/1.1 is faster.           |
+| `ANIWORLD_HTTP2`              | `0`     | `1` (or `true`/`on`) switches to one multiplexed HTTP/2 connection. The default is parallel HTTP/1.1, measured ~50% faster here because the site serves one connection only so fast. |
 | `ANIWORLD_CHECKPOINT_EVERY`   | `25`    | Save resume state every N anime.                                                                                                                                              |
 | `ANIWORLD_PROFILE`            | unset   | Set to `1` to print where a run's time actually went (network vs parse vs disk).                                                                                              |
 | `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `.env`, because it is what locates that file. |
+
+**If a full run starts meeting push-back.** The defaults (HTTP/1.1, 16 workers) were measured on
+samples with no push-back at all, but a full run keeps that load up for much longer. If the log shows
+`Site pushed back` or `Session had expired; logged back in`, or series start failing, back off in
+`.env`, no code change needed:
+
+```
+ANIWORLD_MAX_WORKERS=8          # HTTP/1.1 with less load
+```
+
+or return to the previous defaults, one HTTP/2 connection with 8 workers:
+
+```
+ANIWORLD_HTTP2=1
+ANIWORLD_MAX_WORKERS=8
+```
 
 ## Usage
 

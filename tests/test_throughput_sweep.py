@@ -466,7 +466,7 @@ class TestTheVerdict(unittest.TestCase):
 
 
 class TestTheHttp2Switch(unittest.TestCase):
-    """Only "0" used to switch HTTP/2 off, so "false" silently kept it on."""
+    """HTTP/1.1 unless HTTP/2 is asked for by an explicit on value; "0" was once the only off."""
 
     def resolve(self, values: list[str | None]) -> dict[str, bool]:
         """USE_HTTP2 for each value, from config imported in a clean subprocess."""
@@ -499,8 +499,10 @@ class TestTheHttp2Switch(unittest.TestCase):
         return json.loads(line[len("<<RESULT>>") :])
 
     def test_off_and_on(self):
-        off = ["0", "false", "FALSE", " off ", "no"]
-        on = ["1", "true", "", "2", None]
+        # HTTP/1.1 is the default (measured faster on this site); only an
+        # explicit "on" value brings HTTP/2 back.
+        off = ["0", "false", "FALSE", " off ", "no", "", None]
+        on = ["1", "true", "TRUE", " on ", "yes"]
         result = self.resolve(off + on)
         self.assertEqual({v: result[repr(v)] for v in off}, dict.fromkeys(off, False))
         self.assertEqual({v: result[repr(v)] for v in on}, dict.fromkeys(on, True))
