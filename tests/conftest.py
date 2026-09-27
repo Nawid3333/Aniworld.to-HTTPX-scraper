@@ -64,3 +64,15 @@ def bench(request):
     recorder = Recorder(update=request.config.getoption("--benchmark-update"))
     yield recorder
     recorder.flush()
+
+
+@pytest.fixture(autouse=True)
+def _no_anonymous_reread_pause(monkeypatch):
+    """Skip the scraper's 1-2 s pause before re-reading a page served logged out.
+
+    The pause matters against the live site (it lets a flicker pass); in a
+    test it would only make every logged-out-page case wait for nothing.
+    """
+    import src.scraper as scraper
+
+    monkeypatch.setattr(scraper, "_ANON_REREAD_DELAY", (0.0, 0.0))
