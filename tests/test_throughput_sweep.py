@@ -110,6 +110,9 @@ class NoWaitGuard:
     def reward(self) -> None:
         return None
 
+    def note_server_error(self) -> float | None:
+        return None
+
 
 class SweepCase(unittest.TestCase):
     # The client's event hooks as run_setting left them; set by run_setting().

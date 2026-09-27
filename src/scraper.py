@@ -14,6 +14,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -67,6 +68,10 @@ _ANON_REREAD_DELAY = (1.0, 2.0)
 _CATALOGUE_WARN_RATIO = 0.95
 _CATALOGUE_MIN_INDEX = 20
 _BACKOFF_BASE = 0.5
+# This many 500/502/504s across the whole pool inside this many seconds is
+# the site struggling, not one bad page; see RateGuard.note_server_error.
+_SERVER_ERROR_BURST = 5
+_SERVER_ERROR_WINDOW = 5.0
 
 
 class RateGuard:
@@ -77,11 +82,16 @@ class RateGuard:
     a moment rather than letting the other workers keep hammering; the pool
     then eases back to full speed on its own. One instance is shared by all
     workers, so the slowdown is global, not per-connection.
+
+    A burst of 500/502/504 parks the pool the same way; see
+    note_server_error.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
         self._resume_at = 0.0
         self._penalty = 0.0
+        self._server_errors: deque[float] = deque()
 
     async def wait(self) -> None:
         """Block until the pool is allowed to send again.
@@ -94,7 +104,7 @@ class RateGuard:
         the workers it was meant to hold back, at exactly the moment the site
         was pushing hardest.
         """
-        while (delay := self._resume_at - time.monotonic()) > 0:
+        while (delay := self._resume_at - self._clock()) > 0:
             await asyncio.sleep(delay)
 
     def penalise(self, retry_after: float | None = None) -> float:
@@ -109,7 +119,7 @@ class RateGuard:
         else:
             self._penalty = min(max(self._penalty * 2, 1.0), 30.0)
             pause = self._penalty
-        self._resume_at = max(self._resume_at, time.monotonic() + pause)
+        self._resume_at = max(self._resume_at, self._clock() + pause)
         logger.warning("Site pushed back — pausing all workers for %.1fs", pause)
         return pause
 
@@ -117,6 +127,33 @@ class RateGuard:
         """A clean response: decay the accumulated penalty."""
         if self._penalty:
             self._penalty = max(0.0, self._penalty * 0.5)
+
+    def note_server_error(self) -> float | None:
+        """Record a 500/502/504; park the pool if they are arriving in a burst.
+
+        A lone server error is one bad page, and _get simply retries it. A
+        wave of them is the site itself struggling, and without this the
+        other workers kept firing straight into it at full speed -- each
+        request backed off on its own, the pool never did. So a burst gets
+        the same pool-wide pause as a 429, with the same doubling and decay.
+
+        Errors that land while the pool is already parked were sent before
+        the pause began and say nothing new, so they are not counted: one
+        wave costs one pause, which grows only if the errors carry on once
+        the pool resumes. Returns the pause, or None if there was none.
+        """
+        now = self._clock()
+        if now < self._resume_at:
+            return None
+        window = self._server_errors
+        window.append(now)
+        while now - window[0] > _SERVER_ERROR_WINDOW:
+            window.popleft()
+        if len(window) < _SERVER_ERROR_BURST:
+            return None
+        window.clear()
+        logger.warning("%d server errors within %.0fs", _SERVER_ERROR_BURST, _SERVER_ERROR_WINDOW)
+        return self.penalise()
 
 
 # NOT restricted with a SoupStrainer, deliberately. Straining season pages to
@@ -1824,6 +1861,8 @@ class AniWorldScraper:
                     return resp
                 if resp.status_code in (429, 503):
                     self._rate_guard.penalise(_retry_after_seconds(resp))
+                else:
+                    self._rate_guard.note_server_error()
                 last_exc = httpx.HTTPStatusError(
                     f"HTTP {resp.status_code}",
                     request=resp.request,
