@@ -155,23 +155,24 @@ DEFAULT_BATCH_FILE_PATH = os.path.join(PROJECT_HOME, "series_urls.txt")
 DEFAULT_BATCH_FILE = os.path.abspath(DEFAULT_BATCH_FILE_PATH)
 
 # ==================== SCRAPING SETTINGS ====================
-# Measured, not guessed: a worker sweep over a representative sample of
-# this catalogue (median 1 season, matching the real distribution) found
-# 43.9 pages/s at 8, vs 35.9 at 6 and 31.3 at 12.
-# Re-measured after workers began sharing one logged-in session: the old
-# per-worker login both skewed the comparison and cost real throughput.
-# Past the peak the season fan-out already keeps pool_workers *
-# SEASON_CONCURRENCY requests in flight, so more workers only add load.
+# Measured, not guessed -- on the owner's PC (~100 Mbit/s, ~20 ms to the
+# site), 600 series x2 repeats, tests/throughput_sweep.py, September 2026:
 #
-# Where the time actually goes, measured with the built-in PhaseProfiler
-# over 300 series x2 shuffled passes at these settings:
-#   network 98.8%   parse 1.1%   checkpoint <0.1%
-# Parsing costs 9% of ONE core across the run, so the scrape is bound by
-# the network and not by this process. Offloading parse off the event loop was
-# already measured 2-2.7x SLOWER (see parse_season_html), and the lxml parser
-# cut per-page parse time another 5.7x on top, so there is nothing left to
-# win here. Do not reopen this without a fresh profile showing otherwise.
-NUM_WORKERS = int(os.getenv("ANIWORLD_MAX_WORKERS", "8"))
+#   HTTP/1.1, 4 seasons at once       HTTP/2 (one connection)
+#   workers  pages/s  CPU  ttfb50     pages/s  CPU  ttfb50
+#      8      105.7   57%    77ms       88.8   49%    93ms
+#     16      134.6   80%   116ms       88.5   49%   210ms
+#     24      134.3   91%   174ms       91.0   51%   306ms
+#     32      122.2   94%   242ms       90.3   51%   424ms
+#     48       94.7   96%   413ms       90.0   50%   630ms
+#
+# On HTTP/1.1 the limit is this process: one CPU core, saturated from 24
+# workers, with throughput falling beyond. Not the site: zero 429/503 in any
+# of the 20 settings. Not the line: 17 Mbit/s at most, 17% of it. 16 is the
+# best clean setting; 24 only adds CPU. Every setting returned identical data.
+# Parsing stays on the event loop even so: moving it to a thread was measured
+# 2-2.7x SLOWER (see parse_season_html). Cheaper per page is the way forward.
+NUM_WORKERS = int(os.getenv("ANIWORLD_MAX_WORKERS", "16"))
 
 # Season pages of one series are independent GETs. Fetching them one after
 # another made a series' scrape time scale linearly with its season count,
@@ -182,12 +183,19 @@ SEASON_CONCURRENCY = int(os.getenv("ANIWORLD_SEASON_CONCURRENCY", "4"))
 
 # HTTP/2 multiplexes every request over ONE connection per host; HTTP/1.1
 # opens up to NUM_WORKERS * SEASON_CONCURRENCY parallel connections instead.
-# Which one the site serves faster is the site's business, not ours, so it is
-# switchable for measuring (tests/throughput_sweep.py compares both).
-# ANIWORLD_HTTP2=0 selects HTTP/1.1, and so do false/no/off: a value that reads
-# as "off" must not quietly keep HTTP/2. Anything else, unset included,
-# keeps HTTP/2.
-USE_HTTP2 = os.getenv("ANIWORLD_HTTP2", "1").strip().lower() not in ("0", "false", "no", "off")
+# This site serves one connection only so fast: HTTP/2 stays flat at ~90
+# pages/s from 8 to 48 workers while time-to-first-byte grows 7x, and
+# HTTP/1.1 reached ~135 (+46-51%, in both repeats, with no push-back). So
+# HTTP/1.1 is the default. ANIWORLD_HTTP2=1 (or true/yes/on) switches HTTP/2
+# back on; anything else, unset included, uses HTTP/1.1.
+USE_HTTP2 = os.getenv("ANIWORLD_HTTP2", "").strip().lower() in ("1", "true", "yes", "on")
+
+# If the site starts pushing back on a full run -- "Site pushed back" or
+# "Session had expired; logged back in" in the log, or series failing --
+# the sweep's samples did not cover that load. No code change is needed to
+# back off; set these in .env instead:
+#   ANIWORLD_MAX_WORKERS=8                     HTTP/1.1 with less load (105.7 pages/s above)
+#   ANIWORLD_HTTP2=1 + ANIWORLD_MAX_WORKERS=8  the previous defaults: one connection
 
 
 # Checkpoint frequency: serialize resume state every N completed series.
