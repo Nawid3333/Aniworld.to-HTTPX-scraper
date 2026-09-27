@@ -1620,7 +1620,13 @@ class AniWorldScraper:
                 "User-Agent": UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "de,en-US;q=0.7,en;q=0.3",
-                "Accept-Encoding": "gzip, deflate, br",
+                # No Accept-Encoding: httpx offers exactly the encodings it
+                # can decode. This used to name "br" outright, and httpx only
+                # decodes br when the brotli package is installed, which this
+                # project does not require. The site answers gzip either way
+                # today, but a server that started preferring br would have
+                # handed a machine without brotli raw compressed bytes on every
+                # page -- each one then failing to parse.
                 "Upgrade-Insecure-Requests": "1",
             },
             timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
