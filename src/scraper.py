@@ -1933,7 +1933,7 @@ class AniWorldScraper:
         has_episode_zero = False
         stale_ignored = []
 
-        season_pages = await self._fetch_season_pages(client, season_links)
+        season_pages = self._parse_season_pages(await self._fetch_season_pages(client, season_links))
 
         # A season page that came back logged out yields a full, well-formed
         # episode table with every row unwatched, so it has to be caught here
@@ -1942,7 +1942,7 @@ class AniWorldScraper:
         # the second read is still anonymous.
         if self._any_season_logged_out(season_pages):
             if await self._relogin_shared_client(client):
-                season_pages = await self._fetch_season_pages(client, season_links)
+                season_pages = self._parse_season_pages(await self._fetch_season_pages(client, season_links))
             if self._any_season_logged_out(season_pages):
                 logger.error("Season pages served logged out for %s", url)
                 return self._error_result(info, "session expired — season page not logged in")
@@ -1950,11 +1950,10 @@ class AniWorldScraper:
         for (label, season_url), page in zip(season_links, season_pages, strict=True):
             if isinstance(page, BaseException):
                 return self._error_result(info, f"season {label} fetch failed: {page}")
-            with self._profiler.phase("parse"):
-                logged_in, episodes = parse_season_page(page, self._account_name)
+            logged_in, episodes = page
             if episodes is not None and not logged_in:
-                # Belt and braces: _any_season_logged_out already screened the
-                # batch, so reaching here means the page changed between reads.
+                # Belt and braces: _any_season_logged_out screened these same
+                # results, so this only fires if that screen is ever changed.
                 return self._error_result(info, f"season {label}: not logged in")
             if episodes is None:
                 # None means the page had no episode table at all, or a row
@@ -2052,17 +2051,38 @@ class AniWorldScraper:
                 self._account_name = name
                 logger.debug("Account name for season-page checks: %s", name)
 
-    def _any_season_logged_out(self, season_pages) -> bool:
-        """True if any successfully fetched season page came back anonymous.
+    def _parse_season_pages(self, season_pages) -> list:
+        """Parse each fetched season page exactly once.
 
-        Exceptions are left alone: a failed fetch is already handled per
-        season further down, and reporting it as a login problem here would
-        mask the real reason.
+        Returns, position for position, (logged_in, episodes) for a page that
+        was fetched, or the fetch's exception unchanged. The logged-out screen
+        and the per-season loop both read these results. Each used to parse
+        every page itself, and that second parse cost ~4.6 ms per season page
+        for no information, on a run whose HTTP/1.1 ceiling is one CPU core.
+        A refetch after a re-login is parsed afresh by calling this again on
+        the new pages.
         """
+        parsed = []
         for page in season_pages:
             if isinstance(page, BaseException):
+                parsed.append(page)
                 continue
-            logged_in, episodes = parse_season_page(page, self._account_name)
+            with self._profiler.phase("parse"):
+                parsed.append(parse_season_page(page, self._account_name))
+        return parsed
+
+    @staticmethod
+    def _any_season_logged_out(parsed_pages) -> bool:
+        """True if any successfully fetched season page came back anonymous.
+
+        Takes _parse_season_pages' results. Exceptions are left alone: a
+        failed fetch is already handled per season further down, and reporting
+        it as a login problem here would mask the real reason.
+        """
+        for page in parsed_pages:
+            if isinstance(page, BaseException):
+                continue
+            logged_in, episodes = page
             if episodes is not None and not logged_in:
                 return True
         return False
