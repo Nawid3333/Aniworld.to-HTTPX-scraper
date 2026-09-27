@@ -1,0 +1,9 @@
+# Line endings: LF everywhere -- in the repository and in the working copy,
+# whatever core.autocrlf says on the machine or CI runner that checks it out.
+# .editorconfig (end_of_line = lf) and ruff (line-ending = "lf") ask for the
+# same, so no tool can disagree about a file.
+* text=auto eol=lf
+
+# cmd.exe misreads LF-only batch files; keep CRLF for any that appear.
+*.bat text eol=crlf
+*.cmd text eol=crlf
