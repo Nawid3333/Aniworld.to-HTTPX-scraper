@@ -169,7 +169,7 @@ def _series_identity(entry):
     Title alone is not unique -- aniworld.to can list two different series under one name -- and keying on it let each
     scrape of one overwrite the other, so a new-only scrape offered the missing
     one forever. Slug alone would quietly fold a renamed series into its old
-    entry, which is the decision the duplicate-slug prompt leaves to the user.
+    entry; the save asks about each rename instead (see _find_title_renames).
     """
     return entry.get("title"), _extract_slug(entry)
 
@@ -1356,7 +1356,7 @@ def _prompt_episode_mismatches(mismatches, old_data=None, active_site_url=None):
         print("1) Proceed with merge despite issues")
         print(f"2) Delete index & rescrape {len(critical)} critical series")
         print("3) Cancel (discard all changes)\n")
-        choice = input("Choose option (1-3): ").strip()
+        choice = term.ask("Choose option (1-3): ", ("1", "2", "3"), safe="3")
 
         if choice == "2":
             # Extract URLs for rescraping
@@ -1371,10 +1371,7 @@ def _prompt_episode_mismatches(mismatches, old_data=None, active_site_url=None):
             return False, None
         # Default or choice '1': proceed
     else:
-        choice = (
-            input("\n" + term.danger("Proceed with merge despite warnings?") + term.dim(" (y/n): ")).strip().lower()
-        )
-        return choice == "y", None
+        return term.confirm("\n" + term.danger("Proceed with merge despite warnings?") + term.dim(" (y/n): ")), None
 
     return True, None
 
@@ -1450,8 +1447,7 @@ def _prompt_change_confirmations(changes, new_dict):
         for item in items:
             print(formatter(item))
         print("-" * 70)
-        resp = input(f"\n{prompt_text} (y/n): ").strip().lower()
-        return resp == "y"
+        return term.confirm(f"\n{prompt_text} (y/n): ")
 
     if changes["new_series"]:
 
@@ -1531,8 +1527,7 @@ def _prompt_change_confirmations(changes, new_dict):
         print("\n" + "─" * term_w)
         print(formatted_changes)
         print("─" * term_w)
-        resp = input("\n" + term.danger("Allow subscription/watchlist changes?") + term.dim(" (y/n): ")).strip().lower()
-        if resp == "y":
+        if term.confirm("\n" + term.danger("Allow subscription/watchlist changes?") + term.dim(" (y/n): ")):
             if changes.get("newly_subscribed"):
                 allowed["subscribe"] = True
             if changes.get("newly_unsubscribed"):
@@ -2532,11 +2527,7 @@ def _open_rows_in_browser(rows: list) -> int:
         return 0
 
     print(f"\n  This opens {tab_count} browser tab(s) for {len(rows)} entry(s).")
-    try:
-        go_ahead = input("  Continue? (y/n) [n]: ").strip().lower() or "n"
-    except EOFError:
-        go_ahead = "n"
-    if go_ahead != "y":
+    if not term.confirm("  Continue? (y/n): "):
         print("  → Cancelled; no tabs opened.")
         return 0
 
@@ -2544,13 +2535,7 @@ def _open_rows_in_browser(rows: list) -> int:
     since_pause = 0
     for row in rows:
         if since_pause >= _BROWSER_TAB_BATCH:
-            try:
-                answer = (
-                    input(f"  {opened} tab(s) open, {tab_count - opened} to go. Continue? (y/n) [n]: ").strip() or "n"
-                ).lower()
-            except EOFError:
-                answer = "n"
-            if answer != "y":
+            if not term.confirm(f"  {opened} tab(s) open, {tab_count - opened} to go. Continue? (y/n): "):
                 print(f"  → Stopped after {opened} tab(s).")
                 return opened
             since_pause = 0
@@ -2781,6 +2766,42 @@ def _replacement_differences(old_entry: dict, new_entry: dict) -> tuple[list[str
     return lines, differences
 
 
+def _replacement_url_problem(url: str, row: dict, taken: dict) -> str | None:
+    """Return why *url* cannot replace the entry in *row*, or None if it can."""
+    slug = _extract_slug({"url": url})
+    if slug is None:
+        return f"Not a series URL: {url}"
+    if slug == _extract_slug(row["old_entry"]) or slug == _extract_slug({"url": row["v_url"] or ""}):
+        return "That is this entry's own URL"
+    if slug in taken:
+        return f'Already chosen as the replacement for "{taken[slug]}"'
+    return None
+
+
+def _ask_replacement_url(row: dict, taken: dict) -> str | None:
+    """Ask for the replacement's URL until one can be used; None on "0" or no input.
+
+    A typo -- or Enter, which meant cancel -- used to end the link and drop
+    back to the row's action prompt, so it had to be chosen and pasted again
+    from the start. Only a usable URL or "0" ends this now.
+    """
+    for _ in range(term.MAX_UNRECOGNIZED):
+        try:
+            url = input("  Paste the replacement's URL (0 = cancel): ").strip()
+        except EOFError:
+            print("  -> No input available; not replacing this entry.")
+            return None
+        if url == "0":
+            print("  → Cancelled.")
+            return None
+        problem = _replacement_url_problem(url, row, taken) if url else "No answer"
+        if problem is None:
+            return url
+        print(f"  ⚠ {problem} - paste the replacement's URL, or 0 to cancel.")
+    print(f"  → No usable URL after {term.MAX_UNRECOGNIZED} tries; not replacing this entry.")
+    return None
+
+
 def _choose_replacement(
     row: dict, old_data: dict, new_dict: dict, scraper, taken: dict, url: str | None = None
 ) -> dict | None:
@@ -2808,25 +2829,15 @@ def _choose_replacement(
         user cancelled or the replacement could not be read.
     """
     if url is None:
-        try:
-            url = input("  Paste the replacement's URL (Enter = cancel): ").strip()
-        except EOFError:
-            print("  -> No input available; not replacing this entry.")
+        url = _ask_replacement_url(row, taken)
+        if url is None:
             return None
-        if not url:
-            print("  → Cancelled.")
+    else:
+        problem = _replacement_url_problem(url, row, taken)
+        if problem:
+            print(f"  ⚠ {problem}.")
             return None
-
     slug = _extract_slug({"url": url})
-    if slug is None:
-        print(f"  ⚠ Not a series URL: {url}")
-        return None
-    if slug == _extract_slug(row["old_entry"]) or slug == _extract_slug({"url": row["v_url"] or ""}):
-        print("  ⚠ That is this entry's own URL.")
-        return None
-    if slug in taken:
-        print(f'  ⚠ Already chosen as the replacement for "{taken[slug]}".')
-        return None
 
     # Only a scrape result can stand for the site. A series the run failed to
     # read, or only listed, is read live like one the run skipped.
@@ -2868,10 +2879,9 @@ def _choose_replacement(
 
         try:
             choice = (
-                input(f'  Replace "{row["v_title"]}" with "{new_title}"? (y=replace o=open r=re-scrape n=cancel) [n]: ')
+                input(f'  Replace "{row["v_title"]}" with "{new_title}"? (y=replace o=open r=re-scrape n=cancel): ')
                 .strip()
                 .lower()
-                or "n"
             )
         except EOFError:
             print("  -> No input available; not replacing this entry.")
@@ -2975,7 +2985,7 @@ def _status_diff_line(old_entry: dict, new_entry: dict) -> str | None:
 # endless one is an unattended feed -- a scripted test, a piped command --
 # whose re-prompts used to loop forever, and whose accumulating prompts and
 # warnings ate gigabytes of memory before anything failed.
-_PROMPT_MAX_UNRECOGNIZED = 5
+_PROMPT_MAX_UNRECOGNIZED = term.MAX_UNRECOGNIZED
 
 
 def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None, replacements=None):
@@ -3019,7 +3029,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None, r
     print("\n  Compare each vanished series with its best matching new counterpart.")
     print("  Actions:")
     print("    d   delete this entry")
-    print("    k   keep this entry (default)")
+    print("    k   keep this entry")
     print("    s   swap: replace this entry with the new one shown in its row (compare first, then y/n)")
     print("    l   link: replace this entry with a series whose URL you paste (compare first, then y/n)")
     print("    r   re-scrape this entry's old URL to verify it's really gone")
@@ -3149,10 +3159,10 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None, r
             swap = "s=swap-to-new " if n_url else ""
             prompt = (
                 f'  [{i}/{len(rows)}] Action for "{v_title}"? '
-                f"(d=delete k=keep {swap}l=link-url r=rescrape o=open oa=open-all) [k]: "
+                f"(d=delete k=keep {swap}l=link-url r=rescrape o=open oa=open-all): "
             )
             try:
-                choice = input(prompt).strip().lower() or "k"
+                choice = input(prompt).strip().lower()
             except EOFError:
                 # No one is there to answer -- a piped or redirected run. The
                 # loop below re-prompts on anything it does not recognise, so
@@ -3175,19 +3185,7 @@ def _prompt_vanished_table(vanished_entries, new_dict, old_data, scraper=None, r
                     print(f"\n  ⚠ This entry has watched progress: {watched_eps}/{total_eps} episodes.")
                     print("    Make sure the new entry on the site reflects the same progress,")
                     print("    otherwise the next scrape may report those episodes as unwatched.")
-                try:
-                    confirm = (
-                        input("  " + term.danger(f'Confirm delete "{v_title}"?') + term.dim(" (y/n) [n]: "))
-                        .strip()
-                        .lower()
-                        or "n"
-                    )
-                except EOFError:
-                    # The row prompt is EOF-guarded; this second prompt must be
-                    # too, or stdin closing right after a "d" would crash here.
-                    print("  -> No input available; not deleting this entry.")
-                    break
-                if confirm == "y":
+                if term.confirm("  " + term.danger(f'Confirm delete "{v_title}"?') + term.dim(" (y/n): ")):
                     to_delete.append(row["key"])
                     print("  → Marked for deletion.")
                 else:
@@ -3345,29 +3343,18 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
                     for s in (new_data if isinstance(new_data, list) else new_data.values())
                     if s.get("title") and _series_identity(s) not in old_identities
                 ]
-                if candidate_entries:
-                    try:
-                        ask = (
-                            input(
-                                f"\n{len(vanished)} vanished series found; "
-                                f"{len(candidate_entries)} new series could be renames. "
-                                "Re-scrape all candidate URLs for verification? (y/n): "
-                            )
-                            .strip()
-                            .lower()
-                        )
-                    except EOFError:
-                        # Piped or redirected run. Skipping the live re-verification costs
-                        # accuracy, not data -- the decision table below has its own
-                        # closed-stdin guard and keeps every entry. Letting this raise
-                        # would instead kill the run just before the results are saved.
-                        print("  -> No input available; skipping live re-verification.")
-                        ask = "n"
-                    if ask == "y":
-                        _, verified_new_data = asyncio.run(
-                            scraper.verify_vanished_and_candidates(vanished, candidate_entries)
-                        )
-                        new_data = verified_new_data
+                # A piped or redirected run answers no here: skipping the live
+                # re-verification costs accuracy, not data, and the decision
+                # table below keeps every entry on a closed stdin as well.
+                if candidate_entries and term.confirm(
+                    f"\n{len(vanished)} vanished series found; "
+                    f"{len(candidate_entries)} new series could be renames. "
+                    "Re-scrape all candidate URLs for verification? (y/n): "
+                ):
+                    _, verified_new_data = asyncio.run(
+                        scraper.verify_vanished_and_candidates(vanished, candidate_entries)
+                    )
+                    new_data = verified_new_data
 
             # Show new series alongside so user can spot renames before deciding
             new_dict = {}
@@ -3442,6 +3429,97 @@ def show_vanished_series(old_data, all_discovered_slugs, scrape_scope, index_fil
     return [(title, reason) for title, reason, _ in vanished] if vanished else []
 
 
+def _find_title_renames(old_data, new_dict):
+    """Return (old_key, new_key) for each series the site renamed but kept at its link.
+
+    A site fixes a typo in a title, or swaps it for another language's, without
+    touching the link. Keyed by title, the scrape then read the series as a
+    brand-new one and added it beside its old entry: the sibling s.to index
+    held /serie/die-minverva-akademie twice, as "Die Minverva-Akademie" and
+    "Die Minerva-Akademie", and only the duplicate-slug prompt noticed.
+
+    Only unambiguous pairs are returned: the slug belongs to exactly one index
+    entry this scrape did not also return under its own title. When the index
+    already holds the slug more than once, the scrape's copy stays a new series
+    and the duplicate-slug prompt settles it.
+    """
+    old_by_slug = defaultdict(list)
+    for key, entry in old_data.items():
+        slug = _extract_slug(entry)
+        if slug and key not in new_dict:
+            old_by_slug[slug].append(key)
+    new_by_slug = defaultdict(list)
+    for key, entry in new_dict.items():
+        slug = _extract_slug(entry)
+        if slug and key not in old_data:
+            new_by_slug[slug].append(key)
+    renames = [
+        (old_by_slug[slug][0], new_keys[0])
+        for slug, new_keys in new_by_slug.items()
+        if len(new_keys) == 1 and len(old_by_slug.get(slug, ())) == 1
+    ]
+    return sorted(renames, key=lambda pair: _report_order(pair[1]))
+
+
+def _prompt_title_renames(renames, old_data, new_dict):
+    """Ask about each rename and apply the answer to *old_data* and *new_dict*.
+
+    "y" moves the index entry to its new title, so the diff and merge that
+    follow treat it as the series it is and its watch history carries over.
+    Anything else leaves the entry as it is and drops this scrape's copy, so
+    no second entry is created; the next scrape asks again.
+
+    Only these two local dicts change, and the renamed entry is a copy, so
+    discarding the save afterwards leaves the loaded index untouched.
+
+    Each pair is shown the way the vanished-series table shows a swap: old and
+    new side by side, then the season-by-season comparison of the two. Episode
+    titles that do not match there are the sign that the link now holds a
+    different show. It is not routed through that table, though: its actions
+    (re-scrape the old URL, link another series, swap in the site's data
+    wholesale) answer "where did this series go?", and a rename is still at
+    its link. That table also runs after the save, when the second copy would
+    already be written.
+
+    Returns the approved (old_title, new_title) pairs.
+    """
+    if not renames:
+        return []
+    print(f"\n[RENAMED ON THE SITE] {len(renames)} series changed title but kept their link")
+    print("   (manual confirmation required)")
+    approved = []
+    for position, (old_key, new_key) in enumerate(renames, 1):
+        old_entry = old_data[old_key]
+        new_entry = new_dict[new_key]
+        old_title = old_entry.get("title", old_key)
+        new_title = new_entry.get("title", new_key)
+        old_progress = _series_progress_line(old_entry)
+        width = max(len("Old (index)"), len(old_title), len(old_progress))
+        print(f"\n  [{position}/{len(renames)}] same link: {new_entry.get('url') or new_entry.get('link', '')}")
+        print(f"        {'Old (index)':<{width}} │ New (site)")
+        print(f"        {old_title:<{width}} │ {new_title}")
+        print(f"        {old_progress:<{width}} │ {_series_progress_line(new_entry)}")
+        lines, differences = _replacement_differences(old_entry, new_entry)
+        print("      Index (old) vs. site (new):")
+        for line in lines or ["(no seasons on either side)"]:
+            print(f"        {line}")
+        print(f"      ⚠ {differences} difference(s)" if differences else "      ✓ identical")
+        if not term.confirm("  Rename the index entry? (y/n): "):
+            del new_dict[new_key]
+            print(f"  -> Kept as '{old_title}' and left out of this save (asked again next scrape)")
+            continue
+        renamed = dict(old_entry)
+        renamed["title"] = new_title
+        renamed["alt_titles"] = list(dict.fromkeys([*old_entry.get("alt_titles", []), old_title]))
+        # Rebuilt in order, so the entry keeps its place in the saved file.
+        items = [(new_key, renamed) if key == old_key else (key, entry) for key, entry in old_data.items()]
+        old_data.clear()
+        old_data.update(items)
+        approved.append((old_title, new_title))
+        logger.info("Series renamed on the site: '%s' -> '%s'", old_title, new_title)
+    return approved
+
+
 def confirm_and_save_changes(new_data, description, index_manager, active_site_url=None):
     """Show changes, ask for separate watched/unwatched confirmation, merge, and save.
 
@@ -3486,6 +3564,10 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
             len(skipped_stubs),
             [s.get("title") for s in skipped_stubs][:10],
         )
+
+    # Settled before the diff: a renamed series not matched to its entry here
+    # is diffed as a new series and saved as a second copy of the same link.
+    renamed = _prompt_title_renames(_find_title_renames(old_data, new_dict), old_data, new_dict)
 
     changes = detect_changes(old_data, new_dict)
     logger.info("Detected changes: %s", {k: len(v) for k, v in changes.items()})
@@ -3569,6 +3651,7 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
         main_changes += len(changes["watchlist_added"])
     if allowed["watchlist_remove"]:
         main_changes += len(changes["watchlist_removed"])
+    main_changes += len(renamed)
     if main_changes == 0:
         has_housekeeping = housekeeping["added"] or housekeeping["removed"]
         if has_housekeeping:
@@ -3610,7 +3693,7 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
                     sub_info = f" ({' '.join(parts)})" if parts else ""
                     print(f"    • {title}  [{seasons}]: {watched}/{total_ep} watched{sub_info}")
             print(f"{'─' * 70}")
-            if input("Apply these changes? (y/n): ").strip().lower() != "y":
+            if not term.confirm("Apply these changes? (y/n): "):
                 print("✗ Changes discarded.")
                 return False
             index_manager.series_index = _key_series(merged.values())
@@ -3632,9 +3715,12 @@ def confirm_and_save_changes(new_data, description, index_manager, active_site_u
         include_watchlist_remove=allowed["watchlist_remove"],
         new_data=new_dict,
     )
+    if renamed:
+        print(f"\n[RENAMED] ({len(renamed)})")
+        for old_title, new_title in renamed:
+            print(f"  ~ '{old_title}' → '{new_title}'")
 
-    response = input("\nSave these changes? (y/n): ").strip().lower()
-    if response != "y":
+    if not term.confirm("\nSave these changes? (y/n): "):
         print("✗ Changes discarded. Nothing saved.")
         logger.info("User discarded changes. Nothing saved.")
         return False

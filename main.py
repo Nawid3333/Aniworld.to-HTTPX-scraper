@@ -349,7 +349,8 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
     standing, and which one that should be is a judgement the program cannot
     make: a slug repeats because a series was renamed, because the site reused
     it, or because one scrape stored a stale title. Each slug is shown with
-    everything that tells its copies apart, and the choice is the user's.
+    everything that tells its copies apart, and the choice is the user's --
+    including deleting every copy, so a new-only scrape adds it back fresh.
     """
     dup_extra = sum(index_duplicates.values()) - len(index_duplicates)
     print(f"\n    [WARN] Found {len(index_duplicates)} duplicate slug(s) in index (extra count: {dup_extra})")
@@ -361,6 +362,7 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
             by_slug.setdefault(slug, []).append((title, series))
 
     removed_titles = []
+    cleared_slugs = []
     for slug in sorted(by_slug):
         entries = sorted(by_slug[slug], key=lambda kv: kv[0].lower())
         if len(entries) < 2:
@@ -373,21 +375,30 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
             print(f"         {seasons} season(s), {watched}/{total} watched")
             print(f"         {series.get('url') or series.get('link', '')}")
 
-        choice = (
-            input("      " + term.danger("keep which?") + term.dim(f" (1-{len(entries)}, s=skip, a=abort): "))
-            .strip()
-            .lower()
+        # "1-2" once read as the input format, so the hint spells out that a
+        # number names the one copy to keep; anything else is asked again.
+        choice = term.ask(
+            "      "
+            + term.danger("keep which?")
+            + term.dim(f" (number 1 to {len(entries)} keeps that one, d=delete all, s=skip, a=abort): "),
+            [str(n) for n in range(1, len(entries) + 1)] + ["d", "s", "a"],
+            safe="s",
+            hint=f"type a number from 1 to {len(entries)}, d, s or a",
         )
         if choice == "a":
             print("      aborted - nothing further changed.")
             break
-        if not choice or choice == "s":
+        if choice == "s":
             print("      skipped - every copy kept.")
             continue
-        if not choice.isdigit() or not 1 <= int(choice) <= len(entries):
-            print("      not one of the listed options - skipped, every copy kept.")
+        if choice == "d":
+            for title, _series in entries:
+                if title in idx_mgr.series_index:
+                    del idx_mgr.series_index[title]
+                    removed_titles.append(title)
+            cleared_slugs.append(slug)
+            print(f"      deleted all {len(entries)} - 'Scrape only NEW anime' adds it back from the site.")
             continue
-
         keep = int(choice) - 1
         for position, (title, _series) in enumerate(entries):
             if position != keep and title in idx_mgr.series_index:
@@ -400,7 +411,9 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
         return
 
     idx_mgr.save_index()
-    print(f"\n    Removed {len(removed_titles)} duplicate entry(s); one copy of each resolved slug kept.")
+    print(f"\n    Removed {len(removed_titles)} duplicate entry(s).")
+    if cleared_slugs:
+        print(f"    {len(cleared_slugs)} slug(s) now have no entry - run 'Scrape only NEW anime' to add them back.")
     logger.info("Removed %d duplicate index entries: %s", len(removed_titles), removed_titles[:10])
 
 
@@ -616,11 +629,9 @@ def _check_checkpoint(expected_mode):
 
     if checkpoint_mode == expected_mode:
         print(f'\n⚠ Checkpoint found from a previous "{saved_label}" run!\n')
-        choice = input("Resume from checkpoint? (y/n): ").strip().lower()
-        if choice == "y":
+        if term.confirm("Resume from checkpoint? (y/n): "):
             return {"ok": True, "resume": True}
-        discard = input(term.danger("Discard old checkpoint and start fresh?") + term.dim(" (y/n): ")).strip().lower()
-        if discard == "y":
+        if term.confirm(term.danger("Discard old checkpoint and start fresh?") + term.dim(" (y/n): ")):
             with contextlib.suppress(OSError):
                 os.remove(checkpoint_file)
             return {"ok": True, "resume": False}
@@ -628,8 +639,7 @@ def _check_checkpoint(expected_mode):
 
     print(f'\n⚠ A checkpoint exists from a different mode: "{saved_label}"')
     print(f'   You are about to run: "{expected_label}"\n')
-    discard = input(term.danger("Discard the old checkpoint and continue?") + term.dim(" (y/n): ")).strip().lower()
-    if discard == "y":
+    if term.confirm(term.danger("Discard the old checkpoint and continue?") + term.dim(" (y/n): ")):
         with contextlib.suppress(OSError):
             os.remove(checkpoint_file)
         return {"ok": True, "resume": False}
@@ -788,21 +798,19 @@ def print_completed_series_alerts(index_manager=None, allow_rescrape=True):
         # index update. The two lists cannot overlap (watched == total splits
         # them), so the URLs need no de-duplication.
         needs_sub_fix = completed_not_sub + started_not_sub
-        if needs_sub_fix and allow_rescrape:
-            rescrape = input("\nRescrape these anime to update Sub/WL status? (y/n): ").strip().lower()
-            if rescrape == "y":
-                urls = [s.get("url") for s in needs_sub_fix if s.get("url")]
-                if not urls:
-                    print("✗ No URLs found for these anime")
-                else:
-                    print(f"\n→ Rescraping {len(urls)} unsubscribed anime...")
-                    _run_scrape_and_save(
-                        run_kwargs={"url_list": urls, "parallel": False},
-                        description=f"Rescrape unsubscribed anime ({len(urls)})",
-                        success_msg=f"Rescrape completed! {len(urls)} anime updated.",
-                        no_data_msg="No data scraped",
-                        post_scrape_allow_rescrape=False,
-                    )
+        if needs_sub_fix and allow_rescrape and term.confirm("\nRescrape these anime to update Sub/WL status? (y/n): "):
+            urls = [s.get("url") for s in needs_sub_fix if s.get("url")]
+            if not urls:
+                print("✗ No URLs found for these anime")
+            else:
+                print(f"\n→ Rescraping {len(urls)} unsubscribed anime...")
+                _run_scrape_and_save(
+                    run_kwargs={"url_list": urls, "parallel": False},
+                    description=f"Rescrape unsubscribed anime ({len(urls)})",
+                    success_msg=f"Rescrape completed! {len(urls)} anime updated.",
+                    no_data_msg="No data scraped",
+                    post_scrape_allow_rescrape=False,
+                )
 
         _print_alert_block(
             ongoing_no_wl,
@@ -1017,17 +1025,11 @@ def _prompt_clean_vanished(idx_mgr: IndexManager | None = None, scraper=None, se
 
     kept_titles = {title for title, _ in kept}
     kept_slugs = {slug for slug, title in title_by_slug.items() if title in kept_titles}
-    if kept_slugs:
-        try:
-            prompt = f"\nStop reporting the {len(kept_slugs)} kept entry(s) as vanished? (y/n): "
-            answer = input(prompt).strip().lower()
-        except EOFError:
-            answer = "n"
-        if answer == "y":
-            ignored = _load_ignored_vanished()
-            ignored.update(kept_slugs)
-            _save_ignored_vanished(ignored)
-            print(f"  Ignored {len(kept_slugs)} vanished slug(s) — will not prompt again.")
+    if kept_slugs and term.confirm(f"\nStop reporting the {len(kept_slugs)} kept entry(s) as vanished? (y/n): "):
+        ignored = _load_ignored_vanished()
+        ignored.update(kept_slugs)
+        _save_ignored_vanished(ignored)
+        print(f"  Ignored {len(kept_slugs)} vanished slug(s) — will not prompt again.")
 
     if removed:
         logger.info("Removed %d vanished anime from index after scrape: %s", removed, titles[:10])
@@ -1489,15 +1491,11 @@ def scrape_all_series():
     print("  1. Sequential (slower, but most reliable)")
     print("  2. Parallel (faster, uses multiple sessions)")
     print("  0. Back\n")
-    mode_choice = input("Choose mode (0-2) [default: 2]: ").strip() or "2"
+    mode_choice = term.ask("Choose mode (0-2): ", ("0", "1", "2"), safe="0")
 
     if mode_choice == "0":
         return
-    if mode_choice not in ["1", "2"]:
-        print("⚠ Invalid choice, using default (parallel)")
-        use_parallel = True
-    else:
-        use_parallel = mode_choice == "2"
+    use_parallel = mode_choice == "2"
 
     _run_scrape_and_save(
         run_kwargs={"resume_only": resume, "parallel": use_parallel},
@@ -1561,15 +1559,11 @@ def scrape_unwatched():
     print("  1. Sequential (slower, but most reliable)")
     print("  2. Parallel (faster, uses multiple sessions)")
     print("  0. Back\n")
-    mode_choice = input("Choose mode (0-2) [default: 2]: ").strip() or "2"
+    mode_choice = term.ask("Choose mode (0-2): ", ("0", "1", "2"), safe="0")
 
     if mode_choice == "0":
         return
-    if mode_choice not in ["1", "2"]:
-        print("⚠ Invalid choice, using default (parallel)")
-        use_parallel = True
-    else:
-        use_parallel = mode_choice == "2"
+    use_parallel = mode_choice == "2"
 
     _run_scrape_and_save(
         run_kwargs={
@@ -1590,23 +1584,34 @@ def single_or_batch_add():
     print("\n→ Add single link / batch from file")
     print("  • Paste URL → scrapes single anime")
     print("  • Enter filename → uses that file for batch")
-    print(f"  • Press Enter → uses default ({default_file})")
+    print(f"  • Type 1   → uses {default_file}")
     print("  • Type 0   → back to main menu\n")
 
-    user_input = input(f"Enter [default: {default_file}]: ").strip()
-
-    if user_input == "0":
-        return
-    if not user_input:
-        user_input = default_file
-
-    if user_input.startswith(("http://", "https://")):
-        add_single_series(user_input)
-    else:
-        if not os.path.exists(user_input):
-            print(f"✗ File not found: {user_input}")
+    # No default and no dead end: Enter used to mean the default file, and a
+    # missing file or a bad URL went back to the main menu. Each is asked
+    # again now; only 0 goes back.
+    for _ in range(term.MAX_UNRECOGNIZED):
+        try:
+            user_input = input("URL, filename, 1 or 0: ").strip()
+        except EOFError:
             return
-        batch_add_from_file(user_input)
+        if user_input == "0":
+            return
+        if user_input == "1":
+            user_input = default_file
+        if not user_input:
+            print("  ⚠ No answer - paste a URL, type a filename, 1 or 0.")
+        elif user_input.startswith(("http://", "https://")):
+            if _is_valid_series_url(user_input):
+                add_single_series(user_input)
+                return
+            print("  ⚠ Not an aniworld.to anime URL - try again, or 0 to go back.")
+        elif os.path.exists(user_input):
+            batch_add_from_file(user_input)
+            return
+        else:
+            print(f"  ⚠ File not found: {user_input} - try again, or 0 to go back.")
+    print(f"  ⚠ No usable answer after {term.MAX_UNRECOGNIZED} tries; back to the main menu.")
 
 
 def add_single_series(url):
@@ -1665,8 +1670,7 @@ def batch_add_from_file(file_path):
     if len(urls) > 5:
         print(f"  ... and {len(urls) - 5} more")
 
-    confirm = input("\nProceed with batch add? (y/n): ").strip().lower()
-    if confirm != "y":
+    if not term.confirm("\nProceed with batch add? (y/n): "):
         print("✗ Cancelled")
         return
 
@@ -1877,7 +1881,7 @@ def generate_report():
     print("  2. Subscription/watchlist filtered report")
     print("  0. Back\n")
 
-    choice = input("Choose report type (0-2): ").strip()
+    choice = term.ask("Choose report type (0-2): ", ("0", "1", "2"), safe="0")
 
     if choice == "0":
         return
@@ -1903,7 +1907,7 @@ def generate_report():
             print("  3. Both")
             print("  0. Back\n")
 
-            sub_choice = input("Choose filter (0-3): ").strip()
+            sub_choice = term.ask("Choose filter (0-3): ", ("0", "1", "2", "3"), safe="0")
 
             if sub_choice == "0":
                 return
@@ -1988,7 +1992,7 @@ def scrape_subscribed_watchlist():
     print("  3. Both")
     print("  0. Back\n")
 
-    sub_choice = input("Choose source (0-3) [default: 3]: ").strip() or "3"
+    sub_choice = term.ask("Choose source (0-3): ", ("0", "1", "2", "3"), safe="0")
     if sub_choice == "0":
         return
     source = {"1": "subscribed", "2": "watchlist"}.get(sub_choice, "both")
@@ -2054,10 +2058,8 @@ def main():
 
     print(f"\u2713 Credentials found for user: {EMAIL}\n")
 
-    if not check_disk_space():
-        response = input("Continue anyway? (y/n): ").strip().lower()
-        if response != "y":
-            sys.exit(1)
+    if not check_disk_space() and not term.confirm("Continue anyway? (y/n): "):
+        sys.exit(1)
 
     scraper = AniWorldScraper()
     _probe_sites_before_scrape(scraper, idx_mgr=idx_mgr)

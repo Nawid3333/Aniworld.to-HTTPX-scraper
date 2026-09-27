@@ -591,14 +591,16 @@ class TestVanishedDecisionPrompt(QuietCase):
     def _entries(n):
         return [(f"Show{i}", "gone", series_url(f"s{i}")) for i in range(n)]
 
-    def test_keep_all_by_default(self):
-        # Empty new_dict / old_data => all rows match "none" and default is keep
-        with mock.patch("builtins.input", side_effect=["", "", "", "", ""]):
+    def test_keep_is_typed_not_assumed(self):
+        # Enter used to keep a row. There are no defaults now: it is asked
+        # again, and only a typed "k" keeps.
+        with mock.patch("builtins.input", side_effect=["", "k", "k", "k", "k", "k"]) as feeder:
             self.assertEqual(im._prompt_vanished_table(self._entries(5), {}, {}), [])
+        self.assertEqual(feeder.call_count, 6)
 
     def test_delete_per_item_with_confirmation(self):
         # "d" triggers a y/n confirmation prompt
-        inputs = ["d", "y", "", "d", "y", "", ""]
+        inputs = ["d", "y", "k", "d", "y", "k", "k"]
         with mock.patch("builtins.input", side_effect=inputs):
             result = im._prompt_vanished_table(self._entries(5), {}, {})
             self.assertEqual(len(result), 2)

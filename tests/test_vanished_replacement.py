@@ -222,10 +222,18 @@ class TestReplacePrompt:
         assert "s=swap" not in self.asked[0]
         assert "shows no new entry to swap to" in self.out
 
-    def test_link_asks_for_a_url_and_enter_cancels(self):
-        assert self._run("l", "", "k") == []
+    def test_link_asks_for_a_url_and_0_cancels(self):
+        # Enter used to cancel; it is asked again now, and only 0 cancels.
+        assert self._run("l", "", "0", "k") == []
         assert "Paste the replacement's URL" in self.asked[1]
+        assert "Paste the replacement's URL" in self.asked[2]
         assert "Cancelled" in self.out
+
+    def test_a_mistyped_url_is_asked_again(self):
+        # A typo used to end the link and fall back to the row's action prompt.
+        assert self._run("l", "not a url", "0", "k") == []
+        assert "Not a series URL: not a url" in self.out
+        assert "Paste the replacement's URL" in self.asked[2]
 
     def test_a_url_outside_the_run_is_scraped_live(self):
         scraper = FakeScraper(NEW)

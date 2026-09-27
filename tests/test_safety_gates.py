@@ -137,9 +137,15 @@ class EpisodeMismatchDialogTests(unittest.TestCase):
 
     def test_warnings_need_an_explicit_yes(self):
         self.assertEqual(self._run([_mismatch("warning")], "y"), (True, None))
-        for answer in ("", "n", "j"):
-            with self.subTest(answer=answer):
-                self.assertEqual(self._run([_mismatch("warning")], answer), (False, None))
+        self.assertEqual(self._run([_mismatch("warning")], "n"), (False, None))
+
+    def test_a_wrong_answer_to_the_warnings_is_asked_again(self):
+        # Enter and "j" used to count as no and cancel the merge. Only y or n
+        # answers now, and the question comes back until one is given.
+        for wrong in ("", "j", "yes"):
+            for then, expected in (("y", (True, None)), ("n", (False, None))):
+                with self.subTest(wrong=wrong, then=then):
+                    self.assertEqual(self._run([_mismatch("warning")], wrong, then), expected)
 
     def test_cancel_discards_the_merge(self):
         self.assertEqual(self._run([_mismatch("critical")], "3"), (False, None))
@@ -155,10 +161,18 @@ class EpisodeMismatchDialogTests(unittest.TestCase):
     def test_rescrape_of_an_entry_that_cannot_be_found_gives_up(self):
         self.assertEqual(self._run([_mismatch("critical", title="Unknown")], "2"), (False, None))
 
-    def test_enter_proceeds_and_leaves_every_deletion_to_its_own_prompt(self):
+    def test_proceeding_leaves_every_deletion_to_its_own_prompt(self):
         # Proceeding is not destructive: the merge still asks separately before
         # removing any episode or season, and those prompts default to keep.
-        self.assertEqual(self._run([_mismatch("critical")], ""), (True, None))
+        self.assertEqual(self._run([_mismatch("critical")], "1"), (True, None))
+
+    def test_only_a_listed_option_is_an_answer(self):
+        # Enter and any typo used to proceed with the merge. They are asked
+        # again now, and the option given afterwards is the one that counts.
+        for wrong in ("", "4", "x", "12"):
+            with self.subTest(wrong=wrong):
+                self.assertEqual(self._run([_mismatch("critical")], wrong, "1"), (True, None))
+                self.assertEqual(self._run([_mismatch("critical")], wrong, "3"), (False, None))
 
 
 def _index_with(*entries):
@@ -190,11 +204,24 @@ class DuplicateSlugPromptTests(unittest.TestCase):
         self._resolve("2")  # listed alphabetically: 1 = New Name, 2 = Old Name
         self.assertEqual(_titles_on_disk(self.path), ["Old Name", "Other"])
 
-    def test_skip_abort_and_unknown_answers_keep_every_copy(self):
-        for answer in ("", "s", "a", "3", "x"):
+    def test_delete_all_removes_every_copy_of_that_slug_only(self):
+        self._resolve("d")
+        self.assertEqual(_titles_on_disk(self.path), ["Other"])
+
+    def test_skip_and_abort_keep_every_copy(self):
+        for answer in ("s", "a"):
             with self.subTest(answer=answer):
                 self._resolve(answer)
                 self.assertEqual(_titles_on_disk(self.path), ["New Name", "Old Name", "Other"])
+
+    def test_a_wrong_answer_is_asked_again_and_the_next_one_counts(self):
+        # "1-2" is how the old hint "(1-2, ...)" was once read. It, Enter and
+        # anything unlisted used to skip the slug; they are asked again now.
+        for wrong in ("", "3", "0", "x", "1-2", "D1"):
+            with self.subTest(wrong=wrong):
+                self.setUp()
+                self._resolve(wrong, "2")
+                self.assertEqual(_titles_on_disk(self.path), ["Old Name", "Other"])
 
     def test_abort_stops_before_later_slugs(self):
         path, manager = _index_with(
