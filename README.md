@@ -158,9 +158,11 @@ All optional, with sensible defaults. Set them in `.env`.
 | `ANIWORLD_HOME` | unset | Where `.env`, `data/`, `logs/` and the default batch file live. Unset, that is this checkout. Set it when you install the package, so they do not land in site-packages. Must be a real environment variable — it cannot be set inside `.env`, because it is what locates that file. |
 
 **If a full run starts meeting push-back.** The defaults (HTTP/1.1, 16 workers) were measured on
-samples with no push-back at all, but a full run keeps that load up for much longer. If the log shows
-`Site pushed back` or `Session had expired; logged back in`, or series start failing, back off in
-`.env`, no code change needed:
+samples with no push-back at all, but a full run keeps that load up for much longer.
+The scraper already pauses every worker by itself when the site answers 429/503 or returns a burst
+of server errors (five 500/502/504 within five seconds); each pause logs `Site pushed back`. If that
+line keeps coming back, or the log shows `Session had expired; logged back in`, or series start
+failing, back off in `.env`, no code change needed:
 
 ```
 ANIWORLD_MAX_WORKERS=8          # HTTP/1.1 with less load

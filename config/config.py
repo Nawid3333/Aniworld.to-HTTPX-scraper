@@ -170,6 +170,11 @@ DEFAULT_BATCH_FILE = os.path.abspath(DEFAULT_BATCH_FILE_PATH)
 # workers, with throughput falling beyond. Not the site: zero 429/503 in any
 # of the 20 settings. Not the line: 17 Mbit/s at most, 17% of it. 16 is the
 # best clean setting; 24 only adds CPU. Every setting returned identical data.
+#
+# Since season pages are parsed once instead of twice (600 series x2,
+# HTTP/1.1): 16 -> 182.1 pages/s at 75% CPU, 24 -> 178.0 at 86%, 32 -> 149.2
+# at 94%. The same shape about 35% higher, still one core, so 16 stays.
+#
 # Parsing stays on the event loop even so: moving it to a thread was measured
 # 2-2.7x SLOWER (see parse_season_html). Cheaper per page is the way forward.
 NUM_WORKERS = int(os.getenv("ANIWORLD_MAX_WORKERS", "16"))
