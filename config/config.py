@@ -180,6 +180,15 @@ NUM_WORKERS = int(os.getenv("ANIWORLD_MAX_WORKERS", "8"))
 # only alongside the RateGuard that reacts to the site pushing back.
 SEASON_CONCURRENCY = int(os.getenv("ANIWORLD_SEASON_CONCURRENCY", "4"))
 
+# HTTP/2 multiplexes every request over ONE connection per host; HTTP/1.1
+# opens up to NUM_WORKERS * SEASON_CONCURRENCY parallel connections instead.
+# Which one the site serves faster is the site's business, not ours, so it is
+# switchable for measuring (tests/throughput_sweep.py compares both).
+# ANIWORLD_HTTP2=0 selects HTTP/1.1, and so do false/no/off: a value that reads
+# as "off" must not quietly keep HTTP/2. Anything else, unset included,
+# keeps HTTP/2.
+USE_HTTP2 = os.getenv("ANIWORLD_HTTP2", "1").strip().lower() not in ("0", "false", "no", "off")
+
 
 # Checkpoint frequency: serialize resume state every N completed series.
 # Smaller index (≈18 MB) → moderate interval.

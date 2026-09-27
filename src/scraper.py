@@ -31,6 +31,7 @@ from config.config import (
     SERIES_INDEX_FILE,
     SITE_URL,
     SITE_URLS,
+    USE_HTTP2,
 )
 from src import term
 from src.atomic_io import atomic_write_json
@@ -1614,7 +1615,7 @@ class AniWorldScraper:
 
     async def _create_logged_in_client(self, verify: bool = True) -> httpx.AsyncClient:
         client = httpx.AsyncClient(
-            http2=True,
+            http2=USE_HTTP2,
             headers={
                 "User-Agent": UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -3014,7 +3015,7 @@ class AniWorldScraper:
             normalised_vanished.append((v_title, v_url))
 
         client = httpx.AsyncClient(
-            http2=True,
+            http2=USE_HTTP2,
             headers={"User-Agent": UA},
             timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
             follow_redirects=True,
