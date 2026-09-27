@@ -77,11 +77,14 @@ def measured_row(**overrides) -> dict:
         "failure_reasons": {},
         "pages": 200,
         "wall_s": 10.0,
+        "idle_pct": 2.0,
         "pages_per_s": 20.0,
         "series_per_s": 5.0,
         "mbit_per_s": 8.0,
         "ttfb_p50_ms": 200,
         "ttfb_p90_ms": 400,
+        "body_p50_ms": 5,
+        "body_p90_ms": 10,
         "pushback_429_503": 0,
         "transport_errors": 0,
         "status_counts": {200: 200},
@@ -109,6 +112,9 @@ class NoWaitGuard:
 
 
 class SweepCase(unittest.TestCase):
+    # The client's event hooks as run_setting left them; set by run_setting().
+    hooks_after: dict[str, list]
+
     def setUp(self):
         super().setUp()
         sink = contextlib.redirect_stdout(io.StringIO())
@@ -264,6 +270,71 @@ class TestWhatTheMeterCounts(SweepCase):
         self.assertEqual(meter.pages, 7)
 
 
+class TestWaitingAndDownloadingAreTimedApart(SweepCase):
+    """A site that is slow to answer and a line that is slow to deliver must not look alike."""
+
+    DELAY = 0.08
+
+    def test_a_slow_answer_is_time_to_first_byte(self):
+        async def slow_headers(request):
+            await asyncio.sleep(self.DELAY)
+            return serve_ok(request)
+
+        row = self.run_setting(self.scraper(), sample_of(3), handler=slow_headers)
+        self.assertGreaterEqual(row["ttfb_p50_ms"], self.DELAY * 1000 * 0.9)
+        self.assertLess(row["body_p50_ms"], self.DELAY * 1000 / 2)
+
+    def test_a_slow_body_is_download_time(self):
+        async def trickle():
+            yield b"<html><body>"
+            await asyncio.sleep(self.DELAY)
+            yield b"ok</body></html>"
+
+        row = self.run_setting(self.scraper(), sample_of(3), handler=lambda r: httpx.Response(200, content=trickle()))
+        self.assertGreaterEqual(row["body_p50_ms"], self.DELAY * 1000 * 0.9)
+        self.assertLess(row["ttfb_p50_ms"], self.DELAY * 1000 / 2)
+
+    def test_workers_waiting_on_a_straggler_are_counted_idle(self):
+        # On bs.to one 50-season show outlasted every worker and made a
+        # 150-series setting say nothing about the worker count.
+        sample = sample_of(4)
+
+        async def one_slow_show(request):
+            if request.url.path == sample[2]["link"]:
+                await asyncio.sleep(self.DELAY)
+            return serve_ok(request)
+
+        row = self.run_setting(self.scraper(), sample, workers=4, handler=one_slow_show)
+        self.assertGreaterEqual(row["idle_pct"], 50, "three of four workers waited out the whole straggler")
+
+    def test_workers_that_finish_together_are_not_idle(self):
+        async def even(request):
+            await asyncio.sleep(self.DELAY / 4)
+            return serve_ok(request)
+
+        row = self.run_setting(self.scraper(), sample_of(8), workers=4, handler=even)
+        self.assertLess(row["idle_pct"], 25)
+
+    def test_only_the_page_a_caller_got_has_its_body_timed(self):
+        # A retried 502 and a redirect reach the response hook too, but
+        # nobody reads their bodies; timing them would add fake samples.
+        request = httpx.Request("GET", f"{HOST}/series/s1")
+        retried, redirect, page = httpx.Response(502), httpx.Response(302), httpx.Response(200)
+        meter = sweep.Meter()
+
+        async def serve():
+            for resp in (retried, redirect, page):
+                resp.request = request
+                await meter.on_request(request)
+                await meter.on_response(resp)
+
+        asyncio.run(serve())
+        meter.body_read(page)
+        meter.body_read(page)
+        self.assertEqual(len(meter.ttfb), 3)
+        self.assertEqual(len(meter.body), 1, "one page, one body time -- and reading it twice changes nothing")
+
+
 class TestTheSampleIsFetchedFromTheSessionHost(SweepCase):
     def test_a_mirror_url_moves_to_the_session_host(self):
         info = {"title": "X", "link": "/anime/stream/x", "url": "https://old-mirror.example/anime/stream/x"}
@@ -399,6 +470,11 @@ class TestArguments(unittest.TestCase):
         self.assertEqual(args.season_concurrency, [4])
         self.assertEqual(args.transport, ["h2", "h1"])
         self.assertTrue(args.careful)
+        self.assertIsNone(args.line_mbit, "without a measured line there is nothing to compare with")
+
+    def test_line_speed(self):
+        self.assertEqual(self.parse("--line-mbit", "100").line_mbit, 100.0)
+        self.assertEqual(self.parse("--line-mbit", "52.5").line_mbit, 52.5)
 
     def test_lists_are_tidied(self):
         args = self.parse("--workers", "8, 4,8,", "--transport", "h1, h2")
@@ -415,14 +491,71 @@ class TestArguments(unittest.TestCase):
             ["--sample", "0"],
             ["--repeats", "0"],
             ["--cooldown", "-1"],
+            ["--line-mbit", "0"],
+            ["--line-mbit", "fast"],
         ):
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 self.parse(*argv)
 
 
 class TestTheVerdict(unittest.TestCase):
-    def verdict(self, *rows) -> str:
-        return "\n".join(sweep.diagnose(sweep.summarise(list(rows))))
+    def verdict(self, *rows, line_mbit=None) -> str:
+        return "\n".join(sweep.diagnose(sweep.summarise(list(rows)), line_mbit))
+
+    @staticmethod
+    def plateau(mbit: float, *, ttfb=(200, 400, 800), body=(5, 5, 5)) -> list[dict]:
+        """Flat throughput at 4, 8 and 16 workers: the extra load waited somewhere."""
+        return [
+            measured_row(workers=w, pages_per_s=50.0, mbit_per_s=mbit, ttfb_p50_ms=t, body_p50_ms=b)
+            for w, t, b in zip((4, 8, 16), ttfb, body, strict=True)
+        ]
+
+    def test_a_full_line_is_not_blamed_on_the_site(self):
+        text = self.verdict(*self.plateau(80.0), line_mbit=100)
+        self.assertIn("HOME LINE: the scrape reached 80.0 Mbit/s, 80% of your 100 Mbit/s line", text)
+        self.assertIn("Requests queue ON YOUR LINE", text)
+        self.assertNotIn("ON THE SITE", text)
+
+    def test_a_line_with_room_to_spare_leaves_the_site_as_the_limit(self):
+        text = self.verdict(*self.plateau(8.0), line_mbit=100)
+        self.assertIn("peaked at 8.0 Mbit/s, 8% of your 100 Mbit/s line -- the connection is NOT the limit", text)
+        self.assertIn("Requests queue ON THE SITE", text)
+
+    def test_without_a_line_speed_the_site_queue_is_still_named(self):
+        text = self.verdict(*self.plateau(80.0))
+        self.assertIn("Requests queue ON THE SITE", text)
+        self.assertNotIn("home line", text.lower(), "no line speed was given, so nothing may be said about it")
+
+    def test_a_busy_process_is_not_called_a_site_queue(self):
+        # S.to over HTTP/1.1 on the owner's PC: throughput flat past 16
+        # workers, CPU in step with it, the line 80% idle.
+        rows = self.plateau(19.0)
+        rows[-1]["cpu_pct_one_core"] = 88.6
+        text = self.verdict(*rows, line_mbit=100)
+        self.assertIn("Requests queue IN THIS PROCESS: it used 89% of a core at 16 workers", text)
+        self.assertNotIn("ON THE SITE", text)
+        self.assertNotIn("HOME LINE", text)
+
+    def test_a_setting_spent_waiting_on_stragglers_is_flagged(self):
+        paced = measured_row(workers=24, transport="h1", idle_pct=61.5)
+        text = self.verdict(measured_row(), paced)
+        self.assertIn("WARNING: in 1 setting(s) the workers sat idle 10% of the time or more", text)
+        self.assertIn("worst: 62% at h1 workers=24", text)
+        self.assertNotIn("WARNING", self.verdict(measured_row(), measured_row(workers=16)), "2% is a normal drain")
+
+    def test_idle_workers_in_a_busy_setting_cost_nothing(self):
+        # With the core near full, fewer active workers still kept it busy.
+        busy = measured_row(workers=32, transport="h1", idle_pct=40.0, cpu_pct_one_core=94.0)
+        self.assertNotIn("WARNING", self.verdict(measured_row(), busy))
+
+    def test_a_wait_in_the_download_is_not_called_a_site_queue(self):
+        slow_bodies = self.plateau(8.0, ttfb=(200, 200, 210), body=(20, 400, 1000))
+        text = self.verdict(*slow_bodies)
+        self.assertIn("The extra wait is in downloading the pages", text)
+        self.assertIn("--line-mbit tells which", text)
+        self.assertNotIn("ON THE SITE", text)
+        with_line = self.verdict(*slow_bodies, line_mbit=100)
+        self.assertIn("your line is only at 8%, so the site is sending its pages slowly", with_line)
 
     def test_a_stop_above_the_only_clean_count_is_still_reported(self):
         text = self.verdict(
@@ -501,8 +634,8 @@ class TestTheHttp2Switch(unittest.TestCase):
     def test_off_and_on(self):
         # HTTP/1.1 is the default (measured faster on this site); only an
         # explicit "on" value brings HTTP/2 back.
-        off = ["0", "false", "FALSE", " off ", "no", "", None]
-        on = ["1", "true", "TRUE", " on ", "yes"]
+        off: list[str | None] = ["0", "false", "FALSE", " off ", "no", "", None]
+        on: list[str | None] = ["1", "true", "TRUE", " on ", "yes"]
         result = self.resolve(off + on)
         self.assertEqual({v: result[repr(v)] for v in off}, dict.fromkeys(off, False))
         self.assertEqual({v: result[repr(v)] for v in on}, dict.fromkeys(on, True))

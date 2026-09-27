@@ -12,20 +12,32 @@ Run from the project root:
     python tests/throughput_sweep.py
     python tests/throughput_sweep.py --workers 4,8,12,16,24 --transport h2,h1 --sample 150 --repeats 2
     python tests/throughput_sweep.py --season-concurrency 2,4,8 --workers 8
+    python tests/throughput_sweep.py --line-mbit 100
 
 What it measures, per setting
 -----------------------------
   pages/s      every page the site served, series + season pages. A 429 or a
                5xx is a refusal or a failure, not a page.
   series/s     what a real run's progress bar would show
-  Mbit/s       bytes actually received, to compare with your line speed
+  Mbit/s       bytes actually received (compressed, as they crossed the wire),
+               to compare with your line speed
   ttfb p50/p90 time until the site starts answering. When this grows in step
                with the number of requests in flight while pages/s stays flat,
                the requests are waiting in a queue ON THE SITE: more workers
                only make the queue longer.
+  body p50/p90 time from the headers to the last byte of the page. When this is
+               what grows instead, the bytes themselves are waiting: on a full
+               home line, or on a site that streams the page as it builds it.
+               --line-mbit (your measured download speed) tells the two apart:
+               a plateau at 70% of it or more is the line, not the site.
   429/503      the site explicitly pushing back
   cpu          this process's share of one CPU core. Near 100% means your PC
                (Python's single event loop) is the limit, not the site.
+  idle         the share of worker time spent with nothing left to do: the
+               queue ran dry and the worker waited for the others to finish. A
+               long-running show can outlast every other worker; when much of
+               a setting is spent like that, its pages/s says little about the
+               worker count, and the setting needs a larger --sample.
   mismatch     series whose episode/watched counts differed from the first
                setting that scraped them -- speed must never cost accuracy.
 
@@ -56,6 +68,7 @@ import statistics
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -82,6 +95,18 @@ MAX_PUSHBACK = 3
 # measure failures -- at full load.
 WARMUP_SERIES = 5
 TRANSPORTS = ("h2", "h1")
+# Share of the measured line speed at which the line, not the site, is the
+# ceiling. Short of 100%: protocol overhead and TCP never let a busy line
+# carry its full rated payload.
+LINE_FULL = 0.70
+# Share of one core (the event loop's) past which this process, not the site,
+# is at least part of the ceiling.
+BUSY_CPU = 85
+# A setting whose workers spent this share of their time idle -- queue empty,
+# waiting on a straggler such as a 50-season show fetched SEASON_CONCURRENCY
+# pages at a time -- understates its pages/s by about that much, which is more
+# than the 5% the worker-count choice is made on.
+IDLE_SHARE = 10
 
 
 def pct(values, q):
@@ -96,6 +121,7 @@ class Meter:
 
     def __init__(self) -> None:
         self.ttfb: list[float] = []
+        self.body: list[float] = []
         self.status: dict[int, int] = {}
         self.bytes = 0
         self.transport_errors = 0
@@ -105,18 +131,33 @@ class Meter:
         # word, and "h2" numbers would then be HTTP/1.1 numbers.
         self.protocols: Counter[str] = Counter()
         self._started: dict[int, float] = {}
+        self._headers_at: dict[int, float] = {}
 
     async def on_request(self, request: httpx.Request) -> None:
         self._started[id(request)] = time.perf_counter()
 
     async def on_response(self, response: httpx.Response) -> None:
+        # httpx runs response hooks as soon as the headers are in, and reads
+        # the body only afterwards: this is the line between the two timings.
+        now = time.perf_counter()
+        self._headers_at[id(response)] = now
         start = self._started.pop(id(response.request), None)
         if start is not None:
-            self.ttfb.append(time.perf_counter() - start)
+            self.ttfb.append(now - start)
         self.protocols[response.http_version] += 1
         self.status[response.status_code] = self.status.get(response.status_code, 0) + 1
         if response.status_code in (429, 503):
             self.pushback += 1
+
+    def body_read(self, response: httpx.Response) -> None:
+        """Called once the page's body is fully read.
+
+        Only the response a caller finally got has its body timed. A redirect
+        or a retried 5xx was stamped too, but nobody waited on its body.
+        """
+        headers_at = self._headers_at.pop(id(response), None)
+        if headers_at is not None:
+            self.body.append(time.perf_counter() - headers_at)
 
     @property
     def pages(self) -> int:
@@ -210,6 +251,8 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
             # that did (a 5xx on every attempt) is already in status_counts.
             meter.transport_errors += 1
             raise
+        # client.get has read the whole body by the time _get returns it.
+        meter.body_read(resp)
         meter.bytes += resp.num_bytes_downloaded
         return resp
 
@@ -222,6 +265,8 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
     done = {"ok": 0, "failed": 0, "mismatch": 0, "stopped": None}
     mismatches: list[str] = []
     reasons: Counter[str] = Counter()
+
+    ran_dry: list[float] = []
 
     async def worker():
         while not queue.empty() and not done["stopped"]:
@@ -243,6 +288,7 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
             elif finished >= 20 and done["failed"] / finished > MAX_FAIL_RATIO:
                 top = reasons.most_common(1)[0][0]
                 done["stopped"] = f"{done['failed']}/{finished} series failed (mostly: {top})"
+        ran_dry.append(time.perf_counter())
 
     cpu0, t0 = time.process_time(), time.perf_counter()
     try:
@@ -250,8 +296,10 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
     finally:
         scraper._get = original_get
         client.event_hooks = {"request": [], "response": []}
-    wall = time.perf_counter() - t0
+    end = time.perf_counter()
+    wall = end - t0
     cpu = time.process_time() - cpu0
+    idle = sum(end - t for t in ran_dry) / (workers * wall) if wall else 0
 
     series_done = done["ok"] + done["failed"]
     row = {
@@ -263,11 +311,14 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
         "failure_reasons": dict(reasons.most_common(5)),
         "pages": meter.pages,
         "wall_s": round(wall, 2),
+        "idle_pct": round(idle * 100, 1),
         "pages_per_s": round(meter.pages / wall, 2) if wall else 0,
         "series_per_s": round(series_done / wall, 2) if wall else 0,
         "mbit_per_s": round(meter.bytes * 8 / wall / 1e6, 2) if wall else 0,
         "ttfb_p50_ms": round(pct(meter.ttfb, 0.5) * 1000),
         "ttfb_p90_ms": round(pct(meter.ttfb, 0.9) * 1000),
+        "body_p50_ms": round(pct(meter.body, 0.5) * 1000),
+        "body_p90_ms": round(pct(meter.body, 0.9) * 1000),
         "pushback_429_503": meter.pushback,
         "transport_errors": meter.transport_errors,
         "status_counts": meter.status,
@@ -309,10 +360,14 @@ def summarise(rows):
                 "mbit_per_s": round(med("mbit_per_s"), 1),
                 "ttfb_p50_ms": round(med("ttfb_p50_ms")),
                 "ttfb_p90_ms": round(med("ttfb_p90_ms")),
+                "body_p50_ms": round(med("body_p50_ms")),
+                "body_p90_ms": round(med("body_p90_ms")),
                 "pushback": sum(r["pushback_429_503"] for r in rs),
                 "failed": sum(r["series_failed"] for r in rs),
                 "mismatches": sum(r["mismatches"] for r in rs),
                 "cpu_pct": round(med("cpu_pct_one_core")),
+                # The worst repeat: one straggler is enough to spoil a setting.
+                "idle_pct": round(max(r["idle_pct"] for r in rs)),
                 "protocol": spoken.most_common(1)[0][0] if spoken else None,
                 "stopped": next((r["stopped"] for r in rs if r["stopped"]), None),
             }
@@ -320,8 +375,13 @@ def summarise(rows):
     return table
 
 
-def diagnose(table) -> list[str]:
-    """Turn the table into plain answers."""
+def line_share(mbit: float, line_mbit: float | None) -> float | None:
+    """What share of the owner's measured line `mbit` is, when they gave one."""
+    return mbit / line_mbit if line_mbit else None
+
+
+def diagnose(table, line_mbit: float | None = None) -> list[str]:
+    """Turn the table into plain answers. `line_mbit` is the owner's measured download speed."""
     lines = []
     declined = sorted(
         {t["protocol"] for t in table if t["transport"] == "h2" and t["protocol"] not in (None, "HTTP/2")}
@@ -330,6 +390,16 @@ def diagnose(table) -> list[str]:
         lines.append(
             f"WARNING: asked for HTTP/2, the site answered in {', '.join(declined)} -- the h2 rows are not "
             "HTTP/2, so they say nothing about it."
+        )
+    # Idle workers cost throughput only while the core had room to spare. A
+    # setting that kept the core busy anyway lost nothing to its stragglers.
+    paced = [t for t in table if t["idle_pct"] >= IDLE_SHARE and t["cpu_pct"] <= BUSY_CPU]
+    if paced:
+        worst = max(paced, key=lambda t: t["idle_pct"])
+        lines.append(
+            f"WARNING: in {len(paced)} setting(s) the workers sat idle {IDLE_SHARE}% of the time or more, waiting "
+            f"on stragglers (worst: {worst['idle_pct']}% at {worst['transport']} workers={worst['workers']}). Their "
+            "pages/s understates what that worker count can do -- rerun with a larger --sample before trusting them."
         )
     clean = [t for t in table if not t["stopped"] and not t["pushback"]]
     pushed = [t for t in table if t["stopped"] or t["pushback"]]
@@ -344,6 +414,19 @@ def diagnose(table) -> list[str]:
         f"season_concurrency={best['season_concurrency']} -> {best['pages_per_s']} pages/s, "
         f"{best['series_per_s']} series/s, {best['mbit_per_s']} Mbit/s"
     )
+    if line_mbit:
+        peak = max(t["mbit_per_s"] for t in clean)
+        share = line_share(peak, line_mbit) or 0
+        if share >= LINE_FULL:
+            lines.append(
+                f"HOME LINE: the scrape reached {peak} Mbit/s, {share:.0%} of your {line_mbit:g} Mbit/s line. "
+                "The connection is the ceiling -- more workers cannot help; use the smallest count that fills it."
+            )
+        else:
+            lines.append(
+                f"Home line: the scrape peaked at {peak} Mbit/s, {share:.0%} of your {line_mbit:g} Mbit/s line "
+                "-- the connection is NOT the limit."
+            )
     for key in sorted({(t["transport"], t["season_concurrency"]) for t in clean}):
         curve = sorted(
             (t for t in clean if (t["transport"], t["season_concurrency"]) == key), key=lambda t: t["workers"]
@@ -379,17 +462,50 @@ def diagnose(table) -> list[str]:
             continue
         load_x = last["workers"] / knee["workers"]
         tput_x = last["pages_per_s"] / knee["pages_per_s"] if knee["pages_per_s"] else 0
-        ttfb_x = last["ttfb_p50_ms"] / knee["ttfb_p50_ms"] if knee["ttfb_p50_ms"] else 0
+        latency_knee = knee["ttfb_p50_ms"] + knee["body_p50_ms"]
+        latency_x = (last["ttfb_p50_ms"] + last["body_p50_ms"]) / latency_knee if latency_knee else 0
         lines.append(
             f"   From {knee['workers']} to {last['workers']} workers ({load_x:.1f}x load): "
-            f"pages/s x{tput_x:.2f}, time-to-first-byte x{ttfb_x:.2f}."
+            f"pages/s x{tput_x:.2f}, time-to-first-byte {knee['ttfb_p50_ms']}->{last['ttfb_p50_ms']}ms, "
+            f"body download {knee['body_p50_ms']}->{last['body_p50_ms']}ms."
         )
-        if tput_x < 1.1 and ttfb_x > 0.5 * load_x:
-            lines.append(
-                "   -> Requests queue ON THE SITE: its response time grows with the load while "
-                "throughput stays flat. The site's capacity is the ceiling; more workers only lengthen its queue."
-            )
-        if max(t["cpu_pct"] for t in curve) > 85:
+        if tput_x < 1.1 and latency_x > 0.5 * load_x:
+            # The extra load bought no throughput, so it waited somewhere.
+            # Before the first byte is the site; while the bytes arrive is the
+            # line -- or a site that streams its pages -- and only the line
+            # speed can say which.
+            share = line_share(max(t["mbit_per_s"] for t in curve), line_mbit)
+            waited_in_body = last["body_p50_ms"] - knee["body_p50_ms"] > last["ttfb_p50_ms"] - knee["ttfb_p50_ms"]
+            if share is not None and share >= LINE_FULL:
+                lines.append(
+                    f"   -> Requests queue ON YOUR LINE: throughput is flat at {share:.0%} of your "
+                    f"{line_mbit:g} Mbit/s connection. More workers cannot help."
+                )
+            elif last["cpu_pct"] > BUSY_CPU:
+                # Both timings are taken on the event loop. A loop that is
+                # nearly always busy gets to an answer late, so they grow with
+                # the load just as a site queue would -- they cannot tell the
+                # two apart here.
+                lines.append(
+                    f"   -> Requests queue IN THIS PROCESS: it used {last['cpu_pct']}% of a core at "
+                    f"{last['workers']} workers. A busy event loop reads answers late, which inflates both "
+                    "timings above, so they cannot be pinned on the site. Less CPU per page is the lever here."
+                )
+            elif waited_in_body:
+                where = (
+                    f"your line is only at {share:.0%}, so the site is sending its pages slowly"
+                    if share is not None
+                    else "on your line, or at a site that streams its pages; --line-mbit tells which"
+                )
+                lines.append(
+                    f"   -> The extra wait is in downloading the pages, not in the site starting to answer: {where}."
+                )
+            else:
+                lines.append(
+                    "   -> Requests queue ON THE SITE: its response time grows with the load while "
+                    "throughput stays flat. The site's capacity is the ceiling; more workers only lengthen its queue."
+                )
+        elif max(t["cpu_pct"] for t in curve) > BUSY_CPU:
             lines.append("   -> This process used >85% of a core: your PC/Python is at least part of the limit.")
     transports = {t["transport"] for t in clean}
     if {"h1", "h2"} <= transports and not declined:
@@ -412,7 +528,8 @@ def diagnose(table) -> list[str]:
 def print_table(table) -> None:
     head = (
         f"{'proto':5} {'sc':>2} {'wrk':>3} {'pages/s':>8} {'±':>5} {'series/s':>8} {'Mbit/s':>7} "
-        f"{'ttfb50':>7} {'ttfb90':>7} {'429/503':>7} {'fail':>4} {'mism':>4} {'cpu%':>4}  note"
+        f"{'ttfb50':>7} {'ttfb90':>7} {'body50':>7} {'body90':>7} {'429/503':>7} {'fail':>4} {'mism':>4} "
+        f"{'cpu%':>4} {'idle%':>5}  note"
     )
     print(head)
     print("-" * len(head))
@@ -420,8 +537,8 @@ def print_table(table) -> None:
         print(
             f"{t['transport']:5} {t['season_concurrency']:>2} {t['workers']:>3} {t['pages_per_s']:>8} "
             f"{t['spread']:>5} {t['series_per_s']:>8} {t['mbit_per_s']:>7} {t['ttfb_p50_ms']:>6}ms "
-            f"{t['ttfb_p90_ms']:>6}ms {t['pushback']:>7} {t['failed']:>4} {t['mismatches']:>4} {t['cpu_pct']:>4}  "
-            f"{t['stopped'] or ''}"
+            f"{t['ttfb_p90_ms']:>6}ms {t['body_p50_ms']:>6}ms {t['body_p90_ms']:>6}ms {t['pushback']:>7} "
+            f"{t['failed']:>4} {t['mismatches']:>4} {t['cpu_pct']:>4} {t['idle_pct']:>5}  {t['stopped'] or ''}"
         )
 
 
@@ -475,7 +592,8 @@ async def sweep_transport(transport: str, args, sample: list[dict] | None, rows:
                 rows.append(row)
                 print(
                     f"   rep {rep} workers={workers:>3} sc={sc}: {row['pages_per_s']:>6} pages/s "
-                    f"{row['series_per_s']:>5} series/s  ttfb p50 {row['ttfb_p50_ms']}ms  "
+                    f"{row['series_per_s']:>5} series/s {row['mbit_per_s']:>5} Mbit/s  "
+                    f"ttfb p50 {row['ttfb_p50_ms']}ms body p50 {row['body_p50_ms']}ms  "
                     f"429/503={row['pushback_429_503']} fail={row['series_failed']} "
                     f"cpu={row['cpu_pct_one_core']}%  {row['stopped'] or ''}"
                 )
@@ -494,12 +612,14 @@ def report(rows: list[dict], args, sample: list[dict] | None, complete: bool) ->
         f"  {SCRAPER_CLS.__name__}: {len(sample or [])} series x {args.repeats} repeat(s), medians shown "
         f"(± = spread between repeats)"
     )
+    if args.line_mbit:
+        print(f"  Your line: {args.line_mbit:g} Mbit/s download, as measured by you")
     if not complete:
         print("  INTERRUPTED -- partial results, from the settings that finished.")
     print("=" * 100)
     print_table(table)
     print()
-    verdict = diagnose(table)
+    verdict = diagnose(table, args.line_mbit)
     for line in verdict:
         print("  " + line)
 
@@ -569,7 +689,7 @@ def _transport_list(text: str) -> list[str]:
     return values
 
 
-def _at_least(minimum: float, kind=int):
+def _at_least(minimum: float, kind: Callable[[str], float] = int):
     def parse(text: str):
         try:
             value = kind(text)
@@ -596,6 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown", type=_at_least(0, float), default=15.0, help="seconds of quiet between settings")
     parser.add_argument("--seed", type=int, default=1, help="sample seed; same seed = same series")
     parser.add_argument("--from-catalogue", action="store_true", help="sample the live catalogue, not the index")
+    parser.add_argument(
+        "--line-mbit",
+        type=_at_least(1, float),
+        default=None,
+        help="your measured download speed in Mbit/s, so the verdict can tell a full line from a slow site",
+    )
     parser.add_argument(
         "--no-careful",
         dest="careful",

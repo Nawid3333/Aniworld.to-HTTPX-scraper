@@ -361,8 +361,9 @@ class TargetsTests(unittest.TestCase):
         # Assert on the parsed host, not a substring: startswith would also
         # accept https://mirror.test.evil.com (CodeQL
         # py/incomplete-url-substring-sanitization).
-        self.assertEqual(urlparse(url).hostname, "mirror.test")
-        self.assertNotIn("primary.test", urlparse(url).hostname)
+        host = urlparse(url).hostname
+        self.assertEqual(host, "mirror.test")
+        self.assertNotIn("primary.test", host or "")
 
     def test_an_ignored_series_is_not_fetched(self):
         targets = genre_stats._targets(FakeScraper(ignored={"one-piece"}), [self._entry("one-piece")])
