@@ -15,7 +15,8 @@ Run from the project root:
 
 What it measures, per setting
 -----------------------------
-  pages/s      every GET the scrape made, series + season pages
+  pages/s      every page the site served, series + season pages. A 429 or a
+               5xx is a refusal or a failure, not a page.
   series/s     what a real run's progress bar would show
   Mbit/s       bytes actually received, to compare with your line speed
   ttfb p50/p90 time until the site starts answering. When this grows in step
@@ -31,11 +32,17 @@ What it measures, per setting
 Safety
 ------
 A setting stops early when the site pushes back (429/503) or too many series
-fail, and every larger worker count for that transport is then skipped: load
-only goes up from there. Settings are separated by a cool-down so one
-setting's load does not bleed into the next, and each transport logs in only
-once -- repeated logins are what made this site refuse logins before (see
-_acquire_client).
+fail. In the default careful mode, every setting with at least as many
+requests in flight (workers x season concurrency) is then skipped for that
+transport: load only goes up from there. A transport whose warm-up series all
+fail -- a login that did not take, a host that is down -- is not swept at all.
+Settings are separated by a cool-down so one setting's load does not bleed
+into the next, and each transport logs in only once -- repeated logins are
+what made this site refuse logins before (see _acquire_client).
+
+Whatever finished is saved even when the sweep is interrupted (Ctrl+C) or
+crashes, marked "complete": false, so the load it put on the site is never
+wasted.
 """
 
 from __future__ import annotations
@@ -48,8 +55,10 @@ import random
 import statistics
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -68,6 +77,11 @@ REPORT_FILE = Path(__file__).resolve().parent / "throughput_report.json"
 MAX_FAIL_RATIO = 0.10
 # Explicit push-back tolerated within one setting before it is stopped.
 MAX_PUSHBACK = 3
+# Series scraped, uncounted, before a transport is measured. If every one of
+# them fails, the session or the host is broken, and sweeping would only
+# measure failures -- at full load.
+WARMUP_SERIES = 5
+TRANSPORTS = ("h2", "h1")
 
 
 def pct(values, q):
@@ -86,6 +100,10 @@ class Meter:
         self.bytes = 0
         self.transport_errors = 0
         self.pushback = 0
+        # What the connection actually spoke. Asking for HTTP/2 is only an
+        # offer: a host that declines it is served over HTTP/1.1 without a
+        # word, and "h2" numbers would then be HTTP/1.1 numbers.
+        self.protocols: Counter[str] = Counter()
         self._started: dict[int, float] = {}
 
     async def on_request(self, request: httpx.Request) -> None:
@@ -95,19 +113,26 @@ class Meter:
         start = self._started.pop(id(response.request), None)
         if start is not None:
             self.ttfb.append(time.perf_counter() - start)
+        self.protocols[response.http_version] += 1
         self.status[response.status_code] = self.status.get(response.status_code, 0) + 1
         if response.status_code in (429, 503):
             self.pushback += 1
 
     @property
     def pages(self) -> int:
-        """Pages actually served -- a 429/503 is a refusal, not a page."""
-        return sum(n for code, n in self.status.items() if code not in (429, 503))
+        """Pages actually served -- a 429 or a 5xx is a refusal or a failure, not a page."""
+        return sum(n for code, n in self.status.items() if code != 429 and code < 500)
 
 
 def fingerprint(result: dict):
-    """What must not change between settings: the data, not the timing."""
-    if result.get("error"):
+    """What must not change between settings: the data, not the timing.
+
+    None for a failed series. The scraper marks one with "_error" (see
+    _error_result), and its zeroed counts must never be taken for data: they
+    would pass as a success, hide the failure from the early stop, and show
+    up as a "mismatch" against the next setting that got the series through.
+    """
+    if result.get("_error"):
         return None
     return (
         result.get("total_seasons"),
@@ -139,6 +164,35 @@ async def sample_from_catalogue(scraper, client, size: int, seed: int) -> list[d
     return series[:size]
 
 
+def on_host(info: dict, site_url: str) -> dict:
+    """The same series, fetched from the host this session is logged in to.
+
+    Index entries keep the absolute URL of whichever mirror was live when they
+    were scraped, and a login only counts on the host it was made on: fetched
+    from another mirror, every page would come back logged out. A real run
+    never meets this, because it scrapes the live catalogue, which always
+    carries the active host. "url" stays as it was, so results still line up
+    by series across settings.
+    """
+    path = urlparse(info["url"]).path
+    if not path:
+        return info
+    return {**info, "scrape_url": f"{site_url.rstrip('/')}{path}"}
+
+
+async def scrape_contained(scraper, client, info: dict) -> dict:
+    """_scrape_one_series, with an unexpected exception kept to that one series.
+
+    The real worker does the same: one unparseable page costs that series, not
+    the rest of the queue. Here an escaped exception would also end the whole
+    sweep, every other worker with it, before anything was saved.
+    """
+    try:
+        return await scraper._scrape_one_series(client, on_host(info, scraper.site_url))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return scraper._error_result(info, f"unexpected error: {exc}")
+
+
 async def run_setting(scraper, client, sample, workers, season_conc, cooldown, reference):
     """Scrape `sample` once with `workers` workers; return the measurements."""
     scraper_mod.SEASON_CONCURRENCY = season_conc
@@ -151,7 +205,9 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
     async def counted_get(c, url, **kwargs):
         try:
             resp = await original_get(c, url, **kwargs)
-        except httpx.HTTPError:
+        except httpx.TransportError:
+            # Connection-level failures that outlived _get's retries. A status
+            # that did (a 5xx on every attempt) is already in status_counts.
             meter.transport_errors += 1
             raise
         meter.bytes += resp.num_bytes_downloaded
@@ -165,14 +221,16 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
         queue.put_nowait(info)
     done = {"ok": 0, "failed": 0, "mismatch": 0, "stopped": None}
     mismatches: list[str] = []
+    reasons: Counter[str] = Counter()
 
     async def worker():
         while not queue.empty() and not done["stopped"]:
             info = queue.get_nowait()
-            result = await scraper._scrape_one_series(client, info)
+            result = await scrape_contained(scraper, client, info)
             fp = fingerprint(result)
             if fp is None:
                 done["failed"] += 1
+                reasons[result.get("_error_reason") or "unknown"] += 1
             else:
                 done["ok"] += 1
                 seen = reference.setdefault(info["url"], fp)
@@ -183,7 +241,8 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
             if meter.pushback >= MAX_PUSHBACK:
                 done["stopped"] = f"site pushed back {meter.pushback}x (429/503)"
             elif finished >= 20 and done["failed"] / finished > MAX_FAIL_RATIO:
-                done["stopped"] = f"{done['failed']}/{finished} series failed"
+                top = reasons.most_common(1)[0][0]
+                done["stopped"] = f"{done['failed']}/{finished} series failed (mostly: {top})"
 
     cpu0, t0 = time.process_time(), time.perf_counter()
     try:
@@ -201,6 +260,7 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
         "series": series_done,
         "series_ok": done["ok"],
         "series_failed": done["failed"],
+        "failure_reasons": dict(reasons.most_common(5)),
         "pages": meter.pages,
         "wall_s": round(wall, 2),
         "pages_per_s": round(meter.pages / wall, 2) if wall else 0,
@@ -211,6 +271,7 @@ async def run_setting(scraper, client, sample, workers, season_conc, cooldown, r
         "pushback_429_503": meter.pushback,
         "transport_errors": meter.transport_errors,
         "status_counts": meter.status,
+        "protocols": dict(meter.protocols),
         "cpu_pct_one_core": round(cpu / wall * 100, 1) if wall else 0,
         "mismatches": done["mismatch"],
         "mismatch_detail": mismatches[:10],
@@ -233,6 +294,9 @@ def summarise(rows):
         def med(field, rs=rs):
             return statistics.median(r[field] for r in rs)
 
+        spoken: Counter[str] = Counter()
+        for r in rs:
+            spoken.update(r.get("protocols", {}))
         table.append(
             {
                 "transport": key[0],
@@ -249,6 +313,7 @@ def summarise(rows):
                 "failed": sum(r["series_failed"] for r in rs),
                 "mismatches": sum(r["mismatches"] for r in rs),
                 "cpu_pct": round(med("cpu_pct_one_core")),
+                "protocol": spoken.most_common(1)[0][0] if spoken else None,
                 "stopped": next((r["stopped"] for r in rs if r["stopped"]), None),
             }
         )
@@ -258,10 +323,21 @@ def summarise(rows):
 def diagnose(table) -> list[str]:
     """Turn the table into plain answers."""
     lines = []
+    declined = sorted(
+        {t["protocol"] for t in table if t["transport"] == "h2" and t["protocol"] not in (None, "HTTP/2")}
+    )
+    if declined:
+        lines.append(
+            f"WARNING: asked for HTTP/2, the site answered in {', '.join(declined)} -- the h2 rows are not "
+            "HTTP/2, so they say nothing about it."
+        )
     clean = [t for t in table if not t["stopped"] and not t["pushback"]]
     pushed = [t for t in table if t["stopped"] or t["pushback"]]
     if not clean:
-        return ["No setting finished cleanly -- the site pushed back or failed everywhere. Lower the worker counts."]
+        lines.append(
+            "No setting finished cleanly -- the site pushed back or failed everywhere. Lower the worker counts."
+        )
+        return lines
     best = max(clean, key=lambda t: t["pages_per_s"])
     lines.append(
         f"Fastest clean setting: {best['transport']} workers={best['workers']} "
@@ -272,25 +348,31 @@ def diagnose(table) -> list[str]:
         curve = sorted(
             (t for t in clean if (t["transport"], t["season_concurrency"]) == key), key=lambda t: t["workers"]
         )
-        if len(curve) < 2:
-            continue
+        header = f"[{key[0]}, season_concurrency={key[1]}]"
         top = max(t["pages_per_s"] for t in curve)
         knee = next(t for t in curve if t["pages_per_s"] >= 0.95 * top)
-        lines.append(
-            f"[{key[0]}, season_concurrency={key[1]}] within 5% of the best from workers={knee['workers']} "
-            f"-- the useful maximum for this transport."
-        )
+        if len(curve) > 1:
+            lines.append(
+                f"{header} within 5% of the best from workers={knee['workers']} "
+                "-- the useful maximum for this transport."
+            )
         # Past the knee is where the question lives: extra load that bought
         # no throughput went somewhere, and the time-to-first-byte says where.
-        last = curve[-1]
+        # Reported even when only one count finished cleanly -- "it stopped
+        # above N" is then the whole answer, and the most important one.
         refused = [
             t for t in pushed if (t["transport"], t["season_concurrency"]) == key and t["workers"] > knee["workers"]
         ]
         if refused:
+            first = min(refused, key=lambda t: t["workers"])
+            why = "pushed back (429/503)" if first["pushback"] else "started failing series"
             lines.append(
-                f"   -> The site pushed back (429/503) from workers={min(t['workers'] for t in refused)}: "
-                "that is its rate limit, and the clean maximum above is the setting to use."
+                f"{'   ->' if len(curve) > 1 else header} The site {why} from workers={first['workers']}: "
+                "that is its limit, and the clean maximum below it is the setting to use."
             )
+        if len(curve) < 2:
+            continue
+        last = curve[-1]
         if last is knee:
             if not refused:
                 lines.append("   -> Still climbing at the largest count tried; sweep higher to find the ceiling.")
@@ -310,7 +392,7 @@ def diagnose(table) -> list[str]:
         if max(t["cpu_pct"] for t in curve) > 85:
             lines.append("   -> This process used >85% of a core: your PC/Python is at least part of the limit.")
     transports = {t["transport"] for t in clean}
-    if {"h1", "h2"} <= transports:
+    if {"h1", "h2"} <= transports and not declined:
         b1 = max(t["pages_per_s"] for t in clean if t["transport"] == "h1")
         b2 = max(t["pages_per_s"] for t in clean if t["transport"] == "h2")
         lines.append(
@@ -343,62 +425,77 @@ def print_table(table) -> None:
         )
 
 
-async def main_async(args) -> None:
-    worker_counts = sorted({int(x) for x in args.workers.split(",")})
-    season_concs = sorted({int(x) for x in args.season_concurrency.split(",")})
-    transports = [x.strip() for x in args.transport.split(",")]
-    rows: list[dict] = []
-    reference: dict[str, tuple] = {}
-    sample: list[dict] | None = None if args.from_catalogue else load_sample(args.sample, args.seed)
-    if sample is not None and not sample:
-        print("No usable series in the local index -- use --from-catalogue.")
-        return
+async def sweep_transport(transport: str, args, sample: list[dict] | None, rows: list[dict], reference: dict):
+    """Log in once over `transport` and run every setting on it; returns the sample used.
 
-    for transport in transports:
-        scraper_mod.USE_HTTP2 = transport == "h2"
-        scraper = SCRAPER_CLS()
-        # Size the pool for the largest setting, as a real run of that size would.
-        scraper.pool_workers = max(worker_counts)
-        scraper_mod.SEASON_CONCURRENCY = max(season_concs)
-        print(f"\n→ [{transport}] logging in once...")
-        client = await scraper._create_logged_in_client()
-        try:
-            if sample is None:
-                sample = await sample_from_catalogue(scraper, client, args.sample, args.seed)
-            print(f"→ [{transport}] warming up on 5 series (not counted)...")
-            for info in sample[:5]:
-                await scraper._scrape_one_series(client, info)
-            blocked: set[int] = set()  # season_conc values that hit push-back
-            for rep in range(args.repeats):
-                settings = [(w, sc) for w in worker_counts for sc in season_concs]
-                random.shuffle(settings)
-                # Larger loads last within a repeat when protecting the site
-                # matters more than order effects.
-                if args.careful:
-                    settings.sort(key=lambda s: s[0] * s[1])
-                for workers, sc in settings:
-                    if sc in blocked and args.careful:
-                        continue
-                    row = await run_setting(scraper, client, sample, workers, sc, args.cooldown, reference)
-                    row.update(transport=transport, repeat=rep)
-                    rows.append(row)
+    Rows are appended to `rows` as each setting finishes, not returned at the
+    end, so an interrupted sweep still has everything that completed.
+    """
+    scraper_mod.USE_HTTP2 = transport == "h2"
+    scraper = SCRAPER_CLS()
+    # Size the pool for the largest setting, as a real run of that size would.
+    scraper.pool_workers = max(args.workers)
+    scraper_mod.SEASON_CONCURRENCY = max(args.season_concurrency)
+    print(f"\n→ [{transport}] logging in once...")
+    client = await scraper._create_logged_in_client()
+    try:
+        if sample is None:
+            sample = await sample_from_catalogue(scraper, client, args.sample, args.seed)
+        if not sample:
+            print(f"   [{transport}] no series to sample -- nothing to measure.")
+            return sample
+        warm = sample[:WARMUP_SERIES]
+        print(f"→ [{transport}] warming up on {len(warm)} series (not counted)...")
+        warm_results = [await scrape_contained(scraper, client, info) for info in warm]
+        if all(fingerprint(r) is None for r in warm_results):
+            print(
+                f"   [{transport}] every warm-up series failed "
+                f"({warm_results[0].get('_error_reason')}) -- not sweeping this transport."
+            )
+            return sample
+        # Smallest load (requests in flight) at which a setting had to stop.
+        ceiling: int | None = None
+        for rep in range(args.repeats):
+            settings = [(w, sc) for w in args.workers for sc in args.season_concurrency]
+            random.shuffle(settings)
+            # Larger loads last within a repeat when protecting the site
+            # matters more than order effects.
+            if args.careful:
+                settings.sort(key=lambda s: s[0] * s[1])
+            for workers, sc in settings:
+                load = workers * sc
+                if args.careful and ceiling is not None and load >= ceiling:
                     print(
-                        f"   rep {rep} workers={workers:>3} sc={sc}: {row['pages_per_s']:>6} pages/s "
-                        f"{row['series_per_s']:>5} series/s  ttfb p50 {row['ttfb_p50_ms']}ms  "
-                        f"429/503={row['pushback_429_503']} fail={row['series_failed']} "
-                        f"cpu={row['cpu_pct_one_core']}%  {row['stopped'] or ''}"
+                        f"   rep {rep} workers={workers:>3} sc={sc}: skipped -- {load} in flight, "
+                        f"and {ceiling} already had to stop"
                     )
-                    if row["stopped"] and args.careful:
-                        blocked.add(sc)
-        finally:
-            await client.aclose()
+                    continue
+                row = await run_setting(scraper, client, sample, workers, sc, args.cooldown, reference)
+                row.update(transport=transport, repeat=rep)
+                rows.append(row)
+                print(
+                    f"   rep {rep} workers={workers:>3} sc={sc}: {row['pages_per_s']:>6} pages/s "
+                    f"{row['series_per_s']:>5} series/s  ttfb p50 {row['ttfb_p50_ms']}ms  "
+                    f"429/503={row['pushback_429_503']} fail={row['series_failed']} "
+                    f"cpu={row['cpu_pct_one_core']}%  {row['stopped'] or ''}"
+                )
+                if row["stopped"] and args.careful:
+                    ceiling = load if ceiling is None else min(ceiling, load)
+    finally:
+        await client.aclose()
+    return sample
 
+
+def report(rows: list[dict], args, sample: list[dict] | None, complete: bool) -> None:
+    """Print the summary and verdict, and save everything to REPORT_FILE."""
     table = summarise(rows)
     print("\n" + "=" * 100)
     print(
         f"  {SCRAPER_CLS.__name__}: {len(sample or [])} series x {args.repeats} repeat(s), medians shown "
         f"(± = spread between repeats)"
     )
+    if not complete:
+        print("  INTERRUPTED -- partial results, from the settings that finished.")
     print("=" * 100)
     print_table(table)
     print()
@@ -411,6 +508,7 @@ async def main_async(args) -> None:
             {
                 "generated": datetime.now().isoformat(),
                 "scraper": SCRAPER_CLS.__name__,
+                "complete": complete,
                 "args": vars(args),
                 "cpu_count": os.cpu_count(),
                 "summary": table,
@@ -425,14 +523,77 @@ async def main_async(args) -> None:
     print(f"\n  Saved: {REPORT_FILE}  (series URLs and numbers only -- no credentials)")
 
 
-def main() -> None:
+async def main_async(args) -> None:
+    rows: list[dict] = []
+    reference: dict[str, tuple] = {}
+    sample: list[dict] | None = None
+    if not args.from_catalogue:
+        try:
+            sample = load_sample(args.sample, args.seed)
+        except FileNotFoundError:
+            print(f"No local index at {SERIES_INDEX_FILE} -- use --from-catalogue.")
+            return
+        if not sample:
+            print("No usable series in the local index -- use --from-catalogue.")
+            return
+
+    complete = False
+    try:
+        for transport in args.transport:
+            sample = await sweep_transport(transport, args, sample, rows, reference)
+        complete = True
+    finally:
+        # Saved on the way out whatever happened: a sweep interrupted after
+        # twenty minutes still measured something, and getting it back would
+        # mean putting the same load on the site again.
+        if rows:
+            report(rows, args, sample, complete)
+
+
+def _number_list(text: str) -> list[int]:
+    """argparse type: comma-separated whole numbers, each 1 or more."""
+    try:
+        values = sorted({int(x) for x in text.split(",") if x.strip()})
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected comma-separated numbers, got {text!r}") from None
+    if not values or values[0] < 1:
+        raise argparse.ArgumentTypeError(f"every value must be 1 or more, got {text!r}")
+    return values
+
+
+def _transport_list(text: str) -> list[str]:
+    """argparse type: h2 and/or h1, comma-separated, in the order given."""
+    values = list(dict.fromkeys(x.strip() for x in text.split(",") if x.strip()))
+    if not values or any(v not in TRANSPORTS for v in values):
+        raise argparse.ArgumentTypeError(f"expected h2 and/or h1, got {text!r}")
+    return values
+
+
+def _at_least(minimum: float, kind=int):
+    def parse(text: str):
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected a number, got {text!r}") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be {minimum} or more, got {text!r}")
+        return value
+
+    return parse
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--workers", default="4,8,12,16,24", help="comma-separated worker counts")
-    parser.add_argument("--season-concurrency", default="4", help="comma-separated SEASON_CONCURRENCY values")
-    parser.add_argument("--transport", default="h2,h1", help="h2 (one multiplexed connection), h1 (many), or both")
-    parser.add_argument("--sample", type=int, default=150, help="series per setting (default 150)")
-    parser.add_argument("--repeats", type=int, default=2, help="passes over every setting (default 2)")
-    parser.add_argument("--cooldown", type=float, default=15.0, help="seconds of quiet between settings")
+    parser.add_argument("--workers", type=_number_list, default="4,8,12,16,24", help="comma-separated worker counts")
+    parser.add_argument(
+        "--season-concurrency", type=_number_list, default="4", help="comma-separated SEASON_CONCURRENCY values"
+    )
+    parser.add_argument(
+        "--transport", type=_transport_list, default="h2,h1", help="h2 (one multiplexed connection), h1 (many), or both"
+    )
+    parser.add_argument("--sample", type=_at_least(1), default=150, help="series per setting (default 150)")
+    parser.add_argument("--repeats", type=_at_least(1), default=2, help="passes over every setting (default 2)")
+    parser.add_argument("--cooldown", type=_at_least(0, float), default=15.0, help="seconds of quiet between settings")
     parser.add_argument("--seed", type=int, default=1, help="sample seed; same seed = same series")
     parser.add_argument("--from-catalogue", action="store_true", help="sample the live catalogue, not the index")
     parser.add_argument(
@@ -441,8 +602,11 @@ def main() -> None:
         action="store_false",
         help="fully random order and no skipping after push-back (cleaner statistics, harder on the site)",
     )
-    args = parser.parse_args()
-    asyncio.run(main_async(args))
+    return parser
+
+
+def main() -> None:
+    asyncio.run(main_async(build_parser().parse_args()))
 
 
 if __name__ == "__main__":
