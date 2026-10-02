@@ -28,7 +28,13 @@ jobs:
         shell: bash
 
     steps:
+      # This job's token can write to the repository. Nothing here pushes --
+      # the upload below authenticates through GH_TOKEN -- so it is not left
+      # in .git/config, where the dependency installs and the build could
+      # read it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -36,7 +42,11 @@ jobs:
           # oldest supported version is what catches a newer-only API slipping
           # in. The first run of this workflow caught exactly that.
           python-version: "3.11"
-          cache: pip
+
+      # As in ci.yml: uv installs into the Python above. setup-uv skips its
+      # cache on release events by default, so a release build never restores
+      # files that another run saved.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Verify the tag matches the package version
         # The failure this exists for: pyproject.toml once said 1.0.0 while the
@@ -64,10 +74,7 @@ jobs:
           echo "tag $TAG matches pyproject.toml version $pkg_version"
 
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ".[dev]" build twine
+        run: uv pip install --system -r requirements.txt ".[dev]" build twine
 
       - name: Test
         # The suite runs without credentials and without the captured fixtures,
@@ -85,9 +92,12 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through env rather than written into the script, as in the verify
+          # step: a tag name is text, and expanded inline it would be shell code.
+          TAG: ${{ github.event.release.tag_name }}
         # --clobber so re-running the workflow on the same release replaces the
         # assets instead of failing on the second attempt.
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+        run: gh release upload "$TAG" dist/* --clobber
 
       - name: Keep artifacts on a manual run
         if: github.event_name == 'workflow_dispatch'

@@ -9,8 +9,9 @@
 # Checks out `head_branch` (main), not `head_sha`: python-semantic-release
 # refuses to release from a detached HEAD ("cannot match any release
 # groups"), which checking out a bare SHA produces. workflow_run fires
-# right after CI completes, so in practice this is still the commit CI
-# just validated.
+# right after CI completes, so this is nearly always the commit CI just
+# validated. A step below makes sure: if main has moved on since, this run
+# releases nothing and leaves it to the CI run of the newer commit.
 #
 # python-semantic-release inspects the commits since the last tag: a `fix:`
 # bumps patch, `feat:` bumps minor, a "BREAKING CHANGE:" footer bumps major;
@@ -61,7 +62,24 @@ jobs:
           ref: main
           token: ${{ secrets.RELEASE_PAT }}
 
+      # main can move on between CI finishing and the checkout above.
+      # Releasing then would tag a commit CI never ran on, so only the exact
+      # commit CI validated is released here; a newer one is released by the
+      # Auto Release run that follows its own CI run.
+      - name: Check main is still the commit CI validated
+        id: head
+        env:
+          VALIDATED: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$VALIDATED" ]; then
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main moved past $VALIDATED after CI ran; the CI run for the newer commit releases it."
+            echo "unchanged=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Python Semantic Release
+        if: steps.head.outputs.unchanged == 'true'
         uses: python-semantic-release/python-semantic-release@b700dbeb1f431a0fcc30a79f3f0869407fe07278 # v10.7.0
         with:
           github_token: ${{ secrets.RELEASE_PAT }}
