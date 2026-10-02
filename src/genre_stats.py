@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Protocol
 
 from config.config import DATA_DIR, NUM_WORKERS, SERIES_INDEX_FILE, SITE_URL
+from src import term
 from src.atomic_io import atomic_write_json
 from src.index_manager import IndexManager, get_episode_counts, paginate_list
 from src.scraper import (
@@ -274,6 +275,14 @@ async def _scrape_async(site_url: str | None, data: dict, state: dict, *, refetc
     try:
         print("\n→ Fetching catalogue...")
         catalogue = await scraper._get_all_series(client)  # noqa: SLF001
+        if refetch_all:
+            # A refresh: snapshot the finished run as the baseline the change
+            # list diffs against. Only now, with the catalogue in hand -- this
+            # used to happen before the login, so a run that could not even
+            # sign in still overwrote the baseline, and the changes the user
+            # had not looked at yet were gone. See scrape_genres.
+            data["previous_series"] = dict(data["series"])
+        state["catalogue_fetched"] = True
         targets = _targets(scraper, catalogue)
         data["host"] = scraper.site_url
         data["catalogue_total"] = len(targets)
@@ -296,6 +305,13 @@ async def _scrape_async(site_url: str | None, data: dict, state: dict, *, refetc
         progress = ProgressWriter()
         start = state["start"]
         total = len(todo)
+        # Keys whose label this refresh has already taken from a live page.
+        # A refresh used to empty `labels` up front so a renamed genre could
+        # not keep its old text, which left every genre showing its raw key
+        # when the refresh then failed or was stopped early. Now the old
+        # labels stay, and each one is replaced the first time this pass
+        # sees its genre.
+        relabelled: set[str] = set()
 
         async def worker() -> None:
             while True:
@@ -339,7 +355,11 @@ async def _scrape_async(site_url: str | None, data: dict, state: dict, *, refetc
                         results[slug] = [key for key, _ in genres]
                         titles[slug] = title
                         for key, label in genres:
-                            labels.setdefault(key, label)
+                            if refetch_all and key not in relabelled:
+                                labels[key] = label
+                                relabelled.add(key)
+                            else:
+                                labels.setdefault(key, label)
                     state["done"] += 1
                     done = state["done"]
                     if done % SAVE_EVERY == 0:
@@ -384,29 +404,41 @@ def scrape_genres(site_url: str | None = None) -> dict:
     """Fetch every series page and record its genres. Resumable, never fatal."""
     data = load_genres()
     was_complete = data["catalogue_total"] > 0 and data["scraped_count"] >= data["catalogue_total"]
+    # A finished run means this is a refresh. `series`/`titles` are
+    # deliberately *not* cleared for it -- _scrape_async() overwrites each
+    # slug in place as its page completes, so Ctrl+C partway through a
+    # refresh leaves whatever hasn't been re-fetched yet instead of wiping
+    # thousands of series down to whatever fraction finished before the
+    # interrupt. The baseline and the labels are handled in _scrape_async,
+    # once the catalogue has actually been read.
     fresh_pass = was_complete or not data["series"]
-    if fresh_pass:
-        # A finished run means this is a refresh: snapshot it as the baseline
-        # the change list diffs against. `series`/`titles` are deliberately
-        # *not* cleared here -- _scrape_async() overwrites each slug in place
-        # as its page completes, so Ctrl+C partway through a refresh leaves
-        # whatever hasn't been re-fetched yet instead of wiping thousands of
-        # series down to whatever fraction finished before the interrupt.
-        # `labels` is cheap to rebuild from scratch and is cleared so a
-        # renamed genre's display text can't get stuck on setdefault's
-        # first-seen-wins.
-        data["previous_series"] = dict(data["series"])
-        data["labels"] = {}
-    state = {"done": 0, "empty": 0, "failed": 0, "logged_out": False, "start": time.perf_counter()}
+    state = {
+        "done": 0,
+        "empty": 0,
+        "failed": 0,
+        "logged_out": False,
+        "catalogue_fetched": False,
+        "start": time.perf_counter(),
+    }
     interrupted = False
     try:
         asyncio.run(_scrape_async(site_url, data, state, refetch_all=fresh_pass))
     except KeyboardInterrupt:
         interrupted = True
-        print("\n⚠ Interrupted — saving progress so far...")
+        if state["catalogue_fetched"]:
+            print("\n⚠ Interrupted — saving progress so far...")
     except Exception as exc:  # noqa: BLE001
         print(f"\n✗ Genre scrape failed: {exc}")
         logger.exception("Genre scrape failed")
+    if not state["catalogue_fetched"]:
+        # Nothing was fetched -- the login or the catalogue failed, or the run
+        # was stopped before either finished -- so there is nothing to save.
+        # Saving anyway used to stamp the old data with a fresh timestamp and
+        # report "N/N series recorded" over a run that recorded nothing.
+        if interrupted:
+            print("\n⚠ Interrupted before the catalogue was read.")
+        print("  Genre data left unchanged.\n")
+        return data
     data["scraped_count"] = len(data["series"])
     data["generated"] = datetime.now().isoformat()
     try:
@@ -758,6 +790,18 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
                 return key
         return None
 
+    def _resolve_exact(text: str) -> str | None:
+        """Only a listed label or the back answer; see the non-tty fallback."""
+        text = text.strip().lower()
+        if not text:
+            return None
+        if allow_back and text in ("0", "back"):
+            return back_key
+        for key, label in all_items:
+            if label.lower() == text:
+                return key
+        return None
+
     def _matches(query: str) -> list[tuple[str, str]]:
         """Every selectable entry matching the query, in display order.
 
@@ -877,13 +921,26 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
     if selected is not None:
         return selected
 
-    # Fallback for non-tty or unsupported terminals.
-    while True:
-        answer = input("Enter genre name (0 = back): ").strip()
-        selected = _resolve(answer)
+    # Fallback for non-tty or unsupported terminals. Stricter than the live
+    # picker above, which shows the match it will take before Enter: with no
+    # preview, a fragment is a guess, so only a listed label (any case) or the
+    # back answer counts. End of input or MAX_UNRECOGNIZED misses give the
+    # answer that shows nothing new -- back, or every genre where there is no
+    # back. This loop used to run forever and let EOFError escape.
+    safe = back_key if allow_back else "all"
+    hint = "type a genre exactly as listed" + (", or 0 to go back" if allow_back else "")
+    for _ in range(term.MAX_UNRECOGNIZED):
+        try:
+            answer = input("Enter genre name" + (" (0 = back)" if allow_back else "") + ": ").strip()
+        except EOFError:
+            print("  -> No input available; going back.")
+            return safe
+        selected = _resolve_exact(answer)
         if selected is not None:
             return selected
-        print("✗ No genre matched. Please try again.")
+        print(f"✗ No genre matched - {hint}.")
+    print(f"  ⚠ No usable answer after {term.MAX_UNRECOGNIZED} tries; going back.")
+    return safe
 
 
 def list_unwatched_by_genre(site_url: str | None = None) -> None:
@@ -964,7 +1021,15 @@ def menu(site_url: str | None = None) -> None:
         print("  4. Show unwatched by genre")
         print("  0. Back\n")
 
-        choice = input("Choose (0-4): ").strip()
+        # term.ask: a listed number or nothing. End of input or five unusable
+        # answers in a row go back, which changes nothing; a bare input() here
+        # let EOFError escape to the top of the program as a traceback.
+        choice = term.ask(
+            "Choose (0-4): ",
+            ("0", "1", "2", "3", "4"),
+            safe="0",
+            hint="type a number from 0 to 4",
+        )
         if choice == "0":
             return
         if choice == "1":
@@ -975,5 +1040,3 @@ def menu(site_url: str | None = None) -> None:
             export_report(site_url)
         elif choice == "4":
             list_unwatched_by_genre(site_url)
-        else:
-            print("✗ Invalid choice. Please enter a number between 0 and 4.")

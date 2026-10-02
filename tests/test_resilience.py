@@ -27,6 +27,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -35,9 +36,10 @@ import httpx  # noqa: E402
 import main  # noqa: E402
 import src.index_manager as im  # noqa: E402
 import src.scraper as sc  # noqa: E402
-from config.config import VALID_SERIES_HOSTS  # noqa: E402
+from config.config import SITE_URLS, VALID_SERIES_HOSTS  # noqa: E402
 from src.atomic_io import atomic_write_json  # noqa: E402
 from src.scraper import ScrapingPausedError  # noqa: E402
+from tests import test_season_parse_once as site  # noqa: E402
 
 SCRAPER_CLS = sc.AniWorldScraper
 SERIES_PATH = "/anime/stream/"
@@ -105,18 +107,17 @@ class TempDirCase(QuietCase):
 class TestFailedSaveKeepsTheIndex(TempDirCase):
     """A save that dies on the final swap must not leave the path empty.
 
-    The outgoing file is renamed into .bak1 before the new one is moved into
-    place, so a failure between those two steps used to leave no file at all
-    at the index path.
+    The outgoing file used to be renamed into .bak1 before the new one was
+    moved into place, so a failure between those two steps left no file at
+    all at the index path. The swap is now the first thing that moves, so
+    these fail exactly that rename: the temp file onto the index path.
     """
 
-    def _flaky_replace(self, fail_on):
+    def _failing_swap(self):
         real = os.replace
-        calls = {"n": 0}
 
         def replace(src, dst):
-            calls["n"] += 1
-            if calls["n"] == fail_on:
+            if str(src).endswith(".tmp") and str(dst) == self.index_path:
                 raise OSError("simulated failure")
             return real(src, dst)
 
@@ -126,7 +127,7 @@ class TestFailedSaveKeepsTheIndex(TempDirCase):
         with open(self.index_path, "w", encoding="utf-8") as fh:
             json.dump([{"title": "Important"}], fh)
         with (
-            mock.patch("src.atomic_io.os.replace", side_effect=self._flaky_replace(2)),
+            mock.patch("src.atomic_io.os.replace", side_effect=self._failing_swap()),
             self.assertRaises(OSError),
         ):
             atomic_write_json(self.index_path, [{"title": "New"}])
@@ -138,11 +139,12 @@ class TestFailedSaveKeepsTheIndex(TempDirCase):
         with open(self.index_path, "w", encoding="utf-8") as fh:
             json.dump([{"title": "Important"}], fh)
         with (
-            mock.patch("src.atomic_io.os.replace", side_effect=self._flaky_replace(2)),
+            mock.patch("src.atomic_io.os.replace", side_effect=self._failing_swap()),
             self.assertRaises(OSError),
         ):
             atomic_write_json(self.index_path, [{"title": "New"}])
         self.assertEqual([f for f in os.listdir(self.dir) if f.endswith(".tmp")], [])
+        self.assertEqual([f for f in os.listdir(self.dir) if "pending" in f], [], "the spare backup name stayed")
 
     def test_a_normal_write_still_rotates_a_backup(self):
         atomic_write_json(self.index_path, [{"title": "One"}])
@@ -682,13 +684,15 @@ class TestVerifyAcceptsBothVanishedShapes(QuietCase):
         with mock.patch.object(SCRAPER_CLS, "_login_client", new=mock.AsyncMock()):
             return asyncio.run(scraper.verify_vanished_and_candidates(entries, []))
 
+    # With no URL nothing is fetched, so the verdict is None ("could not tell"),
+    # not False ("the site says it is gone"); see TestVanishedCheckTellsGoneFromUnknown.
     def test_three_tuple_entries_do_not_raise(self):
         verified, _ = self._verify([("Show", "not found on aniworld.to", "")])
-        self.assertEqual(verified, [("Show", "", False)])
+        self.assertEqual(verified, [("Show", "", None)])
 
     def test_two_tuple_entries_do_not_raise(self):
         verified, _ = self._verify([("Show", "")])
-        self.assertEqual(verified, [("Show", "", False)])
+        self.assertEqual(verified, [("Show", "", None)])
 
 
 class TestRescrapeTrustsReachability(QuietCase):
@@ -1582,6 +1586,284 @@ class TestAUselessBackupDoesNotHideAGoodOne(_IndexLoadCase):
         self.assertNotIn("restored", out.getvalue().lower())
 
 
+class TestAnUnreadableIndexIsNeitherEmptiedNorOverwritten(_IndexLoadCase):
+    """Every way the index file can fail to read gets the same, safe handling.
+
+    Only a JSON error used to reach the backups. A file another program had
+    locked, one an editor had re-saved in another encoding, or one bad entry
+    that tripped the validator loaded as an EMPTY index -- and the next save
+    wrote that run's few series over the whole file. Now the newest usable
+    backup is loaded instead, and a save asks before it replaces a file this
+    session could not read.
+    """
+
+    def _three(self):
+        return [self._series("Alpha"), self._series("Beta"), self._series("Gamma")]
+
+    def _lock_the_first_read(self):
+        """open() refuses the index file once, the way a scanner's lock does."""
+        real_open = open
+        refused = []
+
+        def fake_open(file, *args, **kwargs):
+            if not refused and os.path.abspath(str(file)) == os.path.abspath(self.index_path):
+                refused.append(file)
+                raise PermissionError(13, "The process cannot access the file because it is being used")
+            return real_open(file, *args, **kwargs)
+
+        return mock.patch("builtins.open", side_effect=fake_open)
+
+    def _write_bytes(self, raw):
+        with open(self.index_path, "wb") as fh:
+            fh.write(raw)
+
+    def test_an_index_re_saved_in_another_encoding_loads_the_backup(self):
+        self.write_backup(self._three())
+        self._write_bytes(json.dumps(self._three(), ensure_ascii=False).replace("Alpha", "Grüße").encode("cp1252"))
+        manager = self._load()
+        self.assertEqual(sorted(manager.series_index), ["Alpha", "Beta", "Gamma"])
+        self.assertIn("UTF-8", manager.unreadable or "")
+
+    def test_a_locked_index_loads_the_backup_not_an_empty_index(self):
+        self._write(self._three())
+        self.write_backup(self._three()[:2])
+        with self._lock_the_first_read():
+            manager = im.IndexManager(self.index_path)
+        self.assertEqual(sorted(manager.series_index), ["Alpha", "Beta"])
+        self.assertEqual(manager.restored_from, "series_index.json.bak1")
+
+    def test_a_file_that_is_not_a_list_loads_the_backup(self):
+        self._write("just a string")
+        self.write_backup(self._three())
+        self.assertEqual(len(self._load().series_index), 3)
+
+    def test_one_entry_with_a_non_string_url_no_longer_empties_the_index(self):
+        """The repro: `"url": 123` raised inside validation, and that was everything."""
+        self._write([*self._three(), {"title": "Broken", "url": 123, "seasons": []}])
+        manager = self._load()
+        self.assertEqual(sorted(manager.series_index), ["Alpha", "Beta", "Gamma"])
+        self.assertIsNone(manager.unreadable)
+
+    def test_saving_over_an_unreadable_file_asks_and_n_leaves_it_alone(self):
+        raw = json.dumps(self._three(), ensure_ascii=False).replace("Alpha", "Grüße").encode("cp1252")
+        self._write_bytes(raw)
+        manager = self._load()
+        manager.series_index["New"] = self._series("New")
+        with mock.patch("builtins.input", side_effect=["n"]):
+            self.assertFalse(manager.save_index())
+        with open(self.index_path, "rb") as fh:
+            self.assertEqual(fh.read(), raw, "the unreadable file was written over")
+
+    def test_y_replaces_it_and_keeps_the_unreadable_file_as_bak1(self):
+        raw = json.dumps(self._three(), ensure_ascii=False).replace("Alpha", "Grüße").encode("cp1252")
+        self._write_bytes(raw)
+        manager = self._load()
+        with mock.patch("builtins.input", side_effect=["y"]):
+            self.assertTrue(manager.save_index())
+        with open(self.index_path + ".bak1", "rb") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_end_of_input_keeps_the_file(self):
+        self._write_bytes(b"\xff\xfe not text")
+        manager = self._load()
+        with mock.patch("builtins.input", side_effect=[EOFError]):
+            self.assertFalse(manager.save_index())
+        with open(self.index_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"\xff\xfe not text")
+
+    def test_a_one_series_run_after_a_locked_read_no_longer_truncates_the_index(self):
+        """The reported scenario, end to end: lock, no backup, a one-series save."""
+        self._write(self._three())
+        with self._lock_the_first_read():
+            manager = im.IndexManager(self.index_path)
+        self.assertEqual(dict(manager.series_index), {})
+        scrape = [self._series("Alpha")]
+        with (
+            mock.patch.object(im, "_prompt_change_confirmations", return_value=dict.fromkeys(_GATES, True)),
+            # "Save these changes?" y, then "Replace the index file anyway?" n.
+            mock.patch("builtins.input", side_effect=["y", "n"]),
+        ):
+            self.assertFalse(im.confirm_and_save_changes(scrape, "test", manager))
+        with open(self.index_path, encoding="utf-8") as fh:
+            self.assertEqual(sorted(entry["title"] for entry in json.load(fh)), ["Alpha", "Beta", "Gamma"])
+
+
+_GATES = (
+    "new_series",
+    "new_episodes",
+    "watched",
+    "unwatched",
+    "subscribe",
+    "unsubscribe",
+    "watchlist_add",
+    "watchlist_remove",
+    "title_ger",
+    "title_eng",
+    "episode_remove",
+    "season_remove",
+)
+
+
+class TestUnusableEntriesStayInTheFile(_IndexLoadCase):
+    """An entry the loader cannot use is set aside and written back, never deleted.
+
+    The loader used to drop such entries, and the next save wrote the index
+    without them: one corrupt season cost a series and all its other
+    seasons' watch history, without a word.
+    """
+
+    def _saved_titles(self):
+        with open(self.index_path, encoding="utf-8") as fh:
+            return sorted(
+                str(entry.get("title")) if isinstance(entry, dict) else repr(entry) for entry in json.load(fh)
+            )
+
+    def _load_and_save(self):
+        manager = self._load()
+        manager.save_index()
+        return manager
+
+    def test_a_series_with_one_corrupt_season_survives_the_next_save(self):
+        """The repro's "Beta": a good season 1 plus a season whose episodes are a dict."""
+        beta = self._series("Beta", watched=7)
+        beta["seasons"].append({"season": "Season 2", "episodes": {"1": {"watched": True}}})
+        self._write([self._series("Alpha"), beta])
+        manager = self._load_and_save()
+        self.assertEqual(sorted(manager.series_index), ["Alpha"])
+        self.assertEqual(self._saved_titles(), ["Alpha", "Beta"])
+        with open(self.index_path, encoding="utf-8") as fh:
+            saved_beta = next(entry for entry in json.load(fh) if entry["title"] == "Beta")
+        self.assertEqual(saved_beta, beta, "the set-aside entry must come back exactly as it was")
+
+    def test_a_blank_url_with_a_good_link_is_a_usable_entry(self):
+        """The repro's "Gamma", and the bs.to sibling's rule: either field names the series."""
+        gamma = self._series("Gamma")
+        gamma["link"], gamma["url"] = gamma["url"], ""
+        self._write([gamma])
+        self.assertEqual(sorted(self._load().series_index), ["Gamma"])
+
+    def test_seasons_null_no_longer_breaks_every_save(self):
+        self._write([self._series("Alpha"), {**self._series("Delta"), "seasons": None}])
+        self._load_and_save()
+        self.assertEqual(self._saved_titles(), ["Alpha", "Delta"])
+
+    def test_junk_elements_are_written_back_too(self):
+        self._write([self._series("Alpha"), "a bare string", 42])
+        self._load_and_save()
+        self.assertEqual(self._saved_titles(), ["'a bare string'", "42", "Alpha"])
+
+    def test_a_second_entry_with_the_same_title_and_link_is_kept(self):
+        """Keying kept only the later copy, so the next save deleted the other."""
+        first, second = self._series("Alpha", watched=9), self._series("Alpha", watched=2)
+        self._write([first, second])
+        self._load_and_save()
+        with open(self.index_path, encoding="utf-8") as fh:
+            watched = sorted(im.get_episode_counts(entry)[1] for entry in json.load(fh))
+        self.assertEqual(watched, [2, 9])
+
+    def test_the_user_is_told_which_entries_were_set_aside_and_why(self):
+        self._write([self._series("Alpha"), {**self._series("Delta"), "seasons": None}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self._load()
+        self.assertIn("Delta", out.getvalue())
+        self.assertIn("'seasons' is NoneType", out.getvalue())
+
+
+class TestASaveNeverOverwritesAnotherWritersChanges(_IndexLoadCase):
+    """A file rewritten since it was loaded is not quietly written over.
+
+    Two runs of the program, or a hand edit during a long scrape, each load
+    the index and save their own copy: the last save silently undid the
+    other's. The save now notices (modification time and size taken at load)
+    and asks; anything but y leaves the other writer's file as it is.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._write([self._series("Alpha"), self._series("Beta")])
+        self.session = self._load()
+        other = im.IndexManager(self.index_path)
+        other.series_index["Other"] = self._series("Other")
+        other.save_index()
+        self.session.series_index["Mine"] = self._series("Mine")
+
+    def _titles_on_disk(self):
+        with open(self.index_path, encoding="utf-8") as fh:
+            return sorted(entry["title"] for entry in json.load(fh))
+
+    def test_an_unchanged_file_saves_without_asking(self):
+        manager = self._load()
+        with mock.patch("builtins.input", side_effect=[]):
+            self.assertTrue(manager.save_index())
+
+    def test_n_keeps_the_other_writers_file(self):
+        with mock.patch("builtins.input", side_effect=["n"]):
+            self.assertFalse(self.session.save_index())
+        self.assertEqual(self._titles_on_disk(), ["Alpha", "Beta", "Other"])
+
+    def test_end_of_input_keeps_it_too(self):
+        with mock.patch("builtins.input", side_effect=[EOFError]):
+            self.assertFalse(self.session.save_index())
+        self.assertEqual(self._titles_on_disk(), ["Alpha", "Beta", "Other"])
+
+    def test_a_typo_is_asked_again_not_taken_as_an_answer(self):
+        with mock.patch("builtins.input", side_effect=["", "yes", "n"]) as feeder:
+            self.assertFalse(self.session.save_index())
+        self.assertEqual(feeder.call_count, 3)
+
+    def test_y_replaces_it_with_this_sessions_index(self):
+        with mock.patch("builtins.input", side_effect=["y"]):
+            self.assertTrue(self.session.save_index())
+        self.assertEqual(self._titles_on_disk(), ["Alpha", "Beta", "Mine"])
+
+    def test_the_question_names_what_the_file_gained(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("builtins.input", side_effect=["n"]):
+            self.session.save_index()
+        self.assertIn("changed on disk", out.getvalue())
+        self.assertIn("Other", out.getvalue())
+
+    def test_once_saved_the_next_save_does_not_ask_again(self):
+        with mock.patch("builtins.input", side_effect=["y"]):
+            self.session.save_index()
+        with mock.patch("builtins.input", side_effect=[]):
+            self.assertTrue(self.session.save_index())
+
+    def test_a_declined_save_at_the_end_of_a_scrape_leaves_the_manager_as_it_was(self):
+        before = dict(self.session.series_index)
+        with (
+            mock.patch.object(im, "_prompt_change_confirmations", return_value=dict.fromkeys(_GATES, True)),
+            mock.patch("builtins.input", side_effect=["y", "n"]),
+        ):
+            result = im.confirm_and_save_changes([self._series("Zeta")], "test", self.session)
+        self.assertFalse(result)
+        self.assertEqual(self.session.series_index, before)
+        self.assertEqual(self._titles_on_disk(), ["Alpha", "Beta", "Other"])
+
+
+class TestAFailedVerificationDoesNotSinkTheSave(QuietCase):
+    """The optional live check in the vanished table must not abort the run.
+
+    A failed sign-in there escaped into the run's catch-all, which threw away
+    the save that follows -- every approval of the run with it.
+    """
+
+    def test_the_table_still_runs_on_the_runs_own_data(self):
+        old = {"Gone": {"title": "Gone", "url": series_url("gone"), "link": series_url("gone"), "seasons": []}}
+        fresh = {"title": "Fresh", "url": series_url("fresh"), "link": series_url("fresh"), "seasons": []}
+
+        class _Scraper:
+            async def verify_vanished_and_candidates(self, *_args):
+                raise RuntimeError("Login failed — check credentials")
+
+        # Re-verify: y. Row "Gone": keep.
+        with mock.patch("builtins.input", side_effect=["y", "k"]) as feeder:
+            kept = im.show_vanished_series(old, set(), "all", new_data=[fresh], scraper=_Scraper())
+        self.assertEqual(kept, [("Gone", "not found on aniworld.to")])
+        self.assertEqual(feeder.call_count, 2)
+
+
 class TestASeriesPageThatIsNotMarkupIsAParseFailure(QuietCase):
     """A body lxml cannot build a tree from ends the series, and says so.
 
@@ -1632,3 +1914,469 @@ class TestASeriesPageThatIsNotMarkupIsAParseFailure(QuietCase):
         """The guard must reject only unparseable bodies, not thin ones."""
         result, _ = self._run("<html><body>ok</body></html>")
         self.assertNotIn("not markup", result.get("_error_reason", ""))
+
+
+# ── a fake site over real httpx ──────────────────────────────────────────────
+# The classes below drive the scraper through httpx.MockTransport rather than a
+# stub client: closing a client, retrying through _get and following the
+# active host are httpx behaviour, and a permissive double hides exactly that.
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+ANON_SERIES_HTML = site.SERIES_HTML.replace(site.LOGGED_IN, "")
+LOGIN_FORM = '<form action="/login" method="post"><input type="password" name="password"></form>'
+BAD_GATEWAY = "<html><head><title>502 Bad Gateway</title></head></html>"
+
+
+class _FakeSite:
+    """Login, one series and its seasons, served by an httpx.MockTransport.
+
+    `session` is whether the server still knows the session; a login POST
+    revives it unless `login_works` is False. `expire_after` series-page
+    requests end the session (a mid-run expiry). `fail_after_login` serves that
+    many 502s to the first requests after login number `from_login`, which is
+    where that login's own check lands. `faults` maps a URL to status codes
+    served, one per request, before that URL answers normally.
+    """
+
+    def __init__(self, *, session=True, login_works=True, expire_after=0, fail_after_login=0, from_login=1):
+        self.session = session
+        self.login_works = login_works
+        self.expire_after = expire_after
+        self.fail_after_login = fail_after_login
+        self.from_login = from_login
+        self.faults: dict[str, list[int]] = {}
+        self.requests: list[str] = []
+        self.posts = 0
+        self.series_requests = 0
+        self.series_path = urlparse(site.SERIES_URL).path
+
+    def handler(self, request):
+        url, path = str(request.url), request.url.path
+        self.requests.append(url)
+        codes = self.faults.get(url)
+        if codes:
+            return httpx.Response(codes.pop(0), text=BAD_GATEWAY)
+        if request.method == "POST":
+            self.posts += 1
+            self.session = self.session or self.login_works
+            return httpx.Response(200, text="")
+        if "login" in path:
+            return httpx.Response(200, text=LOGIN_FORM)
+        if self.posts >= self.from_login and self.fail_after_login:
+            self.fail_after_login -= 1
+            return httpx.Response(502, text=BAD_GATEWAY)
+        if path.rstrip("/") == self.series_path:
+            self.series_requests += 1
+            if self.expire_after and self.series_requests == self.expire_after:
+                self.session = False
+            return httpx.Response(200, text=site.SERIES_HTML if self.session else ANON_SERIES_HTML)
+        if path.startswith(self.series_path):
+            return httpx.Response(200, text=site.season_html(True, logged_in=self.session))
+        return httpx.Response(200, text=site.SERIES_HTML if self.session else ANON_SERIES_HTML)
+
+    def client(self, *args, **kwargs):
+        """A real AsyncClient on this site; takes and ignores the scraper's own settings."""
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(self.handler), follow_redirects=True)
+
+
+def _no_backoff(case):
+    """Retries without the real back-off, so a retried 502 costs no wall time."""
+    patcher = mock.patch.object(sc, "_BACKOFF_BASE", 0.0)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
+def _series_infos(count):
+    """`count` queue entries that all read the fake site's one series."""
+    path = urlparse(site.SERIES_URL).path
+    return [{"url": site.SERIES_URL, "link": f"{path}#{n}", "title": f"Series {n}"} for n in range(count)]
+
+
+class TestAFailedReloginKeepsTheSharedSession(QuietCase):
+    """A re-login that failed its check used to close the session every worker shares.
+
+    _login_client closed the client it was handed when the check page did not
+    read as logged in -- and mid-run that client is the pool's one session.
+    Every remaining series then failed with "Cannot send a request, as the
+    client has been closed", and one 502 on the check page was enough, since
+    the check was a single bare GET.
+    """
+
+    def setUp(self):
+        super().setUp()
+        _no_backoff(self)
+
+    def _relogin(self, fake):
+        client = fake.client()
+        scraper = SCRAPER_CLS()
+        recovered = asyncio.run(scraper._relogin_shared_client(client))
+        return recovered, client
+
+    def test_one_bad_gateway_on_the_check_page_is_retried(self):
+        recovered, client = self._relogin(_FakeSite(session=False, fail_after_login=1))
+        self.assertTrue(recovered, "a single 502 on the check page failed the re-login")
+        self.assertFalse(client.is_closed)
+
+    def test_a_login_that_did_not_take_leaves_the_session_open(self):
+        recovered, client = self._relogin(_FakeSite(session=False, login_works=False))
+        self.assertFalse(recovered)
+        self.assertFalse(client.is_closed, "the failed re-login closed the shared session")
+
+    def test_a_failed_first_login_still_closes_its_own_client(self):
+        """The client a fresh login built is nobody else's, so it is still closed."""
+        fake = _FakeSite(session=False, login_works=False)
+        built = []
+
+        def factory(*args, **kwargs):
+            built.append(fake.client())
+            return built[-1]
+
+        with mock.patch.object(sc.httpx, "AsyncClient", factory), self.assertRaises(RuntimeError):
+            asyncio.run(SCRAPER_CLS()._create_logged_in_client())
+        self.assertTrue(built and built[0].is_closed)
+
+    def test_a_mid_run_expiry_no_longer_fails_the_rest_of_the_run(self):
+        # The pool's own login is the first; the 502 lands on the re-login's check.
+        fake = _FakeSite(expire_after=3, fail_after_login=1, from_login=2)
+
+        async def pool_client(self_, verify=True):
+            client = fake.client()
+            await self_._login_client(client, verify=verify)
+            return client
+
+        scraper = SCRAPER_CLS()
+        with mock.patch.object(SCRAPER_CLS, "_create_logged_in_client", pool_client):
+            asyncio.run(scraper._scrape_list(_series_infos(12), num_workers=4))
+
+        reasons = [entry["reason"] for entry in scraper.failed_links]
+        self.assertFalse([r for r in reasons if "closed" in r], reasons)
+        self.assertEqual(len(scraper.series_data), 12, reasons)
+
+
+class TestAPoolThatCannotLogInStopsTheRun(QuietCase):
+    """Every worker used to retry the login on its own and then quietly return.
+
+    With 16 workers that was 32 logins in a burst, and then a run that
+    "finished" with the queue untouched and nothing on the failed list. A
+    resumed run went on to merge its old checkpoint, report the scrape
+    complete and delete the checkpoint.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.attempts = 0
+
+        async def failing_login(_self, verify=True):
+            self.attempts += 1
+            raise RuntimeError("Login failed - check credentials")
+
+        async def no_wait(*_args, **_kwargs):
+            return None
+
+        for target, name, value in (
+            (SCRAPER_CLS, "_create_logged_in_client", failing_login),
+            (sc.asyncio, "sleep", no_wait),
+        ):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self._d = tempfile.TemporaryDirectory()
+        self.addCleanup(self._d.cleanup)
+
+    def _scraper(self):
+        scraper = SCRAPER_CLS()
+        scraper.checkpoint_file = os.path.join(self._d.name, ".scrape_checkpoint.json")
+        scraper.failed_file = os.path.join(self._d.name, ".failed_series.json")
+        scraper.ignore_file = os.path.join(self._d.name, ".ignored_series.json")
+        scraper.pause_file = os.path.join(self._d.name, ".pause_scraping")
+        return scraper
+
+    def test_the_login_error_ends_the_run(self):
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._scraper()._scrape_list(_series_infos(40), num_workers=16))
+
+    def test_the_pool_logs_in_once_and_retries_once(self):
+        with contextlib.suppress(RuntimeError):
+            asyncio.run(self._scraper()._scrape_list(_series_infos(40), num_workers=16))
+        self.assertEqual(self.attempts, 2)
+
+    def test_work_from_before_the_failure_is_kept(self):
+        scraper = self._scraper()
+        resumed = {"title": "Done earlier", "link": "/done", "url": series_url("done"), "total_episodes": 3}
+        scraper.series_data = [resumed]
+        with contextlib.suppress(RuntimeError):
+            asyncio.run(scraper._scrape_list(_series_infos(5), num_workers=4))
+        self.assertEqual(scraper.series_data, [resumed])
+        self.assertEqual(scraper.attempted_urls, set(), "nothing was attempted, so nothing may look done")
+
+    def test_run_raises_and_keeps_the_checkpoint_for_a_resume(self):
+        scraper = self._scraper()
+        scraper.series_data = [
+            {"title": "Done earlier", "link": "/done", "url": series_url("done"), "total_episodes": 3}
+        ]
+        scraper.completed_links = {"/done"}
+
+        async def run_pool(**_kwargs):
+            await scraper._scrape_list(_series_infos(5), num_workers=4)
+
+        scraper._async_run = run_pool  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            scraper.run(resume_only=False)
+        with open(scraper.checkpoint_file, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual([s["title"] for s in saved["series_data"]], ["Done earlier"])
+
+    def test_an_empty_series_recheck_that_cannot_log_in_keeps_the_run(self):
+        """The re-check after a finished scrape used to raise and lose the save."""
+        empty = [{"title": "Empty", "link": "/empty", "url": series_url("empty"), "total_episodes": 0}]
+        self.assertEqual(asyncio.run(self._scraper()._rescrape_empty_series(empty)), empty)
+
+
+class TestVanishedCheckTellsGoneFromUnknown(QuietCase):
+    """One 502 used to be reported as "the series really is gone".
+
+    verify_series_url made one bare GET, no retry, no pacing, and anything but
+    a served page came back as not reachable -- which the vanished prompt
+    announces as gone, right before the user decides whether to delete.
+    """
+
+    def setUp(self):
+        super().setUp()
+        _no_backoff(self)
+
+    def _verdict(self, statuses):
+        fake = _FakeSite()
+        fake.faults[site.SERIES_URL] = list(statuses)
+        with mock.patch.object(sc.httpx, "AsyncClient", fake.client):
+            verified, _ = asyncio.run(SCRAPER_CLS().verify_vanished_and_candidates([("Show", site.SERIES_URL)], []))
+        return verified[0][2]
+
+    def test_one_bad_gateway_is_retried_not_reported_gone(self):
+        self.assertIs(self._verdict([502]), True)
+
+    def test_a_site_that_keeps_failing_is_unknown_not_gone(self):
+        self.assertIsNone(self._verdict([502] * sc._MAX_ATTEMPTS))
+
+    def test_a_series_the_site_says_is_missing_is_gone(self):
+        self.assertIs(self._verdict([404]), False)
+
+    def test_the_prompt_does_not_call_an_unknown_gone(self):
+        class _Unknown:
+            async def verify_vanished_and_candidates(self, vanished, candidates):
+                return [(title, url, None) for title, url in vanished], []
+
+        row = {"v_title": "Old Title", "v_url": series_url("old"), "new_entry": None}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(im._rescrape_row(row, _Unknown(), {}))
+        self.assertIn("could not be checked", out.getvalue())
+        self.assertNotIn("really is gone", out.getvalue())
+        self.assertEqual(row["v_title"], "Old Title")
+
+
+class TestAMirrorRunReadsTheMirror(QuietCase):
+    """A run on a mirror used to send every series request to the primary.
+
+    Login and catalogue followed the active host, but the series and season
+    pages were fetched from the stored URL, which always names SITE_URL. With
+    the primary down -- the reason a mirror is active at all -- every series
+    failed; with it up, the mirror's session cookie never went there and every
+    page read logged out.
+    """
+
+    PRIMARY, MIRROR = SITE_URLS[0], SITE_URLS[1]
+
+    def _scrape(self, active):
+        hosts = []
+        fake = _FakeSite()
+        primary_host = urlparse(self.PRIMARY).netloc
+
+        def handler(request):
+            hosts.append(request.url.host)
+            if active != self.PRIMARY and request.url.host == primary_host:
+                raise httpx.ConnectError("the primary is down", request=request)
+            return fake.handler(request)
+
+        scraper = SCRAPER_CLS()
+        scraper.site_url = active
+        path = urlparse(site.SERIES_URL).path
+        info = {"url": f"{self.PRIMARY}{path}", "link": path, "title": "Test Series"}
+        client = _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), follow_redirects=True)
+        try:
+            result = asyncio.run(scraper._scrape_one_series(client, info))
+        finally:
+            asyncio.run(client.aclose())
+        return result, hosts, info
+
+    def test_series_and_season_pages_come_from_the_active_host(self):
+        result, hosts, _info = self._scrape(self.MIRROR)
+        self.assertFalse(result.get("_error"), result.get("_error_reason"))
+        self.assertEqual(set(hosts), {urlparse(self.MIRROR).netloc}, hosts)
+
+    def test_the_stored_urls_stay_canonical(self):
+        """The index reads the same whichever mirror a run went through."""
+        result, _hosts, info = self._scrape(self.MIRROR)
+        self.assertFalse(result.get("_error"), result.get("_error_reason"))
+        self.assertTrue(result["seasons"])
+        self.assertEqual(result["url"], info["url"])
+        for season in result["seasons"]:
+            self.assertTrue(season["url"].startswith(self.PRIMARY), season["url"])
+
+    def test_the_primary_is_still_read_when_it_is_active(self):
+        result, hosts, _info = self._scrape(self.PRIMARY)
+        self.assertFalse(result.get("_error"))
+        self.assertEqual(set(hosts), {urlparse(self.PRIMARY).netloc})
+
+    def test_a_url_on_a_host_this_program_does_not_know_is_left_alone(self):
+        self.assertEqual(
+            sc._on_host("https://example.test/anime/stream/x", self.MIRROR), "https://example.test/anime/stream/x"
+        )
+
+
+class TestAnAccountPageThatFailsIsNotAnEmptyOne(QuietCase):
+    """A timeout on one account page used to be logged and skipped.
+
+    The list that came back short was then the evidence for "no longer on the
+    watchlist" (main._inject_disappeared_series): every watchlist-only series
+    was offered for un-flagging because one page did not load.
+    """
+
+    PAGE = (
+        f"<html><body>{site.LOGGED_IN}<div class='seriesListContainer'>"
+        "<div><a href='/anime/stream/sub-a'><h3>Sub A</h3></a></div></div></body></html>"
+    )
+
+    def setUp(self):
+        super().setUp()
+        _no_backoff(self)
+
+    def _fetch(self, watchlist):
+        def handler(request):
+            if request.url.path.endswith("/watchlist"):
+                return watchlist(request)
+            return httpx.Response(200, text=self.PAGE)
+
+        async def go():
+            async with _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler)) as client:
+                return await SCRAPER_CLS()._get_account_series(client, source="both")
+
+        return asyncio.run(go())
+
+    def test_a_page_that_never_loads_stops_the_run(self):
+        def timeout(request):
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._fetch(timeout)
+        self.assertIn("Watchlist", str(caught.exception))
+
+    def test_a_page_that_fails_once_is_retried(self):
+        answers = [httpx.Response(502, text=BAD_GATEWAY)]
+
+        def flaky(request):
+            return answers.pop(0) if answers else httpx.Response(200, text=self.PAGE)
+
+        self.assertEqual([s["link"] for s in self._fetch(flaky)], ["/anime/stream/sub-a"])
+
+
+class TestTheStartupCheckKeepsThePasswordOffPlainHttp(QuietCase):
+    """The startup check used to log in to every host that answered.
+
+    That included the plain-HTTP IP fallback, on every start, with the HTTPS
+    hosts serving fine -- the account password went out in cleartext each
+    time the program was opened. An HTTP host is now signed in to only when
+    no HTTPS host served, and only after an explicit yes.
+    """
+
+    HOSTS = ["https://a.test", "https://b.test", "http://c.test"]
+
+    def setUp(self):
+        super().setUp()
+        previous = getattr(main, "ACTIVE_SITE_URL", None)
+        self.addCleanup(setattr, main, "ACTIVE_SITE_URL", previous)
+
+    def _check(self, served, answers):
+        logged_into = []
+        asked = []
+
+        def fake_probe(scraper, site_urls):
+            return [{"site_url": url, "ok": True, "status_code": 200} for url in site_urls]
+
+        def fake_fetch(scraper, site_urls):
+            logged_into.extend(site_urls)
+            return {url: ((10, {"a"}) if served.get(url) else (None, set())) for url in site_urls}
+
+        limit = len(answers) + 1
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            # Bounded: a prompt that kept asking after end of input fails here
+            # instead of hanging the suite.
+            if len(asked) > limit:
+                raise AssertionError(f"asked again after end of input: {prompt!r}")
+            if not answers:
+                raise EOFError
+            return answers.pop(0)
+
+        idx = mock.Mock()
+        idx.series_index = {}
+        scraper = SCRAPER_CLS()
+        out = io.StringIO()
+        with (
+            mock.patch.object(main, "SITE_URLS", self.HOSTS),
+            mock.patch.object(main, "_probe_hosts", fake_probe),
+            mock.patch.object(main, "_fetch_catalogue_info_for_hosts", fake_fetch),
+            mock.patch.object(main, "_wait_before_host_retry", lambda *a, **k: False),
+            mock.patch("builtins.input", fake_input),
+            contextlib.redirect_stdout(out),
+        ):
+            main._probe_sites_before_scrape(scraper, idx_mgr=idx)
+        return scraper.site_url, logged_into, asked, out.getvalue()
+
+    def test_with_an_https_host_serving_http_is_never_logged_in_to_or_asked_about(self):
+        active, logged_into, asked, out = self._check(dict.fromkeys(self.HOSTS, True), [])
+        self.assertNotIn(self.HOSTS[2], logged_into)
+        self.assertEqual(asked, [])
+        self.assertEqual(active, self.HOSTS[0])
+        self.assertIn("SKIPPED (HTTP)", out)
+
+    def test_no_keeps_the_password_off_the_wire(self):
+        active, logged_into, asked, _out = self._check({self.HOSTS[2]: True}, ["n"])
+        self.assertNotIn(self.HOSTS[2], logged_into)
+        self.assertEqual(len(asked), 1)
+        self.assertFalse(active.startswith("http://"), active)
+
+    def test_end_of_input_counts_as_no(self):
+        active, logged_into, _asked, _out = self._check({self.HOSTS[2]: True}, [])
+        self.assertNotIn(self.HOSTS[2], logged_into)
+        self.assertFalse(active.startswith("http://"), active)
+
+    def test_a_typo_is_asked_again(self):
+        _active, logged_into, asked, _out = self._check({self.HOSTS[2]: True}, ["yes", "n"])
+        self.assertEqual(len(asked), 2)
+        self.assertNotIn(self.HOSTS[2], logged_into)
+
+    def test_an_explicit_yes_uses_the_http_host(self):
+        active, logged_into, _asked, _out = self._check({self.HOSTS[2]: True}, ["y"])
+        self.assertIn(self.HOSTS[2], logged_into)
+        self.assertEqual(active, self.HOSTS[2])
+
+
+class TestTheProbeLooksLikeABrowser(QuietCase):
+    """The probe went out with httpx's own "python-httpx" User-Agent.
+
+    That is the first thing a bot filter turns away, and a host that refuses
+    the probe is never used, however well it would have served the session.
+    Both sibling scrapers already sent the browser agent here.
+    """
+
+    def test_the_probe_sends_the_scrapers_user_agent(self):
+        seen = {}
+
+        def factory(*args, **kwargs):
+            seen.update(kwargs)
+            return _RecordingClient([], _CannedResponse(200, LOGIN_FORM))
+
+        with mock.patch.object(sc.httpx, "AsyncClient", factory):
+            asyncio.run(SCRAPER_CLS()._probe_one_site("https://probe.test"))
+        self.assertEqual(seen.get("headers", {}).get("User-Agent"), sc.UA)

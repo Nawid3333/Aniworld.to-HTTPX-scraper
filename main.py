@@ -8,7 +8,6 @@ No browser needed — uses httpx async HTTP client.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import json
 import logging
@@ -36,13 +35,14 @@ from config.config import (
     ensure_env_file,
 )
 from src import genre_stats, term
+from src.atomic_io import atomic_write_json
 from src.index_manager import (
     IndexManager,
     _extract_slug_from_field,
     _is_valid_series_url,
     confirm_and_save_changes,
     get_episode_counts,
-    remove_series_from_index,
+    replace_critical_series,
     show_vanished_series,
 )
 from src.scraper import AniWorldScraper, ScrapingPausedError
@@ -64,11 +64,19 @@ def _host_label(site_url):
     return urlparse(site_url).netloc
 
 
+def _status_text(status):
+    """A host's Status cell: OK/FAILED for a bool, or the given text as it is."""
+    if isinstance(status, str):
+        return status
+    return "OK" if status else "FAILED"
+
+
 def _format_host_rows(hosts):
     """Return a list of table-formatted host status lines.
 
     hosts is a list of (label, status, count, idx_count, missing_count,
-    compare_txt) tuples.
+    compare_txt) tuples. status is a bool (OK/FAILED) or a short text for a
+    host that was deliberately not checked.
     """
     if not hosts:
         return []
@@ -79,7 +87,7 @@ def _format_host_rows(hosts):
     labels = ["Host", "Status", "Series", "Index", "Index only", "Compare"]
     cols = {
         "host": max([len(str(label)) for label, *_ in hosts] + [len(labels[0])]),
-        "status": max([len("OK" if status else "FAILED") for _, status, *_ in hosts] + [len(labels[1])]),
+        "status": max([len(_status_text(status)) for _, status, *_ in hosts] + [len(labels[1])]),
         "series": max([len(f"{count:,}") if count is not None else 1 for _, _, count, *_ in hosts] + [len(labels[2])]),
         "index": max(
             [len(f"{idx_count:,}") if idx_count is not None else 1 for _, _, _, idx_count, *_ in hosts]
@@ -131,7 +139,7 @@ def _format_host_rows(hosts):
     ]
 
     for label, status, count, idx_count, missing_count, compare_txt in hosts:
-        status_txt = "OK" if status else "FAILED"
+        status_txt = _status_text(status)
         count_txt = f"{count:,}" if count is not None else "-"
         idx_txt = f"{idx_count:,}" if idx_count is not None else "-"
         missing_txt = f"{missing_count:,}" if missing_count is not None else "-"
@@ -288,7 +296,10 @@ def _collect_index_slugs(idx_mgr):
     index_slugs_list = []
     index_entries_without_slug = []
     for title, s in idx_mgr.series_index.items():
-        slug = _extract_slug_from_field(s.get("url", "") or s.get("link", ""))
+        # Link first, like show_vanished_series and both sibling scrapers.
+        # Reading "url" first put an entry whose two fields disagree under
+        # one slug in this report and another everywhere it is acted on.
+        slug = _extract_slug(s)
         if slug:
             index_slugs_list.append(slug)
         else:
@@ -410,7 +421,12 @@ def _remove_duplicate_index_entries(idx_mgr, index_duplicates):
         print("\n    No entries removed.")
         return
 
-    idx_mgr.save_index()
+    if not idx_mgr.save_index():
+        # The file on disk was not what was loaded and the user kept it, so
+        # the in-memory deletions go too: reload what is actually there.
+        idx_mgr.load_index()
+        print("\n    No entries removed.")
+        return
     print(f"\n    Removed {len(removed_titles)} duplicate entry(s).")
     if cleared_slugs:
         print(f"    {len(cleared_slugs)} slug(s) now have no entry - run 'Scrape only NEW anime' to add them back.")
@@ -485,6 +501,30 @@ def _cross_check_index(scraper, site_url, count, idx_mgr=None, site_slugs=None):
     return idx_count, compare_txt, report_entry
 
 
+def _is_plain_http(site_url):
+    """True for a host reached over unencrypted HTTP, such as the IP fallback."""
+    return urlparse(site_url).scheme == "http"
+
+
+def _confirm_plain_http_login(hosts):
+    """Ask before the password goes anywhere over unencrypted HTTP; True only on y.
+
+    The startup check logs in to every host it counts, and it used to count
+    every host that answered -- the plain-HTTP IP fallback included, on every
+    start, with the HTTPS hosts working fine. That posted the account password
+    in cleartext each time the program was opened. An HTTP host is now only
+    logged in to when no HTTPS host served, and only after this explicit yes;
+    n, end of input or a run of unusable answers keep the password off the
+    wire.
+    """
+    names = ", ".join(_host_label(host) for host in hosts)
+    print("\n" + term.danger("⚠ No HTTPS host served its series list."))
+    print(f"  Reachable over plain HTTP only: {names}")
+    print("  Logging in there sends your aniworld.to email and password UNENCRYPTED --")
+    print("  anyone on the network path between you and that host can read them.")
+    return term.confirm(term.danger("Log in over unencrypted HTTP?") + term.dim(" (y/n): "))
+
+
 def _probe_sites_before_scrape(scraper, idx_mgr=None):
     """Probe configured hosts, show OK/FAILED, and set active site URL.
 
@@ -508,15 +548,25 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
 
     print("\n→ Checking host availability...\n")
     attempt = 0
+    # None until asked; asked at most once per check -- see _confirm_plain_http_login.
+    plain_http_allowed = None
     while True:
         results = _probe_hosts(scraper, site_urls)
 
         probe_by_url = {r.get("site_url"): r for r in results}
         ok_hosts = [url for url in site_urls if probe_by_url.get(url, {}).get("ok")]
-        # Every reachable host's catalogue in one concurrent round. Unreachable
-        # hosts are left out, so a dead mirror still costs only its probe
-        # rather than a second full timeout.
-        catalogue = _fetch_catalogue_info_for_hosts(scraper, ok_hosts)
+        secure_hosts = [url for url in ok_hosts if not _is_plain_http(url)]
+        plain_hosts = [url for url in ok_hosts if _is_plain_http(url)]
+        # Every reachable HTTPS host's catalogue in one concurrent round.
+        # Unreachable hosts are left out, so a dead mirror still costs only its
+        # probe rather than a second full timeout. A plain-HTTP host is only
+        # logged in to when no HTTPS host served, and only with the user's yes.
+        catalogue = _fetch_catalogue_info_for_hosts(scraper, secure_hosts)
+        if plain_hosts and not any(count is not None for count, _ in catalogue.values()):
+            if plain_http_allowed is None:
+                plain_http_allowed = _confirm_plain_http_login(plain_hosts)
+            if plain_http_allowed:
+                catalogue.update(_fetch_catalogue_info_for_hosts(scraper, plain_hosts))
 
         # A site under maintenance answers 500 for a while and then comes
         # back. Every host failing used to drop straight into the menu with
@@ -530,6 +580,10 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         attempt += 1
         print("\n→ Checking host availability again...\n")
 
+    # The hosts this check actually signed in to. A plain-HTTP host the user
+    # did not clear stays out of every choice below, so the scrape cannot end
+    # up logging in to it after all.
+    logged_in_hosts = secure_hosts + (plain_hosts if plain_http_allowed else [])
     host_counts = {}
     table_rows = []
     host_reports = []
@@ -557,7 +611,10 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         # OK means the host served its series list. Answering the probe is not
         # enough: a host under maintenance answers it and then fails the login
         # with a 500, and the table used to show that host as OK.
-        table_rows.append((label, count is not None, count, idx_count, missing_count, compare_txt))
+        status = count is not None
+        if ok and site_url not in logged_in_hosts:
+            status = "SKIPPED (HTTP)"
+        table_rows.append((label, status, count, idx_count, missing_count, compare_txt))
 
     for line in _format_host_rows(table_rows):
         print(line)
@@ -580,8 +637,8 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
     # are already in hand by this point, so reachability alone is the wrong
     # test. Falls back to the probe order when no host served, which is what
     # this did before.
-    serving_hosts = [url for url in ok_hosts if host_counts.get(url) is not None]
-    preferred = serving_hosts or ok_hosts
+    serving_hosts = [url for url in logged_in_hosts if host_counts.get(url) is not None]
+    preferred = serving_hosts or logged_in_hosts
 
     if preferred:
         scraper.site_url = preferred[0]
@@ -592,9 +649,9 @@ def _probe_sites_before_scrape(scraper, idx_mgr=None):
         scraper.site_url = SITE_URL
         print(f"\n→ Active host: {scraper.site_url} (default)")
 
-    if len(ok_hosts) >= 2:
-        counts = [host_counts.get(host) for host in ok_hosts if host_counts.get(host) is not None]
-        if len(counts) == len(ok_hosts) and counts:
+    if len(logged_in_hosts) >= 2:
+        counts = [host_counts.get(host) for host in logged_in_hosts if host_counts.get(host) is not None]
+        if len(counts) == len(logged_in_hosts) and counts:
             match = all(count == counts[0] for count in counts[1:])
             print(f"→ Cross-host counts: match = {match}")
         else:
@@ -623,25 +680,24 @@ def _check_checkpoint(expected_mode):
     if checkpoint_mode is None:
         return {"ok": True, "resume": False}
 
-    checkpoint_file = os.path.join(DATA_DIR, ".scrape_checkpoint.json")
     saved_label = _MODE_LABELS.get(checkpoint_mode, checkpoint_mode)
     expected_label = _MODE_LABELS.get(expected_mode, expected_mode)
 
+    # discard_checkpoint removes the checkpoint's journal along with it, so a
+    # later resume cannot pick up results from the run thrown away here.
     if checkpoint_mode == expected_mode:
         print(f'\n⚠ Checkpoint found from a previous "{saved_label}" run!\n')
         if term.confirm("Resume from checkpoint? (y/n): "):
             return {"ok": True, "resume": True}
         if term.confirm(term.danger("Discard old checkpoint and start fresh?") + term.dim(" (y/n): ")):
-            with contextlib.suppress(OSError):
-                os.remove(checkpoint_file)
+            AniWorldScraper.discard_checkpoint(DATA_DIR)
             return {"ok": True, "resume": False}
         return {"ok": False, "resume": False}
 
     print(f'\n⚠ A checkpoint exists from a different mode: "{saved_label}"')
     print(f'   You are about to run: "{expected_label}"\n')
     if term.confirm(term.danger("Discard the old checkpoint and continue?") + term.dim(" (y/n): ")):
-        with contextlib.suppress(OSError):
-            os.remove(checkpoint_file)
+        AniWorldScraper.discard_checkpoint(DATA_DIR)
         return {"ok": True, "resume": False}
     return {"ok": False, "resume": False}
 
@@ -805,7 +861,9 @@ def print_completed_series_alerts(index_manager=None, allow_rescrape=True):
             else:
                 print(f"\n→ Rescraping {len(urls)} unsubscribed anime...")
                 _run_scrape_and_save(
-                    run_kwargs={"url_list": urls, "parallel": False},
+                    # No checkpoint: this runs inside another action, and the
+                    # file on disk may hold a paused run the user still wants.
+                    run_kwargs={"url_list": urls, "parallel": False, "checkpoint": False},
                     description=f"Rescrape unsubscribed anime ({len(urls)})",
                     success_msg=f"Rescrape completed! {len(urls)} anime updated.",
                     no_data_msg="No data scraped",
@@ -866,8 +924,14 @@ def show_menu():
     print("  0. Exit\n")
 
 
-def _load_ignored_vanished():
-    """Load slugs the user has chosen not to delete."""
+def _read_ignored_vanished():
+    """Return the slugs the user has chosen not to delete, or None if the file cannot be read.
+
+    None, not an empty set, so a caller about to write the file back can
+    tell "nothing ignored" from "could not read it": adding to an empty set
+    and saving would replace every slug the user ever chose to ignore with
+    only the new ones.
+    """
     path = os.path.join(DATA_DIR, "ignored_vanished.json")
     if not os.path.exists(path):
         return set()
@@ -878,19 +942,34 @@ def _load_ignored_vanished():
             return slug_keys(data)
         if isinstance(data, dict):
             return slug_keys(data.get("slugs", []))
-    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Ignored vanished file holds a %s, not a list of slugs", type(data).__name__)
+    except (ValueError, OSError) as exc:
         logger.warning("Could not read ignored vanished file: %s", exc)
-    return set()
+    return None
+
+
+def _load_ignored_vanished():
+    """Load slugs the user has chosen not to delete; empty if the file cannot be read."""
+    ignored = _read_ignored_vanished()
+    return set() if ignored is None else ignored
 
 
 def _save_ignored_vanished(slugs):
-    """Persist slugs the user has chosen not to delete."""
+    """Persist slugs the user has chosen not to delete; True once written.
+
+    Written through atomic_write_json like every other data file. A plain
+    open("w") emptied the file before writing it, so a crash or a full disk
+    in between left it empty or cut short -- and the next load read that as
+    "nothing is ignored" and asked about every entry again.
+    """
     path = os.path.join(DATA_DIR, "ignored_vanished.json")
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"slugs": sorted(slugs)}, f, indent=2, ensure_ascii=False)
+        atomic_write_json(path, {"slugs": sorted(slugs)})
     except OSError as exc:
         logger.warning("Could not save ignored vanished file: %s", exc)
+        print(f"  ✗ Could not save {os.path.basename(path)}: {exc}")
+        return False
+    return True
 
 
 def _extract_slug_for_suggest(series):
@@ -1026,10 +1105,14 @@ def _prompt_clean_vanished(idx_mgr: IndexManager | None = None, scraper=None, se
     kept_titles = {title for title, _ in kept}
     kept_slugs = {slug for slug, title in title_by_slug.items() if title in kept_titles}
     if kept_slugs and term.confirm(f"\nStop reporting the {len(kept_slugs)} kept entry(s) as vanished? (y/n): "):
-        ignored = _load_ignored_vanished()
-        ignored.update(kept_slugs)
-        _save_ignored_vanished(ignored)
-        print(f"  Ignored {len(kept_slugs)} vanished slug(s) — will not prompt again.")
+        ignored = _read_ignored_vanished()
+        if ignored is None:
+            print("  ✗ ignored_vanished.json could not be read, so it was left as it is.")
+            print("    Repair or delete it; these entries are asked about again next time.")
+        else:
+            ignored.update(kept_slugs)
+            if _save_ignored_vanished(ignored):
+                print(f"  Ignored {len(kept_slugs)} vanished slug(s) — will not prompt again.")
 
     if removed:
         logger.info("Removed %d vanished anime from index after scrape: %s", removed, titles[:10])
@@ -1067,6 +1150,18 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
                 return key
         for key, label in all_items:
             if text in label.lower():
+                return key
+        return None
+
+    def _resolve_exact(text: str) -> str | None:
+        """Only a listed label or the back answer; see the non-tty fallback."""
+        text = text.strip().lower()
+        if not text:
+            return None
+        if allow_back and text in ("0", "back"):
+            return back_key
+        for key, label in all_items:
+            if label.lower() == text:
                 return key
         return None
 
@@ -1189,13 +1284,26 @@ def _prompt_genre_choice(choices: dict[str, str], *, allow_back: bool = True) ->
     if selected is not None:
         return selected
 
-    # Fallback for non-tty or unsupported terminals.
-    while True:
-        answer = input("Enter genre name (0 = back): ").strip()
-        selected = _resolve(answer)
+    # Fallback for non-tty or unsupported terminals. Stricter than the live
+    # picker above, which shows the match it will take before Enter: with no
+    # preview, a fragment is a guess, so only a listed label (any case) or the
+    # back answer counts. End of input or MAX_UNRECOGNIZED misses give the
+    # answer that shows nothing new -- back, or every genre where there is no
+    # back. This loop used to run forever and let EOFError escape.
+    safe = back_key if allow_back else "all"
+    hint = "type a genre exactly as listed" + (", or 0 to go back" if allow_back else "")
+    for _ in range(term.MAX_UNRECOGNIZED):
+        try:
+            answer = input("Enter genre name" + (" (0 = back)" if allow_back else "") + ": ").strip()
+        except EOFError:
+            print("  -> No input available; going back.")
+            return safe
+        selected = _resolve_exact(answer)
         if selected is not None:
             return selected
-        print("✗ No genre matched. Please try again.")
+        print(f"✗ No genre matched - {hint}.")
+    print(f"  ⚠ No usable answer after {term.MAX_UNRECOGNIZED} tries; going back.")
+    return safe
 
 
 def _suggest_something_to_watch(idx_mgr: _IndexLike | None = None):
@@ -1295,6 +1403,7 @@ def _run_scrape_and_save(
     pre_save_hook=None,
     vanished_scope=None,
     post_scrape_allow_rescrape=True,
+    replace_entries=None,
 ):
     """Common pattern: create scraper, run, confirm & save, handle errors.
 
@@ -1304,6 +1413,9 @@ def _run_scrape_and_save(
         vanished_scope: Override scope for show_vanished_series (default: auto-detect).
         post_scrape_allow_rescrape: If False, suppress the rescrape prompt
                                     after the scrape (used during recursive rescrapes).
+        replace_entries: Index entries the integrity check chose to rescrape.
+                         What the run reads is offered as their replacement
+                         (replace_critical_series) instead of being merged.
     """
     pre_index = IndexManager(SERIES_INDEX_FILE) if pre_save_hook else None
     t_start = time.perf_counter()
@@ -1323,7 +1435,12 @@ def _run_scrape_and_save(
         # (e.g. all retries failing again) is misreported as a success below.
         successful_data = [s for s in scraper.series_data if isinstance(s, dict) and not s.get("_error")]
 
-        if successful_data:
+        if successful_data and replace_entries is not None:
+            # The integrity check's rescrape: the merge already ran for the
+            # rest of the outer run, so this only offers each re-read series
+            # in place of its entry. Series that failed again keep theirs.
+            replace_critical_series(replace_entries, successful_data, SERIES_INDEX_FILE)
+        elif successful_data:
             if pre_save_hook:
                 pre_save_hook(scraper, pre_index)
 
@@ -1365,17 +1482,24 @@ def _run_scrape_and_save(
                 active_site_url=ACTIVE_SITE_URL,
             )
             if isinstance(result, dict) and result.get("rescrape"):
-                # User already confirmed deletion in the integrity dialog — proceed directly
+                # Rescrape first, replace after: the critical series stay in
+                # the index until each one has been read again and the user
+                # has approved its swap (replace_critical_series). Deleting
+                # them up front lost them for good whenever the rescrape
+                # failed or its prompts were declined.
                 n = len(result["urls"])
-                print(f"\n→ Deleting {n} critical series from index before rescraping...")
-                remove_series_from_index(SERIES_INDEX_FILE, result["series"])
-                print(f"\n→ Rescraping {n} critical series...\n")
+                print(f"\n→ Rescraping {n} critical series (they stay in the index until you approve a swap)...\n")
                 _run_scrape_and_save(
-                    run_kwargs={"url_list": result["urls"], "parallel": False},
+                    # No checkpoint: a rescrape nested in this call must not
+                    # replace or delete the outer run's -- a paused run's
+                    # checkpoint used to vanish here while the outer call
+                    # still reported it preserved.
+                    run_kwargs={"url_list": result["urls"], "parallel": False, "checkpoint": False},
                     description=f"Rescrape critical series ({n})",
                     success_msg=f"Critical series rescraping completed! {n} series updated.",
-                    no_data_msg="No data scraped for critical series",
+                    no_data_msg="No data scraped for critical series -- they stay in the index unchanged",
                     post_scrape_allow_rescrape=False,
+                    replace_entries=result["series"],
                 )
             elif result:
                 print(f"\n✓ {success_msg}")
@@ -1414,11 +1538,16 @@ def _run_scrape_and_save(
                 print(f"\n⚠ {no_data_msg}")
                 logger.warning(no_data_msg)
 
-        # Only clear checkpoint if scraping completed (not paused)
+        # Only clear checkpoint if scraping completed (not paused). A run that
+        # keeps no checkpoint (a single anime, a rescrape started from a
+        # prompt) leaves the file alone either way -- it may belong to a
+        # paused run the user still means to resume.
         if not scraper.paused:
             scraper.clear_checkpoint()
-        else:
+        elif scraper.checkpointing:
             print("\n⚠ Scraping was paused — checkpoint preserved for resume.")
+        else:
+            print("\n⚠ Scraping was paused — this kind of run keeps no checkpoint; start it again to finish.")
 
         if scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} anime failed during scraping.")
@@ -1447,7 +1576,8 @@ def _run_scrape_and_save(
                 active_site_url=ACTIVE_SITE_URL,
             )
             if isinstance(result, dict) and result.get("rescrape"):
-                remove_series_from_index(SERIES_INDEX_FILE, result["series"])
+                # Not deleted here either: the retry list rescrapes them, and
+                # the integrity check offers the swap again then.
                 for url, title in zip(result["urls"], result["titles"], strict=True):
                     scraper.failed_links.append(
                         {
@@ -1458,9 +1588,9 @@ def _run_scrape_and_save(
                         }
                     )
                 scraper.save_failed_series()
-                print(f"\n✓ {len(result['urls'])} critical series removed from index and added to retry list.")
+                print(f"\n✓ {len(result['urls'])} critical series added to the retry list; the index keeps them.")
                 print("→ Use option 6 (Retry failed series) to rescrape these.")
-                logger.info("Critical series removed from index and added to retry list after Ctrl+C")
+                logger.info("Critical series added to retry list after Ctrl+C; index entries kept")
             elif result:
                 print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
                 logger.info("%s interrupted — partial data saved", description)
@@ -2067,11 +2197,16 @@ def main():
 
     while True:
         show_menu()
-        choice = input("Enter your choice (0-9): ").strip()
-
-        if not choice.isdigit() or not 0 <= int(choice) <= 9:
-            print("✗ Invalid choice. Please enter a number between 0 and 9.")
-            continue
+        # term.ask, like every other prompt: only a listed number counts, and
+        # end of input (a closed pipe, Ctrl+Z) or five unusable answers in a
+        # row exit, which changes nothing. A bare input() here let EOFError
+        # escape as a traceback.
+        choice = term.ask(
+            "Enter your choice (0-9): ",
+            [str(n) for n in range(10)],
+            safe="0",
+            hint="type a number from 0 to 9",
+        )
 
         if choice in ["1", "2", "3", "5", "6", "7", "8", "9"] and not check_disk_space():
             print("⚠ Aborting due to low disk space.")

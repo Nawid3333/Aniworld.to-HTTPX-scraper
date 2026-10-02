@@ -281,6 +281,51 @@ class BatchAddPromptTests(unittest.TestCase):
         batch.assert_not_called()
 
 
+class MainMenuTests(unittest.TestCase):
+    """The main menu read a bare input(): end of input escaped as a traceback.
+
+    A closed pipe or Ctrl+Z at "Enter your choice" raised EOFError out of
+    _run_cli, and an unattended feed of junk was asked forever. The menu goes
+    through term.ask now, whose safe answer here is 0 -- leave, changing
+    nothing.
+    """
+
+    def _run(self, feeder):
+        index = mock.Mock()
+        index.series_index = {}
+        with (
+            mock.patch.object(main, "ensure_env_file", lambda: None),
+            mock.patch.object(main, "IndexManager", lambda *_a, **_k: index),
+            mock.patch.object(main, "validate_credentials", lambda: True),
+            mock.patch.object(main, "check_disk_space", lambda *_a, **_k: True),
+            mock.patch.object(main, "_probe_sites_before_scrape", lambda *_a, **_k: None),
+            mock.patch.object(main, "_notify_vanished_at_startup", lambda *_a, **_k: None),
+            mock.patch("builtins.input", feeder),
+            captured_output() as out,
+        ):
+            code = main._run_cli()
+        return code, term.strip_ansi(out.getvalue())
+
+    def test_end_of_input_leaves_cleanly(self):
+        code, out = self._run(mock.Mock(side_effect=[EOFError()]))
+        self.assertEqual(code, 0)
+        self.assertIn("Goodbye", out)
+
+    def test_a_typo_is_asked_again(self):
+        feeder = _Script("x", "0")
+        code, out = self._run(feeder)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(feeder.asked), 2)
+        self.assertIn("'x' is not an option", out)
+
+    def test_endless_wrong_answers_leave_rather_than_loop(self):
+        # Finite on purpose: a missing cap fails fast with StopIteration instead of hanging.
+        feeder = mock.Mock(side_effect=["x"] * (term.MAX_UNRECOGNIZED + 1))
+        code, _out = self._run(feeder)
+        self.assertEqual(code, 0)
+        self.assertEqual(feeder.call_count, term.MAX_UNRECOGNIZED)
+
+
 def _docstring_ids(tree):
     """Return the ids of every docstring node; a docstring may describe a prompt."""
     ids = set()

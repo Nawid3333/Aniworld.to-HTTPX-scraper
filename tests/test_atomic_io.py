@@ -12,12 +12,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import atomic_io  # noqa: E402
 from src.atomic_io import _rotate_backups, atomic_write_json, create_file_backup  # noqa: E402
 
 
@@ -223,6 +225,188 @@ class WriteFailureTests(_TmpDirTest):
             atomic_write_json(p, {"gen": 2})
 
         self.assertEqual(json.loads(self.read(p)), {"gen": 2})
+
+
+class LockedSwapTests(_TmpDirTest):
+    """A swap Windows refuses must cost neither the save's backups nor a stray file.
+
+    A scanner or indexer briefly holding the freshly written temp file makes
+    the final rename fail with "in use by another process". The backups used
+    to be rotated before that rename, so each failed save pushed the oldest
+    generation out: three failed saves in a row left no backup at all, and
+    every attempt left a full-size temp file behind.
+    """
+
+    def setUp(self):
+        super().setUp()
+        sleeper = mock.patch("src.atomic_io.time.sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def _generations(self, p):
+        names = [p] + [f"{p}.bak{i}" for i in (1, 2, 3)]
+        return [json.loads(self.read(name))["gen"] if os.path.exists(name) else None for name in names]
+
+    def _four_generations(self):
+        p = self.path()
+        for gen in range(1, 5):
+            atomic_write_json(p, {"gen": gen})
+        self.assertEqual(self._generations(p), [4, 3, 2, 1])
+        return p
+
+    def _locked_swap(self, p, times=None):
+        """os.replace that refuses the temp-file swap onto *p*, *times* times or always."""
+        real = os.replace
+        refused = []
+
+        def replace(src, dst):
+            if str(src).endswith(".tmp") and str(dst) == p and (times is None or len(refused) < times):
+                refused.append(src)
+                raise PermissionError(13, "The process cannot access the file because it is being used")
+            return real(src, dst)
+
+        return replace, refused
+
+    def _leftovers(self):
+        return [n for n in os.listdir(self.dirpath) if n.endswith(".tmp") or "pending" in n]
+
+    def test_a_failed_swap_keeps_every_backup_generation(self):
+        p = self._four_generations()
+        replace, _ = self._locked_swap(p)
+        with mock.patch("src.atomic_io.os.replace", side_effect=replace), self.assertRaises(PermissionError):
+            atomic_write_json(p, {"gen": 5})
+        self.assertEqual(self._generations(p), [4, 3, 2, 1])
+        self.assertEqual(self._leftovers(), [])
+
+    def test_three_failed_saves_in_a_row_still_leave_three_backups(self):
+        """The repro: each of these used to drop a generation."""
+        p = self._four_generations()
+        replace, _ = self._locked_swap(p)
+        for gen in (5, 6, 7):
+            with mock.patch("src.atomic_io.os.replace", side_effect=replace), self.assertRaises(PermissionError):
+                atomic_write_json(p, {"gen": gen})
+        self.assertEqual(self._generations(p), [4, 3, 2, 1])
+
+    def test_a_briefly_locked_swap_is_retried_and_lands(self):
+        p = self._four_generations()
+        replace, refused = self._locked_swap(p, times=2)
+        with mock.patch("src.atomic_io.os.replace", side_effect=replace):
+            atomic_write_json(p, {"gen": 5})
+        self.assertEqual(len(refused), 2, "the lock was not hit twice")
+        self.assertEqual(self._generations(p), [5, 4, 3, 2])
+        self.assertEqual(self._leftovers(), [])
+
+    def test_retrying_gives_up_after_a_bounded_number_of_tries(self):
+        p = self._four_generations()
+        replace, refused = self._locked_swap(p)
+        with mock.patch("src.atomic_io.os.replace", side_effect=replace), self.assertRaises(PermissionError):
+            atomic_write_json(p, {"gen": 5})
+        self.assertEqual(len(refused), len(atomic_io._LOCK_RETRY_DELAYS) + 1)
+
+    def test_an_error_that_is_not_a_lock_is_not_retried(self):
+        p = self._four_generations()
+        calls = []
+        real = os.replace
+
+        def replace(src, dst):
+            if str(src).endswith(".tmp"):
+                calls.append(src)
+                raise OSError("read-only file system")
+            return real(src, dst)
+
+        with mock.patch("src.atomic_io.os.replace", side_effect=replace), self.assertRaises(OSError):
+            atomic_write_json(p, {"gen": 5})
+        self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(os.name == "nt", "only Windows refuses to rename a file another handle holds")
+    def test_a_real_handle_on_the_temp_file(self):
+        """The live failure: a second open handle, as a virus scanner holds one."""
+        p = self._four_generations()
+        real_mkstemp = atomic_io.tempfile.mkstemp
+        held = []
+
+        def mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            held.append(open(path, "rb"))  # noqa: SIM115 -- held open on purpose until the write has failed
+            return fd, path
+
+        try:
+            with mock.patch("src.atomic_io.tempfile.mkstemp", side_effect=mkstemp), self.assertRaises(PermissionError):
+                atomic_write_json(p, {"gen": 5})
+        finally:
+            for handle in held:
+                handle.close()
+        self.assertEqual(self._generations(p), [4, 3, 2, 1])
+
+
+class PendingBackupTests(_TmpDirTest):
+    """The second name the outgoing file carries until the new one is in place."""
+
+    def test_a_rotation_cut_short_after_the_swap_is_finished_by_the_next_write(self):
+        p = self.path()
+        atomic_write_json(p, {"gen": 1})
+        atomic_write_json(p, {"gen": 2})
+        # The swap to gen 3 happened, the rotation did not: gen 2 is still
+        # waiting under the pending name.
+        self.write(f"{p}.bak-pending", json.dumps({"gen": 2}))
+        self.write(p, json.dumps({"gen": 3}))
+        atomic_write_json(p, {"gen": 4})
+        self.assertEqual(json.loads(self.read(p)), {"gen": 4})
+        self.assertEqual(json.loads(self.read(f"{p}.bak1")), {"gen": 3})
+        self.assertEqual(json.loads(self.read(f"{p}.bak2")), {"gen": 2})
+        self.assertEqual(json.loads(self.read(f"{p}.bak3")), {"gen": 1})
+        self.assertFalse(os.path.exists(f"{p}.bak-pending"))
+
+    def test_a_spare_link_from_a_write_that_never_swapped_is_dropped(self):
+        p = self.path()
+        atomic_write_json(p, {"gen": 1})
+        atomic_write_json(p, {"gen": 2})
+        try:
+            os.link(p, f"{p}.bak-pending")
+        except OSError:
+            self.skipTest("no hard links on this file system")
+        atomic_write_json(p, {"gen": 3})
+        self.assertEqual(json.loads(self.read(f"{p}.bak1")), {"gen": 2})
+        self.assertEqual(json.loads(self.read(f"{p}.bak2")), {"gen": 1})
+        self.assertFalse(os.path.exists(f"{p}.bak3"), "the spare link was rotated in as a generation")
+        self.assertFalse(os.path.exists(f"{p}.bak-pending"))
+
+    def test_without_hard_links_the_backup_is_copied(self):
+        p = self.path()
+        atomic_write_json(p, {"gen": 1})
+        with mock.patch("src.atomic_io.os.link", side_effect=OSError("not supported")):
+            atomic_write_json(p, {"gen": 2})
+        self.assertEqual(json.loads(self.read(f"{p}.bak1")), {"gen": 1})
+        self.assertEqual(json.loads(self.read(p)), {"gen": 2})
+
+
+class StaleTempSweepTests(_TmpDirTest):
+    """Temp files a failed write could not delete are cleared up later, and only those."""
+
+    def test_an_old_temp_file_of_this_file_is_removed(self):
+        p = self.path("index.json")
+        stale = self.path(".index.json.abc123.tmp")
+        self.write(stale, "{}")
+        old = time.time() - atomic_io._STALE_TEMP_SECONDS - 60
+        os.utime(stale, (old, old))
+        atomic_write_json(p, {"a": 1})
+        self.assertFalse(os.path.exists(stale))
+
+    def test_a_young_temp_file_is_left_for_the_write_that_owns_it(self):
+        p = self.path("index.json")
+        young = self.path(".index.json.def456.tmp")
+        self.write(young, "{}")
+        atomic_write_json(p, {"a": 1})
+        self.assertTrue(os.path.exists(young))
+
+    def test_another_files_temp_file_is_never_touched(self):
+        p = self.path("index.json")
+        other = self.path(".checkpoint.json.abc123.tmp")
+        self.write(other, "{}")
+        old = time.time() - atomic_io._STALE_TEMP_SECONDS - 60
+        os.utime(other, (old, old))
+        atomic_write_json(p, {"a": 1})
+        self.assertTrue(os.path.exists(other))
 
 
 class CreateFileBackupTests(_TmpDirTest):

@@ -34,6 +34,7 @@ from config.config import (
     SITE_URL,
     SITE_URLS,
     USE_HTTP2,
+    VALID_SERIES_HOSTS,
 )
 from src import term
 from src.atomic_io import atomic_write_json
@@ -275,6 +276,87 @@ def _retry_after_seconds(resp) -> float | None:
         return None
 
 
+# ── Checkpoint journal ──────────────────────────────────────────────────────
+# The periodic checkpoint keeps a run's results in a journal beside the
+# checkpoint file, one JSON line per scraped series; see
+# AniWorldScraper._write_periodic_checkpoint for why.
+
+
+def _journal_path(checkpoint_file: str) -> str:
+    """Where a checkpoint keeps the results its periodic saves have recorded."""
+    return os.path.splitext(checkpoint_file)[0] + ".journal.jsonl"
+
+
+def _append_journal(path: str, entries: list) -> None:
+    """Append one JSON line per entry, flushed and fsynced before returning.
+
+    A crash can cut the last line off half-written. If the file does not end
+    in a newline, one goes first, so the torn fragment stays a line of its own
+    and is skipped on read rather than swallowing this batch's first entry.
+    """
+    payload = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries).encode("utf-8")
+    with open(path, "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                payload = b"\n" + payload
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _read_journal(path: str) -> list[dict]:
+    """Every intact entry in the journal, in the order written; [] if there is none.
+
+    A line that does not parse is the tail a crash cut off mid-append, and is
+    skipped: the checkpoint never named its link, so the series it belonged
+    to is simply scraped again.
+    """
+    entries: list[dict] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        logger.error("Could not read the checkpoint journal %s: %s", path, exc)
+        return []
+    return entries
+
+
+def _merge_checkpoint_results(saved: list, journaled: list, completed: set) -> list:
+    """The results a resume starts from: the checkpoint's own, then the journal's.
+
+    Only journal entries whose link the checkpoint recorded as completed are
+    taken. A line can be on disk for a series the checkpoint never named --
+    the run died between the two writes -- and that series is scraped again,
+    so keeping its line as well would put it in the results twice. A link
+    journaled more than once keeps its latest line.
+    """
+    merged = list(saved or [])
+    position = {entry.get("link"): i for i, entry in enumerate(merged) if isinstance(entry, dict) and entry.get("link")}
+    for entry in journaled:
+        link = entry.get("link")
+        if not link or link not in completed:
+            continue
+        if link in position:
+            merged[position[link]] = entry
+        else:
+            position[link] = len(merged)
+            merged.append(entry)
+    return merged
+
+
 # ── Rename matching helpers ─────────────────────────────────────────────────
 
 _STOPWORDS = frozenset(
@@ -438,6 +520,34 @@ def _series_list_url(site_url: str | None = None) -> str:
     return _host_url(SERIES_LIST_PATH, site_url)
 
 
+def _on_host(url: str, site_url: str) -> str:
+    """`url` moved onto `site_url`'s scheme and host, if it is one of this site's URLs.
+
+    Series URLs are stored canonically on the primary host -- the catalogue,
+    the batch file and the index all name SITE_URL -- but a run talks to
+    whichever host the startup check made active. Fetching the stored URL
+    as-is meant a run whose primary was down logged in on the mirror and
+    then sent every series and season request to the dead primary, so every
+    series failed; and with the primary up, the mirror's session cookie was
+    never sent there, so every page read logged out. The login and the
+    catalogue already followed the active host; this makes the pages follow
+    it too.
+
+    Only URLs on one of the configured hosts are moved. Anything else is
+    returned untouched, so a URL this program does not recognise is never
+    quietly redirected somewhere else.
+    """
+    if not url or not site_url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return f"{site_url}{url}" if url.startswith("/") else url
+    if parsed.netloc not in VALID_SERIES_HOSTS:
+        return url
+    target = urlparse(site_url)
+    return parsed._replace(scheme=target.scheme, netloc=target.netloc).geturl()
+
+
 _ANIME_PATH_RE = re.compile(r"(/anime/stream/[^/]+)")
 _ANIME_SLUG_RE = re.compile(r"^/anime/stream/([^/?#]+)/?$")
 _STAFFEL_RE = re.compile(r"/staffel-(\d+)")
@@ -449,6 +559,9 @@ _ERROR_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _SERVER_ERROR_CODES = {"429", "500", "502", "503", "504"}
+# Error-page codes that are an answer about the series itself -- it is not
+# there -- rather than about the site's state at that moment.
+_GONE_CODES = frozenset({"404", "410"})
 
 # Generic listing-page titles that aniworld.to returns instead of a real 404
 _UTILITY_PAGES = {
@@ -510,6 +623,13 @@ _ROWS_PRIMARY = f".//table[{_has_class_xpath('seasonEpisodesList')}]//tbody//tr[
 _ROWS_NO_TBODY = f".//table[{_has_class_xpath('seasonEpisodesList')}]//tr[@data-episode-id]"
 _ROWS_GENERIC = ".//tbody//tr[@data-episode-id]"
 _EPISODE_TABLE = f".//table[{_has_class_xpath('seasonEpisodesList')}]"
+# A row in the episode table that carries an episode's own cells -- its number
+# or its title -- whether or not it still has the data-episode-id the row
+# selectors above key on. Used only to tell an empty table from one whose rows
+# the selectors no longer recognise; see _parse_episodes_from_doc.
+_EPISODE_LIKE_ROWS = (
+    f"{_EPISODE_TABLE}//tr[.//meta[@itemprop='episodeNumber'] or .//td[{_has_class_xpath('seasonEpisodeTitle')}]]"
+)
 _XP_EPISODE_NUMBER = ".//meta[@itemprop='episodeNumber']/@content"
 _XP_TITLE_GER = f".//td[{_has_class_xpath('seasonEpisodeTitle')}]//a//strong"
 _XP_TITLE_ENG = f".//td[{_has_class_xpath('seasonEpisodeTitle')}]//a//span"
@@ -558,6 +678,8 @@ _XP_H1_FW_BOLD = f".//h1[{_has_class_xpath('fw-bold')}]"
 _XP_ADD_SERIES = f".//div[{_has_class_xpath('add-series')}]"
 _XP_FAVOURITE_TRUE = f".//li[{_has_class_xpath('setFavourite')}][{_has_class_xpath('true')}]"
 _XP_WATCHLIST_TRUE = f".//li[{_has_class_xpath('setWatchlist')}][{_has_class_xpath('true')}]"
+_XP_FAVOURITE_ANY = f".//li[{_has_class_xpath('setFavourite')}]"
+_XP_WATCHLIST_ANY = f".//li[{_has_class_xpath('setWatchlist')}]"
 _XP_ANY_LINK = ".//a[@href]"
 _XP_ANY_HREF = ".//@href"
 _XP_CATALOGUE_LINKS = ".//*[@id='seriesContainer']//ul//li//a"
@@ -751,6 +873,15 @@ def _parse_episodes_from_doc(doc) -> list[dict] | None:
         # (a redesign, a truncated response, or a soft error page --
         # aniworld.to serves a nav-less generic page for a season that
         # doesn't exist, which lands here).
+        #
+        # A table whose rows still look like episodes -- an episode number,
+        # an episode title -- but that none of the selectors matched is the
+        # third case, and it is not empty: the site changed the row markup
+        # (dropped data-episode-id, say). Reading that as [] stored every
+        # season of every series as 0 episodes; it is a parse failure.
+        if doc.xpath(_EPISODE_LIKE_ROWS):
+            logger.warning("Episode rows found but none matched the row selectors - treating as a parse failure")
+            return None
         return [] if doc.xpath(_EPISODE_TABLE) else None
 
     episodes = []
@@ -999,7 +1130,8 @@ def _detect_subscription_status(doc) -> tuple[bool | None, bool | None]:
     and data-series-watchlist attributes (value "1" = active).
     Cross-validates with CSS classes li.setFavourite.true / li.setWatchlist.true.
 
-    Returns (subscribed, watchlist) — None if container not found or not logged in.
+    Returns (subscribed, watchlist) — None if container not found, not logged
+    in, or the page carries neither signal for that flag.
     """
     # Verify logged-in state (profile avatar)
     if _first(doc, _XP_AVATAR_LINK_ROOTED) is None:
@@ -1038,10 +1170,16 @@ def _detect_subscription_status(doc) -> tuple[bool | None, bool | None]:
             css_watchlist,
         )
 
-    # Fallback to CSS if data attributes missing
-    if subscribed is None:
+    # Fallback to CSS if data attributes missing -- but only where the CSS
+    # control is actually on the page. A missing li.setFavourite.true means
+    # "not subscribed" only if li.setFavourite itself is there; when a
+    # redesign has dropped both the data attribute and the control, the
+    # fallback used to read "not subscribed, not on the watchlist" for every
+    # series in the run, and the merge then offered to clear both flags
+    # across the whole index. Unknown is None, which the merge leaves alone.
+    if subscribed is None and _first(doc, _XP_FAVOURITE_ANY) is not None:
         subscribed = css_subscribed
-    if watchlist is None:
+    if watchlist is None and _first(doc, _XP_WATCHLIST_ANY) is not None:
         watchlist = css_watchlist
 
     return (subscribed, watchlist)
@@ -1087,8 +1225,20 @@ class AniWorldScraper:
         self.pause_file = os.path.join(DATA_DIR, ".pause_scraping")
 
         self._checkpoint_mode: str | None = None
+        # False for a run that must leave the checkpoint files alone -- a
+        # single-anime add, a rescrape started from the post-save prompts. Such
+        # runs have nothing worth resuming, and the checkpoint on disk belongs
+        # to whichever paused run the user may still want to resume; see run().
+        self.checkpointing = True
+        # How many leading entries of the run's results are already on disk,
+        # in the checkpoint or its journal; see _checkpoint_snapshot.
+        self._journaled = 0
         self._use_parallel: bool = True
         self._lock = threading.Lock()
+        # Set when the worker pool's login has failed even after its one
+        # retry, so the remaining workers fail fast instead of each logging
+        # in again; see _acquire_client.
+        self._pool_login_error: Exception | None = None
         self._relogin_count = 0
         # Bumped whenever a worker refreshes or confirms the shared session, so
         # workers that queued behind it reuse that result instead of repeating
@@ -1138,11 +1288,50 @@ class AniWorldScraper:
             pass
         return None
 
+    @staticmethod
+    def discard_checkpoint(data_dir):
+        """Delete a checkpoint and its journal -- the menu's "start fresh" answer.
+
+        The two belong together: a journal left behind would hand a later
+        resume the results of a run the user chose to throw away.
+        """
+        cp_file = os.path.join(data_dir, ".scrape_checkpoint.json")
+        for path in (cp_file, _journal_path(cp_file)):
+            with contextlib.suppress(OSError):
+                if os.path.exists(path):
+                    os.remove(path)
+
     # ── Checkpoint management ───────────────────────────────────────────────
 
+    @property
+    def checkpoint_journal(self) -> str:
+        """The journal that sits beside checkpoint_file; see _write_periodic_checkpoint.
+
+        Derived rather than stored so that pointing checkpoint_file somewhere
+        else -- which is how the tests keep away from the real data/ -- moves
+        the journal with it.
+        """
+        return _journal_path(self.checkpoint_file)
+
+    def _discard_journal_locked(self) -> None:
+        """Remove the journal. Caller holds self._lock."""
+        with contextlib.suppress(OSError):
+            if os.path.exists(self.checkpoint_journal):
+                os.remove(self.checkpoint_journal)
+
     def _sync_save_checkpoint(self, include_data=False):
-        """Synchronous checkpoint writer; thread-safe."""
+        """Synchronous checkpoint writer; thread-safe.
+
+        With include_data the whole run's results go into the checkpoint
+        itself, which makes the journal redundant, so it is removed once that
+        write has landed. The final, pause and error paths save this way; the
+        frequent save during a run is _write_periodic_checkpoint.
+
+        A run that keeps no checkpoint (see run()) writes nothing at all.
+        """
         with self._lock:
+            if not self.checkpointing:
+                return
             payload = {
                 "completed_links": list(self.completed_links),
                 "mode": self._checkpoint_mode,
@@ -1159,15 +1348,81 @@ class AniWorldScraper:
                 atomic_write_json(self.checkpoint_file, payload, indent=None, backup=False)
             except Exception as e:
                 logger.error("Failed to save checkpoint: %s", e)
+                return
+            if include_data:
+                self._discard_journal_locked()
+                self._journaled = len(self.series_data)
 
     def save_checkpoint(self, include_data=False):
         """Synchronous entry point for final/pause/error paths."""
         self._sync_save_checkpoint(include_data=include_data)
 
-    async def asave_checkpoint(self, include_data=False):
-        """Offload checkpoint I/O to a thread so the event loop stays free."""
+    def _checkpoint_snapshot(self, results: list) -> tuple[list, list, int]:
+        """What one periodic checkpoint records, taken in one step. Caller holds self._lock.
+
+        The periodic checkpoint used to write completed_links and none of the
+        results behind them. Only the final, pause and error paths wrote the
+        data, so a run that ended any other way -- the console window closed,
+        a crash, a power cut -- left a checkpoint naming hundreds of series as
+        done with nothing to show for them. Resuming skipped every one, and
+        their results never reached the index. A resumed run's periodic save
+        did the same to the data its paused predecessor had saved.
+
+        Now the results since the last save travel with the links and are
+        journaled first (_write_periodic_checkpoint), and a link is recorded
+        only once its outcome is on disk. A series that failed is left out: its
+        failure lives only in memory until the run ends, so after a crash it is
+        simply tried again instead of being skipped with no trace on the failed
+        list.
+
+        Returns (links, new_results, start), where start is how far the journal
+        had got, so a failed write can hand the batch back.
+        """
+        start = self._journaled
+        new_results = list(results[start:])
+        self._journaled = len(results)
+        failed = {entry.get("link") for entry in self.failed_links if isinstance(entry, dict)}
+        links = [link for link in self.completed_links if link not in failed]
+        return links, new_results, start
+
+    def _write_periodic_checkpoint(self, links: list, new_results: list, start: int) -> None:
+        """Journal this batch's results, then record its links. Runs in a thread.
+
+        Appending is what keeps this cheap enough to do every CHECKPOINT_EVERY
+        series. Writing the whole run's results each time would serialise a
+        list that grows to the size of the index, under the GIL, on the core
+        the run is already bound by; the journal writes only this batch.
+
+        The order is the guarantee: the results are fsynced before the
+        checkpoint names their links, so a crash between the two leaves results
+        nobody points at (dropped on load) rather than links with nothing
+        behind them.
+        """
+        with self._lock:
+            if not self.checkpointing:
+                return
+            if new_results:
+                try:
+                    _append_journal(self.checkpoint_journal, new_results)
+                except OSError as e:
+                    logger.error("Failed to save checkpoint journal: %s", e)
+                    # Not on disk, so not done: the next snapshot takes them again.
+                    self._journaled = min(self._journaled, start)
+                    return
+            payload = {
+                "completed_links": links,
+                "mode": self._checkpoint_mode,
+                "timestamp": time.time(),
+            }
+            try:
+                atomic_write_json(self.checkpoint_file, payload, indent=None, backup=False)
+            except Exception as e:
+                logger.error("Failed to save checkpoint: %s", e)
+
+    async def asave_periodic_checkpoint(self, links: list, new_results: list, start: int) -> None:
+        """Offload the periodic checkpoint to a thread so the event loop stays free."""
         with self._profiler.phase("checkpoint"):
-            await asyncio.to_thread(self._sync_save_checkpoint, include_data)
+            await asyncio.to_thread(self._write_periodic_checkpoint, links, new_results, start)
 
     def load_checkpoint(self) -> bool:
         with self._lock:
@@ -1176,6 +1431,7 @@ class AniWorldScraper:
                     return False
                 with open(self.checkpoint_file, encoding="utf-8") as f:
                     data = json.load(f)
+                saved_data = None
                 if isinstance(data, dict):
                     self.completed_links = set(data.get("completed_links", []))
                     self._checkpoint_mode = data.get("mode")
@@ -1184,18 +1440,36 @@ class AniWorldScraper:
                         self.series_data = saved_data
                 elif isinstance(data, list):
                     self.completed_links = set(data)
+                self.series_data = _merge_checkpoint_results(
+                    self.series_data, _read_journal(self.checkpoint_journal), self.completed_links
+                )
+                # Results that came out of the checkpoint file itself exist
+                # nowhere else, and the next periodic save rewrites that file
+                # without them -- so they are journaled again first. Results
+                # read from the journal are already there.
+                self._journaled = 0 if saved_data else len(self.series_data)
                 return bool(self.completed_links)
             except Exception as e:
                 logger.error("Failed to load checkpoint: %s", e)
                 return False
 
     def clear_checkpoint(self):
+        """Remove the checkpoint and its journal. A no-op for a run that keeps none.
+
+        main.py clears the checkpoint after every run that was not paused, and
+        that includes the runs that never wrote one: a single-anime add, the
+        rescrapes offered after a save. Clearing there deleted the checkpoint
+        of a paused run the user still meant to resume.
+        """
         with self._lock:
+            if not self.checkpointing:
+                return
             try:
                 if os.path.exists(self.checkpoint_file):
                     os.remove(self.checkpoint_file)
             except OSError:
                 pass
+            self._discard_journal_locked()
 
     # ── Failed series management ────────────────────────────────────────────
 
@@ -1661,10 +1935,15 @@ class AniWorldScraper:
             pass False: _get_all_series applies the same _is_logged_in check
             to the same response, so verifying here only downloads the page a
             second time to reach the same verdict.
+
+        Every failure is a RuntimeError, and `client` is never closed here.
+        The client may be the session every worker shares -- a re-login after
+        a mid-run expiry passes it in -- and closing it on a failed check made
+        every remaining series in the run fail with "client has been closed".
+        Whoever created the client closes it.
         """
         # GET the login page first to establish session cookies
         login_url = _login_url(self.site_url)
-        await client.get(login_url)
 
         # aniworld.to login: email + password + autoLogin (no CSRF token)
         login_data = {
@@ -1673,24 +1952,33 @@ class AniWorldScraper:
             "autoLogin": "on",
         }
 
-        await client.post(
-            login_url,
-            data=login_data,
-            headers={
-                "Origin": self.site_url,
-                "Referer": login_url,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            follow_redirects=True,
-        )
+        try:
+            await client.get(login_url)
+            await client.post(
+                login_url,
+                data=login_data,
+                headers={
+                    "Origin": self.site_url,
+                    "Referer": login_url,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                follow_redirects=True,
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Login request failed: {exc}") from exc
         # POST returns empty body — verify on the catalogue page before
         # returning the client, matching the other scrapers/watchmaker pattern.
         if not verify:
             return
-        verify_resp = await client.get(_series_list_url(self.site_url))
+        try:
+            # Through _get: a single 5xx on this page used to fail the login
+            # outright, and mid-run that is exactly when the site is having a
+            # bad moment.
+            verify_resp = await self._get(client, _series_list_url(self.site_url))
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Login could not be checked: {exc}") from exc
         verify_doc = make_doc(verify_resp.text)
         if verify_doc is None or not _is_logged_in(verify_doc):
-            await client.aclose()
             raise RuntimeError("Login failed — check credentials")
 
     async def _create_logged_in_client(self, verify: bool = True) -> httpx.AsyncClient:
@@ -1721,7 +2009,13 @@ class AniWorldScraper:
                 max_keepalive_connections=self.pool_workers * SEASON_CONCURRENCY + 4,
             ),
         )
-        await self._login_client(client, verify=verify)
+        try:
+            await self._login_client(client, verify=verify)
+        except BaseException:
+            # This client is ours alone until it is returned, so a failed
+            # login is ours to close; _login_client never closes one.
+            await client.aclose()
+            raise
         return client
 
     async def _get_all_series(self, client: _AsyncGetClient) -> list[dict]:
@@ -1794,6 +2088,13 @@ class AniWorldScraper:
 
         Returns list of series dicts with title, link, url keys.
         Note: aniworld.to account pages have no pagination.
+
+        Raises RuntimeError when a page cannot be read. This list is the
+        evidence main.py uses to clear the subscribed/watchlist flag of every
+        indexed series missing from it, so a page that failed must never pass
+        for one that came back short. A timeout on the watchlist page used to
+        be logged and skipped, and every watchlist-only series was then offered
+        as "no longer on the watchlist".
         """
         pages = []
         if source in ("subscribed", "both"):
@@ -1807,10 +2108,11 @@ class AniWorldScraper:
         for base_url, label in pages:
             count_before = len(series_list)
             try:
-                resp = await client.get(base_url, follow_redirects=True)
+                # Through _get, so a dropped connection or a 5xx is retried
+                # (and the pool's back-off honoured) before the run gives up.
+                resp = await self._get(client, base_url)
             except httpx.HTTPError as e:
-                logger.warning("Could not fetch %s: %s", base_url, e)
-                continue
+                raise RuntimeError(f"Could not fetch the {label} page, so the account list is incomplete: {e}") from e
 
             doc = make_doc(resp.text)
             if doc is None or not _is_logged_in(doc):
@@ -1937,7 +2239,9 @@ class AniWorldScraper:
     async def _scrape_one_series(self, client: _AsyncGetClient, info: dict) -> dict:
         """Scrape a single anime: all seasons, episodes, subscription status."""
         t_start = time.perf_counter()
-        url = info.get("scrape_url", info["url"])
+        # Fetched from the active host, stored under the canonical URL; see
+        # _on_host. An explicit scrape_url is still taken as given.
+        url = info.get("scrape_url") or _on_host(info["url"], self.site_url)
         slug = self.get_series_slug_from_url(info["url"])
 
         try:
@@ -2004,12 +2308,14 @@ class AniWorldScraper:
         alt_titles_from_info = info.get("alt_titles", [])
         alt_titles = list(dict.fromkeys(alt_titles_from_info + alt_titles_from_page))
 
-        scrape_url = info.get("scrape_url", info["url"])
-        if scrape_url.startswith("http://") or scrape_url.startswith("https://"):
-            parsed_scrape = urlparse(scrape_url)
+        # Season pages come from the same host as the series page did.
+        if url.startswith("http://") or url.startswith("https://"):
+            parsed_scrape = urlparse(url)
             season_base_url = f"{parsed_scrape.scheme}://{parsed_scrape.netloc}"
         else:
             season_base_url = self.site_url
+        stored = urlparse(info["url"])
+        stored_origin = f"{stored.scheme}://{stored.netloc}" if stored.netloc else SITE_URL
 
         season_links = _extract_season_links(doc, slug, season_base_url)
         if not season_links:
@@ -2076,7 +2382,9 @@ class AniWorldScraper:
             total_count = len(episodes)
             season_entry = {
                 "season": label,
-                "url": season_url,
+                # Stored on the series' own host, like the series URL, so the
+                # index reads the same whichever mirror the run went through.
+                "url": _on_host(season_url, stored_origin),
                 "episodes": episodes,
                 "watched_episodes": watched_count,
                 "total_episodes": total_count,
@@ -2090,7 +2398,7 @@ class AniWorldScraper:
         result = {
             "title": title,
             "link": info["link"],
-            "url": scrape_url,
+            "url": info["url"],
             "total_seasons": len(seasons_data),
             "total_episodes": total_eps,
             "watched_episodes": total_watched,
@@ -2321,12 +2629,37 @@ class AniWorldScraper:
         Reference-counted rather than opened and closed by the orchestrators,
         because several entry points spawn workers and each would otherwise
         need the same bookkeeping.
+
+        A failed login raises, for every worker. Each worker used to retry on
+        its own and then quietly return, so a pool whose login failed sent two
+        logins per worker -- 32 at the default 16, the very storm the shared
+        session exists to prevent -- and then finished "successfully" with the
+        queue untouched and nothing on the failed list. A resumed run went on
+        to merge its old checkpoint, report the scrape complete and delete the
+        checkpoint. Now the pool gets one retry, the first failure after it is
+        remembered so the other workers raise without logging in again, and
+        the error ends the run, which keeps its checkpoint for a later resume.
         """
         async with self._client_lock:
             if self._shared_client is None:
-                self._shared_client = await self._create_logged_in_client()
+                if self._pool_login_error is not None:
+                    raise RuntimeError(f"Login for the worker pool failed: {self._pool_login_error}")
+                try:
+                    self._shared_client = await self._login_for_pool()
+                except RuntimeError as exc:
+                    self._pool_login_error = exc
+                    raise
             self._client_users += 1
             return self._shared_client
+
+    async def _login_for_pool(self):
+        """The pool's session: one login, and one retry a second later if it fails."""
+        try:
+            return await self._create_logged_in_client()
+        except RuntimeError as exc:
+            logger.warning("Login for the worker pool failed (%s); retrying once...", exc)
+            await asyncio.sleep(1)
+            return await self._create_logged_in_client()
 
     async def _release_client(self) -> None:
         """Drop this worker's claim; close the session once the last one exits."""
@@ -2346,16 +2679,8 @@ class AniWorldScraper:
         total: int,
         predicted_rate: float | None = None,
     ):
-        try:
-            client = await self._acquire_client()
-        except RuntimeError:
-            logger.warning("Worker %d login failed, retrying...", worker_id)
-            await asyncio.sleep(1)
-            try:
-                client = await self._acquire_client()
-            except RuntimeError:
-                logger.error("Worker %d login failed permanently", worker_id)
-                return
+        # A failed login raises out of here and ends the run; see _acquire_client.
+        client = await self._acquire_client()
 
         try:
             while True:
@@ -2429,6 +2754,7 @@ class AniWorldScraper:
                 # Keep completed_links, progress, and the checkpoint snapshot
                 # consistent under the lock. This prevents a crash window where
                 # completed_links is ahead of the saved series_data.
+                snapshot = None
                 with self._lock:
                     link = info.get("link", "")
                     if link:
@@ -2437,8 +2763,8 @@ class AniWorldScraper:
                         self.attempted_urls.add(info["url"])
                     progress["done"] += 1
                     done = progress["done"]
-                    if done % CHECKPOINT_EVERY == 0:
-                        self.series_data = list(results)
+                    if done % CHECKPOINT_EVERY == 0 and self.checkpointing:
+                        snapshot = self._checkpoint_snapshot(results)
 
                 # Progress bar + ETA using per-series historical timings
                 elapsed = time.perf_counter() - progress["start"]
@@ -2492,8 +2818,8 @@ class AniWorldScraper:
                         f" watched{sub_info}{ep0_warn}"
                     )
 
-                if done % CHECKPOINT_EVERY == 0:
-                    await self.asave_checkpoint(include_data=False)
+                if snapshot is not None:
+                    await self.asave_periodic_checkpoint(*snapshot)
         finally:
             self._progress.flush()
             await self._release_client()
@@ -2571,6 +2897,8 @@ class AniWorldScraper:
         filtered = self._filter_completed(series_list)
         if filtered is None:
             return
+        # A new pool gets its own login attempt; see _acquire_client.
+        self._pool_login_error = None
 
         queue: asyncio.Queue = asyncio.Queue()
         for s in filtered:
@@ -2647,15 +2975,25 @@ class AniWorldScraper:
                 f"\n→ Re-scraping {len(empty)} series that reported 0 episodes to confirm they are really empty..."
             )
         )
-        client = await self._create_logged_in_client()
+        try:
+            client = await self._create_logged_in_client()
+        except RuntimeError as exc:
+            # The scrape itself is finished and its results are good; failing
+            # to sign in for this second look must not take them down with it.
+            # Raising here used to abort the whole run before the save, over
+            # a check that only ever confirms what the first pass found.
+            logger.warning("Could not log in to re-check empty series: %s", exc)
+            print(term.warn(f"  ⚠ Could not log in to re-check them ({exc}); they keep the result of the first pass."))
+            return list(empty)
         try:
             retried: list[dict] = []
             for s in empty:
+                # No scrape_url: the page is fetched from the active host, which
+                # is not necessarily the one the stored URL names.
                 info = {
                     "title": s.get("title", ""),
                     "link": s.get("link", ""),
                     "url": s.get("url", ""),
-                    "scrape_url": s.get("url", ""),
                 }
                 try:
                     result = await self._scrape_one_series(client, info)
@@ -2694,7 +3032,11 @@ class AniWorldScraper:
     def _ignored_seasons_continue(self) -> bool:
         """After scraping ignored-season anime, check for changes and prompt.
 
-        Returns True to continue scraping, False to stop.
+        Returns True to continue scraping, False to stop. Stopping is a pause:
+        the caller raises ScrapingPausedError and run() saves the checkpoint and
+        the failed list. This used to save them itself and then let the run end
+        as if it had finished, so main.py reported the scrape complete and
+        deleted the checkpoint it had just been told to keep.
         """
         has_stale = bool(self._stale_ignored_warnings)
         has_new_ep0 = any(f.get("reason") == "episode_0_placeholder" for f in self.failed_links)
@@ -2718,10 +3060,7 @@ class AniWorldScraper:
                 print(f"  • {f.get('title', f.get('url', '?'))}")
 
         if not term.confirm("\nContinue scraping remaining anime? (y/n): "):
-            print("✗ Scraping stopped. Saving progress...")
-            self.save_checkpoint(include_data=True)
-            if self.failed_links:
-                self.save_failed_series()
+            print("✗ Scraping stopped. Saving progress for a later resume...")
             return False
         return True
 
@@ -2787,6 +3126,12 @@ class AniWorldScraper:
 
         if single_url:
             self._checkpoint_mode = "single"
+            # Single-anime runs have no partial resume state to preserve, so
+            # they keep no checkpoint -- and must not touch the one on disk.
+            # This used to clear it after the scrape, which deleted a paused
+            # full run's checkpoint whenever a single anime was added in
+            # between; run() then wrote a "single" one in its place.
+            self.checkpointing = False
             main_url = self.normalize_to_series_url(single_url)
             m = _ANIME_PATH_RE.search(main_url)
             link = m.group(1) if m else main_url
@@ -2801,8 +3146,6 @@ class AniWorldScraper:
             # One worker costs one extra login and makes this mode report
             # exactly like every other one.
             await self._scrape_list([info], num_workers=1)
-            # Single-anime runs have no partial resume state to preserve.
-            self.clear_checkpoint()
             return
 
         if url_list:
@@ -2874,7 +3217,7 @@ class AniWorldScraper:
                 print(f"→ Phase 1: Scraping {len(ignored_batch)} anime with ignored seasons...")
                 await self._scrape_list(ignored_batch, num_workers=1)
                 if not self._ignored_seasons_continue():
-                    return
+                    raise ScrapingPausedError("Stopped after the ignored-seasons check")
 
             print(f"→ Found {len(rest_batch)} remaining anime — scraping...")
             n = NUM_WORKERS if self._use_parallel else 1
@@ -2980,7 +3323,7 @@ class AniWorldScraper:
             print(f"→ Phase 1: Scraping {len(ignored_batch)} anime with ignored seasons...")
             await self._scrape_list(ignored_batch, num_workers=1)
             if not self._ignored_seasons_continue():
-                return
+                raise ScrapingPausedError("Stopped after the ignored-seasons check")
 
         n = NUM_WORKERS if self._use_parallel else 1
         await self._scrape_list(rest_batch, num_workers=n)
@@ -2998,8 +3341,16 @@ class AniWorldScraper:
         parallel=None,
         account_source=None,
         checkpoint_mode=None,
+        checkpoint=True,
     ):
-        """Main entry point: login, scrape, save checkpoint."""
+        """Main entry point: login, scrape, save checkpoint.
+
+        checkpoint: False for a run that must not read, write or clear the
+            checkpoint files -- the rescrapes main.py offers after a save. A
+            single-anime run never keeps one either. Both used to share the
+            checkpoint with the run the user might still resume, and replaced
+            or deleted it.
+        """
         if parallel is not None:
             self._use_parallel = parallel
             print(f"→ Using {'multi-session' if parallel else 'single-session'} mode")
@@ -3008,6 +3359,14 @@ class AniWorldScraper:
 
         if checkpoint_mode is not None:
             self._checkpoint_mode = checkpoint_mode
+
+        self.checkpointing = bool(checkpoint) and not single_url
+        if self.checkpointing and not resume_only:
+            # A fresh run starts a fresh journal. main.py only starts one once
+            # any earlier checkpoint is resumed or discarded, so whatever is
+            # left here belongs to nothing the user can still resume.
+            with self._lock:
+                self._discard_journal_locked()
 
         # Clear any stale pause file from a previous run
         self._clear_pause_file()
@@ -3020,14 +3379,32 @@ class AniWorldScraper:
             print("\n⚠ Pause requested (Ctrl+C). Finishing current series...")
             self._create_pause_file()
 
-        try:
-            signal.signal(signal.SIGINT, _signal_handler)
-            if hasattr(signal, "SIGTERM"):
-                signal.signal(signal.SIGTERM, _signal_handler)
-        except ValueError:
+        # The handlers are put back when the run ends. They used to stay, so
+        # after the first scrape Ctrl+C never quit the program again: at the
+        # menu it printed "Pause requested" and left a pause file behind, and
+        # the genre scrape, which never looks at that file, could not be
+        # interrupted at all.
+        previous_handlers = {}
+        for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
             # Not the main thread or signal not supported; ignore.
-            pass
+            with contextlib.suppress(ValueError, OSError):
+                previous_handlers[sig] = signal.signal(sig, _signal_handler)
 
+        try:
+            self._run_and_save(single_url, url_list, new_only, resume_only, retry_failed, account_source)
+        finally:
+            for sig, handler in previous_handlers.items():
+                if handler is not None:
+                    with contextlib.suppress(ValueError, OSError, TypeError):
+                        signal.signal(sig, handler)
+            # A pause requested once the workers had stopped looking -- during
+            # the empty-series re-check, say -- has nothing left to pause.
+            self._clear_pause_file()
+
+    def _run_and_save(self, single_url, url_list, new_only, resume_only, retry_failed, account_source):
+        """The body of run(), with its pause and failure paths; see run()."""
         try:
             if resume_only:
                 if self.load_checkpoint():
@@ -3092,9 +3469,20 @@ class AniWorldScraper:
         mirror serving a 200 placeholder read as reachable and could be
         made the active host. The login page is also the smaller request:
         ~17 KB against a ~350 KB homepage.
+
+        Sent with the same browser User-Agent and timeouts as every other
+        request, as both sibling scrapers already do. httpx's default
+        "python-httpx" agent is the first thing a bot filter turns away, and a
+        host that refuses the probe is never used even when it would have
+        served the real session perfectly well.
         """
         try:
-            async with httpx.AsyncClient(timeout=HTTP_REQUEST_TIMEOUT, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                http2=USE_HTTP2,
+                headers={"User-Agent": UA},
+                timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
+                follow_redirects=True,
+            ) as client:
                 resp = await client.get(_login_url(site_url))
             ok = resp.status_code < 500 and _looks_like_login_page(resp.text)
             return {
@@ -3157,23 +3545,40 @@ class AniWorldScraper:
         """Fetch a series URL and return current title/availability info.
 
         Used to verify vanished/rename candidates without doing a full scrape.
-        Returns a dict with keys: url, reachable, title, season_count, error.
+        Returns a dict with keys: url, reachable, gone, title, season_count,
+        error. `reachable` means the page was served; `gone` means the site
+        answered that the series does not exist (HTTP 404/410 or its own
+        not-found page). Neither means the check could not tell -- a timeout,
+        a 5xx, a 429 -- and the caller must not read that as either answer.
+
+        The page goes through _get, so it is retried and paced like every
+        other request. It used to be one bare GET, and one 502 was then
+        reported to the user as "the series really is gone" right before they
+        decided whether to delete it.
         """
         result = {
             "url": url,
             "reachable": False,
+            "gone": False,
             "title": None,
             "season_count": 0,
             "error": None,
         }
         try:
-            resp = await client.get(url, follow_redirects=True)
+            resp = await self._get(client, _on_host(url, self.site_url))
+            if resp.status_code in (404, 410):
+                result["gone"] = True
+                result["error"] = f"http_{resp.status_code}"
+                return result
             doc = make_doc(resp.text)
             if doc is None:
                 result["error"] = "error_page_unparseable"
                 return result
             error_code = _check_error_page(doc)
             if error_code:
+                # Only the site's own "not found" says anything about the
+                # series; a 5xx or 429 page says nothing either way.
+                result["gone"] = error_code in _GONE_CODES
                 result["error"] = f"error_page_{error_code}"
                 return result
             title = _extract_title(doc)
@@ -3207,7 +3612,7 @@ class AniWorldScraper:
         self,
         vanished_entries: list[tuple[str, ...]],
         candidate_entries: list[dict],
-    ) -> tuple[list[tuple[str, str, bool]], list[dict]]:
+    ) -> tuple[list[tuple[str, str, bool | None]], list[dict]]:
         """Re-fetch vanished URLs and rename candidates to verify accuracy.
 
         Args:
@@ -3219,9 +3624,12 @@ class AniWorldScraper:
 
         Returns:
             Tuple of (verified_vanished, verified_candidates). Each verified
-            vanished entry is (title, url, reachable). Callers must test
-            `reachable`: an unreachable URL is still returned, carrying its
-            original title, so the list being non-empty proves nothing.
+            vanished entry is (title, url, reachable), where reachable is True
+            when the page was served, False only when the site said the series
+            does not exist, and None when the check could not tell -- a
+            timeout, a 5xx, no URL to check. Callers must tell False from None:
+            every entry is returned either way, carrying its original title, so
+            the list being non-empty proves nothing.
         """
         normalised_vanished: list[tuple[str, str]] = []
         for item in vanished_entries:
@@ -3252,8 +3660,8 @@ class AniWorldScraper:
             all_urls.extend(e.get("url", e.get("link", "")) for e in candidate_entries if e.get("url") or e.get("link"))
             unique_urls = sorted(set(all_urls))
             if not unique_urls:
-                # Nothing was fetched, so nothing is verified as reachable.
-                return [(t, u, False) for t, u in normalised_vanished], candidate_entries
+                # Nothing was fetched, so nothing is known either way.
+                return [(t, u, None) for t, u in normalised_vanished], candidate_entries
 
             print(f"\n→ Verifying {len(unique_urls)} vanished/rename URL(s) with fresh scrape...")
             results = await asyncio.gather(
@@ -3267,13 +3675,15 @@ class AniWorldScraper:
                 if isinstance(res, dict):
                     info_by_url[res["url"]] = res
 
-            verified_vanished = []
+            verified_vanished: list[tuple[str, str, bool | None]] = []
             for title, url in normalised_vanished:
                 info = info_by_url.get(url, {})
                 if info.get("reachable"):
                     verified_vanished.append((info.get("title") or title, url, True))
-                else:
+                elif info.get("gone"):
                     verified_vanished.append((title, url, False))
+                else:
+                    verified_vanished.append((title, url, None))
 
             verified_candidates = []
             for entry in candidate_entries:

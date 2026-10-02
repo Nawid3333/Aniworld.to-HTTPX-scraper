@@ -334,6 +334,41 @@ class CleanupPromptTests(unittest.TestCase):
             self.assertFalse(removed)
             self.assertEqual(self._titles(index_path), {"Alpha", "Gone"})
 
+    def test_the_ignore_list_is_written_atomically(self):
+        """A plain open("w") emptied the file first; a crash then lost every slug in it."""
+        with tempfile.TemporaryDirectory(prefix="aniworld_slug_") as tmp:
+            _index_path, idx_mgr = self._setup(tmp)
+            with (
+                patch.object(main, "atomic_write_json", wraps=main.atomic_write_json) as writer,
+                patch("builtins.input", side_effect=["k", "y"]),
+                captured_output(),
+            ):
+                main._prompt_clean_vanished(idx_mgr)
+            writer.assert_called_once()
+            self.assertEqual(writer.call_args[0][0], os.path.join(tmp, "ignored_vanished.json"))
+
+    def test_an_unreadable_ignore_list_is_not_written_over(self):
+        """Read as empty and saved back, it used to lose every slug it held."""
+        with tempfile.TemporaryDirectory(prefix="aniworld_slug_") as tmp:
+            _index_path, idx_mgr = self._setup(tmp)
+            ignored = os.path.join(tmp, "ignored_vanished.json")
+            Path(ignored).write_text('{"slugs": ["older-one", "older-two"', encoding="utf-8")
+            with patch("builtins.input", side_effect=["k", "y"]), captured_output() as out:
+                main._prompt_clean_vanished(idx_mgr)
+            self.assertEqual(Path(ignored).read_text(encoding="utf-8"), '{"slugs": ["older-one", "older-two"')
+            self.assertIn("could not be read", out.getvalue())
+
+
+class IndexSlugReportOrderTests(unittest.TestCase):
+    """The startup report reads an entry's slug the way every other check does: link first."""
+
+    def test_an_entry_whose_link_and_url_disagree_is_reported_under_its_link(self):
+        entry = _index_entry("Renamed", "new-name")
+        entry["url"] = "https://aniworld.to/anime/stream/old-name"
+        idx_mgr = type("Index", (), {"series_index": {"Renamed": entry}})()
+        slugs, _dups, _no_slug = main._collect_index_slugs(idx_mgr)
+        self.assertEqual(slugs, {"new-name"})
+
 
 if __name__ == "__main__":
     unittest.main()

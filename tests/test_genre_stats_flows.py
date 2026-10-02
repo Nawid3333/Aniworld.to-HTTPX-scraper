@@ -459,6 +459,74 @@ class ChangeLineTests(unittest.TestCase):
         self.assertIn("mystery", line)
 
 
+class RefreshThatNeverStartedTests(_FlowTest):
+    """A refresh that could not even sign in used to save anyway.
+
+    The baseline was rotated and the labels emptied before the login, so a
+    site that was down wiped every genre's display name, dropped the changes
+    the user had not looked at yet, stamped the old data with a new time and
+    reported "N/N series recorded" for a run that recorded nothing.
+    """
+
+    # One genre on the page, under a label the stored data does not have yet.
+    PAGE = (
+        '<html><body><h1 itemprop="name"><span>Done One</span></h1>'
+        '<div class="genres"><ul><li><a itemprop="genre" href="/genre/action">Action (renamed)</a></li></ul></div>'
+        "</body></html>"
+    )
+
+    def _stored(self):
+        with open(self.index_path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _seed(self):
+        # previous_series differs from series: a change the user has not seen.
+        genre_stats.save_genres(genre_data(previous_series={"done-one": ["action"], "partial": ["action"]}))
+        with open(self.index_path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_a_login_that_fails_leaves_the_genre_data_untouched(self):
+        before = self._seed()
+
+        async def down(_self, verify=True):
+            raise RuntimeError("Login failed")
+
+        with mock.patch.object(genre_stats.AniWorldScraper, "_create_logged_in_client", down):
+            out = self.run_capturing(genre_stats.scrape_genres, "https://example.test")
+        with open(self.index_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertIn("left unchanged", out)
+        self.assertNotIn("series recorded", out)
+
+    def test_a_refresh_keeps_each_old_label_until_a_page_replaces_it(self):
+        self._seed()
+
+        class _Client:
+            async def aclose(self):
+                pass
+
+        async def logged_in(_self, verify=True):
+            return _Client()
+
+        async def catalogue(_self, _client):
+            return [{"title": "Done One", "link": f"{SLUG_PREFIX}/done-one"}]
+
+        async def page(_self, _client, _url, **_kwargs):
+            return mock.Mock(text=self.PAGE, status_code=200)
+
+        cls = genre_stats.AniWorldScraper
+        with (
+            mock.patch.object(cls, "_create_logged_in_client", logged_in),
+            mock.patch.object(cls, "_get_all_series", catalogue),
+            mock.patch.object(cls, "_get", page),
+            mock.patch.object(cls, "get_ignored_slugs", lambda _self: set()),
+        ):
+            self.run_capturing(genre_stats.scrape_genres, "https://example.test")
+        labels = self._stored()["labels"]
+        self.assertEqual(labels["action"], "Action (renamed)", "the live page's label wins")
+        self.assertEqual(labels["drama"], "Drama", "a label no page replaced is kept, not wiped")
+
+
 class PromptGenreChoiceTests(unittest.TestCase):
     """The non-tty fallback path, which is what a piped run and CI both take."""
 
@@ -474,8 +542,31 @@ class PromptGenreChoiceTests(unittest.TestCase):
     def test_matching_is_case_insensitive(self):
         self.assertEqual(self._choose("aCtIoN"), "action")
 
-    def test_a_substring_selects_the_matching_genre(self):
-        self.assertEqual(self._choose("science"), "sci_fi")
+    def test_a_fragment_is_asked_again_rather_than_guessed(self):
+        """Without the live picker's preview, "science" is a guess, not an answer.
+
+        This used to select Science Fiction -- and "a" selected "All genres",
+        the first label containing it. Only a listed label counts now.
+        """
+        self.assertEqual(self._choose("science", "Science Fiction"), "sci_fi")
+
+    def test_end_of_input_goes_back(self):
+        """A closed stdin used to raise EOFError out of the whole program."""
+        with mock.patch("builtins.input", side_effect=[EOFError()]), redirect_stdout(io.StringIO()):
+            self.assertEqual(genre_stats._prompt_genre_choice(self.choices), "__back__")
+
+    def test_end_of_input_without_back_shows_every_genre(self):
+        """With no back to offer, the answer that filters nothing is the safe one."""
+        with mock.patch("builtins.input", side_effect=[EOFError()]), redirect_stdout(io.StringIO()):
+            self.assertEqual(genre_stats._prompt_genre_choice(self.choices, allow_back=False), "all")
+
+    def test_endless_unmatched_answers_stop_and_go_back(self):
+        """An unattended feed of junk used to be asked forever."""
+        # Finite on purpose: a missing cap fails fast with StopIteration instead of hanging.
+        answers = ["zzz"] * (genre_stats.term.MAX_UNRECOGNIZED + 1)
+        with mock.patch("builtins.input", side_effect=answers) as feeder, redirect_stdout(io.StringIO()):
+            self.assertEqual(genre_stats._prompt_genre_choice(self.choices), "__back__")
+        self.assertEqual(feeder.call_count, genre_stats.term.MAX_UNRECOGNIZED)
 
     def test_zero_goes_back(self):
         self.assertEqual(self._choose("0"), "__back__")
@@ -518,9 +609,22 @@ class MenuTests(_FlowTest):
         out = self._run_menu("0")
         self.assertIn("Genre data:", out)
 
-    def test_an_invalid_choice_is_rejected_and_the_menu_repeats(self):
+    def test_an_invalid_choice_is_rejected_and_asked_again(self):
         out = self._run_menu("9", "0")
-        self.assertIn("Invalid choice", out)
+        self.assertIn("'9' is not an option", out)
+
+    def test_end_of_input_leaves_the_menu(self):
+        """A bare input() here let EOFError escape to the top of the program."""
+        with mock.patch("builtins.input", side_effect=[EOFError()]):
+            out = self.run_capturing(genre_stats.menu)
+        self.assertIn("No input available", out)
+
+    def test_endless_invalid_choices_leave_the_menu(self):
+        # Finite on purpose: a missing cap fails fast with StopIteration instead of hanging.
+        answers = ["9"] * (genre_stats.term.MAX_UNRECOGNIZED + 1)
+        with mock.patch("builtins.input", side_effect=answers) as feeder:
+            self.run_capturing(genre_stats.menu)
+        self.assertEqual(feeder.call_count, genre_stats.term.MAX_UNRECOGNIZED)
 
     def test_option_one_scrapes(self):
         with mock.patch.object(genre_stats, "scrape_genres") as fn:

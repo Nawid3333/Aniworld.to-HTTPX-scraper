@@ -348,5 +348,81 @@ class MergeGuardTests(unittest.TestCase):
         self.assertEqual(second["total_episodes"], 11)
 
 
+class IgnoredEpisodeZeroTests(unittest.TestCase):
+    """Episode 0 of an ignored season leaves the index only on its own yes.
+
+    The ignore list makes the scraper drop episode 0, so the index's old
+    episode 0 showed up under "DELETE these episodes?" -- and answering n
+    there did not keep it: the merge deleted it anyway. Its own question
+    used to appear only when nothing else had changed.
+    """
+
+    @staticmethod
+    def _entry(*, ignored, numbers, watched=(1,)):
+        # Episode 1 watched on both sides keeps the integrity check quiet,
+        # so the prompts in the save tests are exactly the ones named there.
+        entry = series("Show", slug="show", seasons=1)
+        season = entry["seasons"][0]
+        season["episodes"] = [{"number": n, "watched": n in watched} for n in numbers]
+        if ignored:
+            season["ignored_episode_0"] = True
+        im.sync_season_counts(season)
+        total, seen = im.get_episode_counts(entry)
+        entry.update(total_episodes=total, watched_episodes=seen, unwatched_episodes=total - seen)
+        return entry
+
+    def setUp(self):
+        self.old = {"Show": self._entry(ignored=False, numbers=(0, 1))}
+        self.new = {"Show": self._entry(ignored=True, numbers=(1, 2))}
+
+    @staticmethod
+    def _numbers(merged):
+        return [ep["number"] for ep in merged["Show"]["seasons"][0]["episodes"]]
+
+    def test_it_is_not_listed_as_an_episode_removal(self):
+        changes = im.detect_changes(self.old, self.new)
+        self.assertEqual(changes["removed_episodes"], [])
+
+    def test_declining_keeps_it_even_when_removals_were_approved(self):
+        merged = im._build_merged_data(self.old, self.new, {**ALLOW_ALL, "ignore_episode_0": False})
+        self.assertEqual(self._numbers(merged), [0, 1, 2])
+        self.assertNotIn("ignored_episode_0", merged["Show"]["seasons"][0])
+
+    def test_approving_removes_it_and_flags_the_season(self):
+        merged = im._build_merged_data(self.old, self.new, {**ALLOW_ALL, "ignore_episode_0": True})
+        self.assertEqual(self._numbers(merged), [1, 2])
+        self.assertTrue(merged["Show"]["seasons"][0]["ignored_episode_0"])
+
+    def test_declining_also_keeps_a_flag_the_scrape_dropped(self):
+        old = {"Show": self._entry(ignored=True, numbers=(1,))}
+        new = {"Show": self._entry(ignored=False, numbers=(1,))}
+        merged = im._build_merged_data(old, new, {**ALLOW_ALL, "ignore_episode_0": False})
+        self.assertTrue(merged["Show"]["seasons"][0]["ignored_episode_0"])
+
+    def _save(self, answers):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_index([self.old["Show"]], tmp)
+            manager = im.IndexManager(path)
+            with mock.patch("builtins.input", side_effect=answers) as feeder, captured_output() as out:
+                result = im.confirm_and_save_changes([self.new["Show"]], "test", manager)
+            on_disk = json.loads(Path(path).read_text(encoding="utf-8"))
+        return result, on_disk[0]["seasons"][0], out.getvalue(), feeder.call_count
+
+    def test_n_to_its_own_question_keeps_it_through_a_save(self):
+        """The repro: other changes saved, episode 0 answered n -- it stays."""
+        # Add the new episode 2: y. Episode 0 changes: n. Save: y.
+        result, season, printed, asked = self._save(["y", "n", "y"])
+        self.assertTrue(result)
+        self.assertEqual([ep["number"] for ep in season["episodes"]], [0, 1, 2])
+        self.assertIn("episode 0 change", printed)
+        self.assertEqual(asked, 3)
+
+    def test_y_to_its_own_question_applies_it_with_the_save(self):
+        result, season, _printed, _asked = self._save(["y", "y", "y"])
+        self.assertTrue(result)
+        self.assertEqual([ep["number"] for ep in season["episodes"]], [1, 2])
+        self.assertTrue(season["ignored_episode_0"])
+
+
 if __name__ == "__main__":
     unittest.main()

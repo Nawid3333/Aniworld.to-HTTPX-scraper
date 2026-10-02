@@ -138,5 +138,34 @@ class TestSuggestPicker(unittest.TestCase):
         self.assertNotIn("Anime B", out)
 
 
+class TestPickerFallback(unittest.TestCase):
+    """main.py's copy of the genre picker, on a terminal that is not a tty.
+
+    Its fallback loop read input() forever: end of input raised EOFError out
+    of the program, an unattended feed of junk never stopped, and a fragment
+    such as "a" picked whichever label happened to contain it first.
+    """
+
+    choices = {"all": "All genres / no filter", "action": "Action", "sci_fi": "Science Fiction"}
+
+    def _choose(self, answers):
+        # Finite on purpose: a missing cap fails fast with StopIteration instead of hanging.
+        with mock.patch("builtins.input", side_effect=answers) as feeder, mock.patch("sys.stdout", new=io.StringIO()):
+            return main._prompt_genre_choice(self.choices), feeder.call_count
+
+    def test_a_listed_label_in_any_case_is_taken(self):
+        self.assertEqual(self._choose(["science fiction"])[0], "sci_fi")
+
+    def test_a_fragment_is_asked_again(self):
+        self.assertEqual(self._choose(["science", "Action"]), ("action", 2))
+
+    def test_end_of_input_goes_back(self):
+        self.assertEqual(self._choose([EOFError()]), ("__back__", 1))
+
+    def test_endless_junk_stops_and_goes_back(self):
+        limit = main.term.MAX_UNRECOGNIZED
+        self.assertEqual(self._choose(["zzz"] * (limit + 1)), ("__back__", limit))
+
+
 if __name__ == "__main__":
     unittest.main()

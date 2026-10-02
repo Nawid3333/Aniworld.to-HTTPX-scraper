@@ -282,6 +282,68 @@ class TestSubscriptionAndWatchlistOnNewSeries(unittest.TestCase):
         self.assertEqual(changes["watchlist_added"], ["Show"])
 
 
+class TestNewSeasonOfAKnownSeries(unittest.TestCase):
+    """A season the index has never seen passes the same gates as any new episode.
+
+    The merge handled a new season on its own branch, which never looked at
+    the gates: declining "Add these new episodes?" still added the whole
+    season, and declining the watched prompt still stored its episodes as
+    watched. A new season of a show already in the index is common, so the
+    refusal was ignored on many runs.
+    """
+
+    def setUp(self):
+        self.old = {"Show": series([(1, True), (2, True)])}
+        self.new = {"Show": series([(1, True), (2, True)])}
+        second = copy.deepcopy(self.new["Show"]["seasons"][0])
+        second["season"] = "Staffel 2"
+        second["episodes"] = [
+            {"number": 1, "watched": True},
+            {"number": 2, "watched": True},
+            {"number": 3, "watched": False},
+        ]
+        self.new["Show"]["seasons"].append(second)
+
+    @staticmethod
+    def labels(merged):
+        return [season["season"] for season in merged["Show"]["seasons"]]
+
+    @staticmethod
+    def second_season(merged):
+        season = next(s for s in merged["Show"]["seasons"] if s["season"] == "Staffel 2")
+        return {ep["number"]: ep["watched"] for ep in season["episodes"]}
+
+    def test_its_episodes_reach_both_prompts(self):
+        changes = detect_changes(copy.deepcopy(self.old), copy.deepcopy(self.new))
+        self.assertEqual(len(changes["new_episodes"]), 3)
+        self.assertEqual(len(changes["newly_watched"]), 2)
+
+    def test_declining_new_episodes_leaves_the_season_out(self):
+        """The repro: everything declined, and season 2 was stored anyway."""
+        merged = merge(self.old, self.new, DENY)
+        self.assertEqual(self.labels(merged), ["Staffel 1"])
+        self.assertEqual(merged["Show"]["watched_episodes"], 2)
+
+    def test_declined_season_is_offered_again_next_scrape(self):
+        index = merge(self.old, self.new, DENY)
+        self.assertEqual(len(detect_changes(index, copy.deepcopy(self.new))["new_episodes"]), 3)
+
+    def test_declining_only_the_watch_state_adds_it_unwatched(self):
+        merged = merge(self.old, self.new, ADD_ONLY)
+        self.assertEqual(self.second_season(merged), {1: False, 2: False, 3: False})
+        self.assertEqual(merged["Show"]["watched_episodes"], 2)
+
+    def test_approving_both_adds_it_as_the_site_shows_it(self):
+        merged = merge(self.old, self.new, ADD_AND_WATCH)
+        self.assertEqual(self.second_season(merged), {1: True, 2: True, 3: False})
+
+    def test_the_known_season_is_untouched_either_way(self):
+        for allowed in (DENY, ADD_ONLY, ADD_AND_WATCH):
+            with self.subTest(allowed=allowed):
+                season = merge(self.old, self.new, allowed)["Show"]["seasons"][0]
+                self.assertEqual({ep["number"]: ep["watched"] for ep in season["episodes"]}, {1: True, 2: True})
+
+
 class TestNothingIsLost(unittest.TestCase):
     """Refusing anything costs one run and never corrupts the index."""
 

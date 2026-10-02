@@ -218,6 +218,54 @@ class TestParseEpisodesTakesHtml(unittest.TestCase):
         """Same shape, no rows: still [] (a real season state), not None."""
         self.assertEqual(_parse_episodes('<table class="seasonEpisodesList"><tbody></tbody></table>'), [])
 
+    def test_episode_rows_the_selectors_no_longer_match_are_a_failure(self):
+        """A redesign that drops data-episode-id must not read as an empty season.
+
+        The rows are plainly episodes -- a number, a title -- but none of the
+        row selectors matched them, and the table being present was enough to
+        return []: every season of every series would have been stored as 0
+        episodes.
+        """
+        html = """
+        <table class="seasonEpisodesList"><thead><tr><th>#</th></tr></thead><tbody>
+          <tr class="seen"><meta itemprop="episodeNumber" content="1">
+            <td class="seasonEpisodeTitle"><a><strong>Pilot</strong></a></td></tr>
+        </tbody></table>
+        """
+        self.assertIsNone(_parse_episodes(html))
+
+    def test_a_header_row_alone_is_still_an_empty_season(self):
+        """Every real season table has a <thead> row; that is not an episode."""
+        html = '<table class="seasonEpisodesList"><thead><tr><th>#</th></tr></thead><tbody></tbody></table>'
+        self.assertEqual(_parse_episodes(html), [])
+
+
+class TestSubscriptionStatusNeedsASignal(unittest.TestCase):
+    """Absent markup is "unknown", never "not subscribed"."""
+
+    AVATAR = '<div class="avatar"><a href="/user/profil/Me">me</a></div>'
+
+    def _status(self, body):
+        doc = make_doc(f"<html><body>{self.AVATAR}{body}</body></html>")
+        return scraper._detect_subscription_status(doc)
+
+    def test_no_attribute_and_no_control_reads_as_unknown(self):
+        """A redesign that dropped both used to read every series as unsubscribed
+        and off the watchlist, and the merge offered to clear both flags across
+        the whole index."""
+        self.assertEqual(self._status('<div class="add-series"></div>'), (None, None))
+
+    def test_the_css_controls_still_answer_when_the_attributes_are_gone(self):
+        body = (
+            '<div class="add-series"></div><ul>'
+            '<li class="setFavourite true">fav</li><li class="setWatchlist">wl</li></ul>'
+        )
+        self.assertEqual(self._status(body), (True, False))
+
+    def test_the_data_attributes_still_win(self):
+        body = '<div class="add-series" data-series-favourite="0" data-series-watchlist="1"></div>'
+        self.assertEqual(self._status(body), (False, True))
+
 
 # ==================== unparseable season handling ====================
 class _FakeResponse:

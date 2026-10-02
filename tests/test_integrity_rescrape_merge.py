@@ -121,16 +121,17 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertTrue(result.get("rescrape"))
         self.assertEqual(result["titles"], ["Critical"])
-        # main.py deletes by these entries, so they must be handed back too.
+        # main.py offers replacements for these entries, so they must be
+        # handed back too.
         self.assertEqual([s["title"] for s in result["series"]], ["Critical"])
 
     def test_declining_the_save_also_cancels_the_rescrape(self):
-        """Declining the final save must not still delete and rescrape.
+        """Declining the final save must not still rescrape and offer swaps.
 
-        main.py acts on the returned dict by deleting those series from the
-        index. Handing it back after the user answered "n" to "Save these
-        changes?" would destroy data on the strength of a prompt they had
-        just refused, so the refusal has to cancel both halves.
+        main.py acts on the returned dict by rescraping those series and
+        offering each as a replacement. Doing that after the user answered
+        "n" to "Save these changes?" would act on a run they had just
+        refused, so the refusal has to cancel both halves.
         """
         manager = im.IndexManager(self.index_file)
         rescrape = {
@@ -156,6 +157,63 @@ class TestApprovalsSurviveCriticalRescrape(unittest.TestCase):
             12,
             "approved watch change was discarded when a critical rescrape was chosen",
         )
+
+
+class TestCriticalRescrapeReplacesOnlyWhatCameBack(unittest.TestCase):
+    """The rescrape the dialog starts swaps an entry only on its own y.
+
+    The critical series used to be deleted from the index before the rescrape
+    ran. A rescrape that failed, or a declined prompt after it, left the
+    series gone with its whole watch history -- and the series that trip this
+    check are the ones whose episodes the site lost, where the index is the
+    only record. Now each one stays until it has been read again and its
+    swap approved.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.index_file = str(Path(self.dir.name) / "series_index.json")
+        self.critical = _series("Critical", 1, [True, True])
+        self.critical["added_date"] = "2020-01-01T00:00:00"
+        with open(self.index_file, "w", encoding="utf-8") as f:
+            json.dump([_series("Other", 1, [True]), self.critical], f)
+        self.fresh = _series("Critical", 1, [True])
+
+    def _index(self):
+        with open(self.index_file, encoding="utf-8") as f:
+            return {s["title"]: s for s in json.load(f)}
+
+    def _replace(self, answers, fresh=None):
+        with mock.patch("builtins.input", side_effect=answers) as feeder, mock.patch("sys.stdout"):
+            result = im.replace_critical_series(
+                [self.critical], [self.fresh] if fresh is None else fresh, self.index_file
+            )
+        return result, feeder.call_count
+
+    def test_y_swaps_in_what_the_site_shows_now(self):
+        result, _ = self._replace(["y"])
+        self.assertEqual(result, (1, 0))
+        index = self._index()
+        self.assertEqual(index["Critical"]["total_episodes"], 1)
+        self.assertEqual(index["Critical"]["added_date"], "2020-01-01T00:00:00", "it is the same series")
+        self.assertEqual(index["Other"]["watched_episodes"], 1)
+
+    def test_n_keeps_the_entry_as_it_is(self):
+        result, _ = self._replace(["n"])
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(self._index()["Critical"]["watched_episodes"], 2)
+
+    def test_end_of_input_keeps_it(self):
+        self._replace([EOFError])
+        self.assertEqual(self._index()["Critical"]["watched_episodes"], 2)
+
+    def test_a_series_that_did_not_come_back_is_kept_without_asking(self):
+        """The repro: a failed rescrape used to leave nothing but a deleted entry."""
+        result, asked = self._replace([], fresh=[{**self.fresh, "_error": True}])
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(asked, 0)
+        self.assertEqual(sorted(self._index()), ["Critical", "Other"])
 
 
 class TestRescrapeListsStayInStep(unittest.TestCase):
