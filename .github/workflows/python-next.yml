@@ -1,0 +1,183 @@
+name: Next Python
+
+# ci.yml tests the oldest supported Python (3.11) and the newest stable one
+# (3.x) on every push, every pull request and every Monday, so a new stable
+# release is tested the week it comes out. This tests the Python after it while
+# it is still an alpha, beta or release candidate, so a break shows up months
+# before the release instead of on the day the maintainer's machine moves to it.
+#
+# Once a day it reads the versions setup-python can install (the
+# actions/python-versions manifest). When the newest Windows x64 build is a
+# pre-release of a newer Python than the newest stable one, ci.yml's test job
+# runs on it. Each pre-release is tested once: a green run is recorded as an
+# Actions cache entry (python-next-<version>) and later runs find it and stop.
+# A failing one is retried every day until it passes or the next pre-release
+# replaces it. A failure opens one issue per Python version, assigned to the
+# owner with an @mention; the first green run closes it, and so does the
+# release itself, from then on ci.yml's 3.x job tests it. Run by hand to test
+# the newest pre-release again regardless.
+
+on:
+  schedule:
+    - cron: '45 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: python-next
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Find the newest Python pre-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.find.outputs.version }}
+      minor: ${{ steps.find.outputs.minor }}
+      key: ${{ steps.find.outputs.key }}
+      tested: ${{ steps.tested.outputs.cache-hit }}
+    steps:
+      - name: Read the version list
+        id: find
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 3 -o "$RUNNER_TEMP/manifest.json" \
+            https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
+          python3 - "$RUNNER_TEMP/manifest.json" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, re, sys
+
+          def order(version):
+              # "3.15.0-beta.2" -> (3, 15, 0, 1, 2); a final release ranks above its rc.
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?", version)
+              if not m:
+                  return None
+              major, minor, patch, pre, n = m.groups()
+              rank = {"alpha": 0, "beta": 1, "rc": 2, None: 3}[pre]
+              return (int(major), int(minor), int(patch), rank, int(n or 0))
+
+          # Windows x64 only: CI runs there. Free-threaded builds have an arch of their own.
+          releases = [
+              r for r in json.load(open(sys.argv[1], encoding="utf-8"))
+              if order(r["version"]) and any(f["platform"] == "win32" and f["arch"] == "x64" for f in r["files"])
+          ]
+          newest = max(releases, key=lambda r: order(r["version"]))
+          stable = max((r for r in releases if r["stable"]), key=lambda r: order(r["version"]))
+          print(f"Newest stable: {stable['version']}, newest of all: {newest['version']}", file=sys.stderr)
+          if order(newest["version"])[:2] > order(stable["version"])[:2]:
+              major, minor = order(newest["version"])[:2]
+              print(f"version={newest['version']}")
+              print(f"minor={major}.{minor}")
+              print(f"key=python-next-{newest['version']}")
+          else:
+              print("No pre-release of a newer Python yet; nothing to test.", file=sys.stderr)
+          EOF
+
+      - name: Already tested?
+        id: tested
+        if: steps.find.outputs.version != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .python-next-tested
+          key: ${{ steps.find.outputs.key }}
+          lookup-only: true
+
+  test:
+    name: On the pre-release
+    needs: detect
+    if: >
+      needs.detect.outputs.version != '' &&
+      (needs.detect.outputs.tested != 'true' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    with:
+      python-versions: ${{ format('["{0}"]', needs.detect.outputs.version) }}
+
+  # Only after a green run, so a pre-release is never recorded as tested while it fails.
+  record:
+    name: Record the pre-release as tested
+    needs: [detect, test]
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: echo "$VERSION" > .python-next-tested
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .python-next-tested
+          key: ${{ needs.detect.outputs.key }}
+
+  report:
+    needs: [detect, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DETECT: ${{ needs.detect.result }}
+          TEST: ${{ needs.test.result }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          MINOR: ${{ needs.detect.outputs.minor }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          open_issues() { # title -> numbers of the open issues with that title
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title == \"$1\") | .number"
+          }
+
+          if [ "$DETECT" != success ]; then
+            title='Next Python check cannot read the version list'
+            if [ -z "$(open_issues "$title")" ]; then
+              printf '@%s The daily Next Python check could not read which Pythons setup-python can install, so it is not testing pre-releases: %s\n\nThe actions/python-versions manifest has probably moved or changed format; the detect step in .github/workflows/python-next.yml needs adjusting. This issue does not close on its own.\n' \
+                "$OWNER" "$RUN_URL" > "$RUNNER_TEMP/body.md"
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"
+            fi
+            exit 0
+          fi
+
+          # An issue for any other Python is settled: that Python is released
+          # now, and ci.yml's 3.x job tests it on every push and every Monday.
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+            --jq '.[] | select(.title | test("^CI fails on Python [0-9.]+ \\(pre-release\\)$")) | "\(.number) \(.title)"' |
+            while read -r number rest; do
+              if [ "$rest" != "CI fails on Python $MINOR (pre-release)" ]; then
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                  --comment "That Python is no longer the next pre-release; ci.yml's 3.x job tests it once it is released. $RUN_URL"
+              fi
+            done
+
+          if [ "$TEST" != success ] && [ "$TEST" != failure ]; then
+            echo "Python ${VERSION:-pre-release}: ${TEST:-not run} - nothing to report."
+            exit 0
+          fi
+          title="CI fails on Python $MINOR (pre-release)"
+          number=$(open_issues "$title" | head -1)
+          if [ "$TEST" = success ]; then
+            if [ -n "$number" ]; then
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Green on Python $VERSION now: $RUN_URL"
+            fi
+            exit 0
+          fi
+          if [ -n "$number" ]; then
+            echo "Python $VERSION still failing; already reported in #$number."
+            exit 0
+          fi
+          {
+            printf '@%s CI fails on **Python %s**, a pre-release of the next Python: %s\n\n' "$OWNER" "$VERSION" "$RUN_URL"
+            printf 'ci.yml tests Python 3.11 and the newest stable Python on every push; if those are green, something in %s differs. The run log names the failing step:\n\n' "$MINOR"
+            printf -- '- **Install**: a dependency has no build for Python %s yet, or does not support it. Moving your own Python to %s would hit the same wall until that dependency releases one; nothing in this repository needs changing.\n' "$MINOR" "$MINOR"
+            printf -- '- **Lint, Format, Type check or Test**: the code relies on something %s changed or removed. "What'"'"'s New in Python %s" on docs.python.org lists those changes.\n\n' "$MINOR" "$MINOR"
+            printf 'This issue closes on its own once a run on a %s pre-release passes (the check retries daily), or once %s is released.\n' "$MINOR" "$MINOR"
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --assignee "$OWNER" --body-file "$RUNNER_TEMP/body.md"

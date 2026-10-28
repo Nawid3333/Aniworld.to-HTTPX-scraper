@@ -795,6 +795,34 @@ class TestBatchFileExportAppends(QuietCase):
         self.assertEqual((len(added), skipped), (0, 1))
         self.assertEqual(self._read(), commented)
 
+    def test_a_crlf_file_keeps_its_line_endings(self):
+        """The "w" mode this used to write with made every line CRLF on Windows."""
+        with open(self.path, "wb") as fh:
+            fh.write(b"# my notes\r\n" + series_url("mine").encode() + b"\r\n")
+        self._append([series_url("alpha")])
+        with open(self.path, "rb") as fh:
+            data = fh.read()
+        self.assertEqual(data.count(b"\r\n"), 3)
+        self.assertEqual(data.count(b"\n"), 3, "a bare LF crept in")
+
+    def test_an_lf_file_keeps_its_line_endings(self):
+        with open(self.path, "wb") as fh:
+            fh.write(series_url("mine").encode() + b"\n")
+        self._append([series_url("alpha")])
+        with open(self.path, "rb") as fh:
+            self.assertNotIn(b"\r", fh.read())
+
+    def test_a_failed_write_leaves_the_file_as_it_was(self):
+        with open(self.path, "wb") as fh:
+            fh.write(series_url("mine").encode() + b"\n")
+        with (
+            mock.patch("src.atomic_io._retry_on_lock", side_effect=OSError("disk full")),
+            self.assertRaises(OSError),
+        ):
+            self._append([series_url("alpha")])
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), series_url("mine").encode() + b"\n")
+
 
 class TestSingleUrlRunReportsProgress(unittest.TestCase):
     """A one-series scrape used to finish silently.

@@ -20,7 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import atomic_io  # noqa: E402
-from src.atomic_io import _rotate_backups, atomic_write_json, create_file_backup  # noqa: E402
+from src.atomic_io import _rotate_backups, atomic_write_json, atomic_write_text, create_file_backup  # noqa: E402
 
 
 class _TmpDirTest(unittest.TestCase):
@@ -78,6 +78,25 @@ class AtomicWriteJsonTests(_TmpDirTest):
         atomic_write_json(p, {"old": True, "extra": 1})
         atomic_write_json(p, {"new": True})
         self.assertEqual(json.loads(self.read(p)), {"new": True})
+
+
+class AtomicWriteTextTests(_TmpDirTest):
+    """The batch file's writer: the text lands exactly as given."""
+
+    def test_line_endings_are_written_untranslated(self):
+        """A CRLF file stays CRLF and an LF one LF, even on Windows."""
+        p = self.path("series_urls.txt")
+        for text in ("a\r\nb\r\n", "a\nb\n", "a\nb"):
+            atomic_write_text(p, text)
+            with open(p, "rb") as fh:
+                self.assertEqual(fh.read(), text.encode("utf-8"))
+
+    def test_backup_false_makes_no_backup(self):
+        p = self.path("series_urls.txt")
+        atomic_write_text(p, "old\n", backup=False)
+        atomic_write_text(p, "new\n", backup=False)
+        self.assertEqual(self.read(p), "new\n")
+        self.assertEqual(os.listdir(self.dirpath), ["series_urls.txt"])
 
 
 class BackupOnWriteTests(_TmpDirTest):
