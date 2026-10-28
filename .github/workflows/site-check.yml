@@ -24,15 +24,25 @@ on:
     # 06:23 UTC on the 3rd of every month. Off the hour, when fewer
     # scheduled runs are queued and a late start is less likely.
     - cron: "23 6 3 * *"
+  # Every pull request and every push to main as well, so a change -- a
+  # Dependabot bump of a dependency included -- is checked against the live
+  # site before and after it is merged, not up to a month later. Those runs
+  # only pass or fail; the issue stays the monthly and manual runs'.
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
   issues: write
 
+# One run at a time on main, where the issue is kept; a pull request's newer
+# push cancels its older run.
 concurrency:
-  group: site-check
-  cancel-in-progress: false
+  group: site-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -44,12 +54,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
       # As in ci.yml: uv in place of pip, installing into the Python above.
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Install
         run: uv pip install --system -r requirements.txt
@@ -72,6 +82,7 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
       - name: Open, update or close the issue
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           CODE: ${{ steps.check.outputs.code }}

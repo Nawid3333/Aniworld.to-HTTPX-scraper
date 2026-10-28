@@ -1,14 +1,23 @@
-# Dependabot configuration for pip dependencies.
-# Enables weekly dependency update PRs for the root requirements.txt.
+# Dependabot configuration for pip dependencies and workflow actions.
+# Weekly update PRs for requirements.txt and pyproject.toml -- the runtime
+# dependencies, the dev tools in the [dev] extra (ruff, pyright, pytest, ...)
+# and setuptools in [build-system] -- and for the actions the workflows pin.
 #
 # Note: You must also enable Dependabot in the repository settings
 # (Settings > Code security > Dependabot alerts/version updates).
 version: 2
 updates:
+  # 'increase' raises each '>=' floor to the new release, one PR per package.
+  # Left unset, Dependabot picked a strategy per repository from PyPI: the
+  # ones whose package name is not taken there got 'widen_ranges', under
+  # which '>=x' already allows every newer release, so their pip jobs ran
+  # weekly and never opened a PR. watchmaker only got its PRs because an
+  # unrelated package on PyPI happens to share its name.
   - package-ecosystem: 'pip'
     directory: '/'
     schedule:
       interval: 'weekly'
+    versioning-strategy: 'increase'
     open-pull-requests-limit: 10
     labels:
       - 'dependencies'

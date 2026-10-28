@@ -27,6 +27,11 @@ on:
       windows-runner:
         type: string
         default: windows-latest
+      # The Pythons to test, as a JSON list: python-next.yml passes one
+      # pre-release. Empty means the matrix below.
+      python-versions:
+        type: string
+        default: ''
 
 # A newer push to the same branch or PR makes the older run pointless, so it
 # is cancelled instead of finishing on a Windows runner. On main that is
@@ -52,7 +57,7 @@ jobs:
         # version is what catches a newer-only API slipping in. 3.x is the newest
         # stable release, which is what a fresh install, and the maintainer's own
         # machine, actually runs.
-        python-version: ['3.11', '3.x']
+        python-version: ${{ fromJSON(inputs.python-versions || '["3.11", "3.x"]') }}
     # Matches release.yml: windows-latest is the only platform this suite has
     # been run on, so keeping CI on the same runner means a green CI run
     # actually predicts a green release build.
@@ -69,9 +74,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+          # For python-next.yml's pre-release; 3.11 and 3.x always match a
+          # stable release, so it changes nothing for them.
+          allow-prereleases: true
 
       # uv in place of pip: the same packages from the same unpinned
       # requirements, resolved and installed several times faster. --system
@@ -80,7 +88,7 @@ jobs:
       # requirements.txt and pyproject.toml, replaces setup-python's pip cache;
       # a cached run still resolves against the live index, so the weekly check
       # still gets the newest releases.
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Install
         run: uv pip install --system -r requirements.txt ".[dev]"
@@ -99,3 +107,41 @@ jobs:
         # captured fixtures, which are not in git; the tests needing either
         # skip themselves.
         run: python -m pytest
+
+  # The release build, on every push and pull request: release.yml builds the
+  # sdist and wheel only once a release is published, so a change that breaks
+  # packaging -- a setuptools bump, a file MANIFEST.in leaves out -- surfaced
+  # only after it was on main and tagged. Builds in isolation from
+  # [build-system] alone, exactly as release.yml does.
+  build:
+    name: build (sdist + wheel)
+    # Not on python-next.yml's run: this builds on 3.11, which says nothing
+    # about a pre-release.
+    if: ${{ !inputs.python-versions }}
+    runs-on: ${{ inputs.windows-runner || 'windows-latest' }}
+    timeout-minutes: 10
+
+    steps:
+      # As in the test job: nothing here pushes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # The floor in requires-python, as in release.yml.
+          python-version: '3.11'
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install
+        run: uv pip install --system build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check package metadata
+        # bash for the glob, as in release.yml: PowerShell does not expand it
+        # for an external command.
+        shell: bash
+        run: twine check dist/*
