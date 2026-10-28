@@ -35,7 +35,7 @@ from config.config import (
     ensure_env_file,
 )
 from src import genre_stats, term
-from src.atomic_io import atomic_write_json
+from src.atomic_io import atomic_write_json, atomic_write_text
 from src.index_manager import (
     IndexManager,
     _extract_slug_from_field,
@@ -1763,21 +1763,24 @@ def add_single_series(url):
 def batch_add_from_file(file_path):
     """Add multiple anime from a text file containing URLs"""
     try:
-        urls = []
+        entries = []
         skipped = []
-        with open(file_path, encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                url = line.strip()
-                if not url or url.startswith("#"):
-                    continue
-                parsed = urlparse(url)
-                if parsed.scheme and parsed.scheme not in ("http", "https"):
-                    skipped.append((line_num, url))
-                    continue
-                if not _is_valid_series_url(url):
-                    skipped.append((line_num, url))
-                    continue
-                urls.append(url)
+        # newline="": the lines keep their own endings, so deleting a
+        # duplicate rewrites nothing else (_offer_to_delete_duplicates).
+        with open(file_path, encoding="utf-8", newline="") as f:
+            lines = f.readlines()
+        for line_num, line in enumerate(lines, 1):
+            url = line.strip()
+            if not url or url.startswith("#"):
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme and parsed.scheme not in ("http", "https"):
+                skipped.append((line_num, url))
+                continue
+            if not _is_valid_series_url(url):
+                skipped.append((line_num, url))
+                continue
+            entries.append((line_num, url))
         if skipped:
             print(f"⚠ Skipped {len(skipped)} invalid URL(s):")
             for line_num, bad_url in skipped[:5]:
@@ -1788,6 +1791,14 @@ def batch_add_from_file(file_path):
         print(f"✗ Failed to read file: {str(e)}")
         logger.error("Failed to read file %s: %s", file_path, e)
         return
+
+    groups = _duplicate_batch_lines(entries)
+    if groups:
+        _offer_to_delete_duplicates(file_path, lines, groups)
+    # Skipped whatever the answer, as the scrape always did: the answer only
+    # decides whether the lines stay in the file.
+    duplicates = {line_num for _kept, dupes in groups for line_num, _url in dupes}
+    urls = [url for line_num, url in entries if line_num not in duplicates]
 
     if not urls:
         print("✗ No valid URLs found in file")
@@ -1820,6 +1831,60 @@ def batch_add_from_file(file_path):
         success_msg=f"Batch add completed! {len(urls)} anime processed.",
         no_data_msg="No data scraped",
     )
+
+
+def _duplicate_batch_lines(entries):
+    """Every anime the batch file lists more than once: [(kept, duplicates)].
+
+    *entries* are the file's valid (line number, URL) pairs in file order.
+    Two lines are one anime exactly when the scrape collapses them
+    (batch_series_key). The first line of an anime is kept; every later line
+    naming it is a duplicate.
+    """
+    keyer = AniWorldScraper()
+    first: dict[str, tuple[int, str]] = {}
+    later: dict[str, list[tuple[int, str]]] = {}
+    for line_num, url in entries:
+        key = keyer.batch_series_key(url)
+        if key in first:
+            later.setdefault(key, []).append((line_num, url))
+        else:
+            first[key] = (line_num, url)
+    return [(kept, later[key]) for key, kept in first.items() if key in later]
+
+
+def _offer_to_delete_duplicates(file_path, lines, groups):
+    """List the duplicate lines and delete them from the batch file on a y.
+
+    Only those lines go: comments, blank lines, skipped lines and the order
+    stay as they are. n, end of input, a failed write, or a file edited while
+    the prompt was open leave it exactly as it was.
+    """
+    doomed = {line_num for _kept, dupes in groups for line_num, _url in dupes}
+    print(f"⚠ {len(doomed)} duplicate line(s) - the same anime as an earlier line:")
+    for (kept_num, kept_url), dupes in groups:
+        print(f"  Line {kept_num}: {kept_url}  (kept)")
+        for line_num, url in dupes:
+            print(f"    Line {line_num}: {url}  (duplicate)")
+    if not term.confirm(f"\nDelete the {len(doomed)} duplicate line(s) from {file_path}? (y/n): "):
+        print(f"→ {file_path} left unchanged; the duplicates are skipped for this run.")
+        return
+    try:
+        with open(file_path, encoding="utf-8", newline="") as f:
+            changed = f.read() != "".join(lines)
+        if changed:
+            print(f"✗ {file_path} changed while the prompt was open - nothing deleted.")
+            return
+        # No .bak generations: only repeats of an earlier line go, and the
+        # file can sit anywhere the user keeps it -- the backups would too.
+        kept = "".join(line for line_num, line in enumerate(lines, 1) if line_num not in doomed)
+        atomic_write_text(file_path, kept, backup=False)
+    except (OSError, ValueError) as exc:
+        print(f"✗ Could not update {file_path}: {exc} - nothing deleted.")
+        logger.error("Failed to delete duplicate lines from %s: %s", file_path, exc)
+        return
+    print(f"✓ Deleted {len(doomed)} duplicate line(s) from {file_path}")
+    logger.info("Deleted %d duplicate line(s) from %s", len(doomed), file_path)
 
 
 def _report_batch_export(added, skipped, urls_file, noun):
@@ -1858,9 +1923,15 @@ def _append_urls_to_batch_file(urls_file, urls):
     """
     existing_lines = []
     known = set()
+    # The file's own line ending, so an append changes nothing but the end:
+    # the "w" mode this used to write with made every line CRLF on Windows.
+    newline = "\n"
     if os.path.exists(urls_file):
-        with open(urls_file, encoding="utf-8") as fh:
-            existing_lines = fh.read().splitlines()
+        with open(urls_file, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        existing_lines = text.splitlines()
+        if "\r\n" in text:
+            newline = "\r\n"
         for line in existing_lines:
             stripped = line.strip().lstrip("#").strip()
             if stripped:
@@ -1872,8 +1943,9 @@ def _append_urls_to_batch_file(urls_file, urls):
         while body and not body[-1].strip():
             body.pop()
         body.extend(fresh)
-        with open(urls_file, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(body) + "\n")
+        # Atomic, like the duplicate deletion: an export cut short used to
+        # leave the hand-kept list half written.
+        atomic_write_text(urls_file, newline.join(body) + newline, backup=False)
     return fresh, len(urls) - len(fresh)
 
 

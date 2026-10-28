@@ -1,4 +1,4 @@
-"""Durable atomic JSON writes, shared by every persisted file in this project."""
+"""Durable atomic writes -- JSON, and the batch file's text -- shared by every persisted file in this project."""
 
 import contextlib
 import json
@@ -187,7 +187,7 @@ def atomic_write_json(filepath, data, *, indent: int | None = 2, backup: bool = 
     flush the file's *contents* to disk -- on an unclean shutdown the
     rename can land while the data is still sitting in the page cache,
     leaving a file that atomically points at nothing useful. The
-    flush()+fsync() below close that gap. Shared by every JSON writer in
+    flush()+fsync() in _atomic_write close that gap. Shared by every JSON writer in
     this project (index, checkpoint, failed list, ignore list, ignored
     seasons) so the durability behaviour can't drift between call sites.
 
@@ -204,6 +204,21 @@ def atomic_write_json(filepath, data, *, indent: int | None = 2, backup: bool = 
     retried while Windows reports a lock, and only a swap that succeeded
     rotates .bak1-3 and turns that second name into .bak1.
     """
+    _atomic_write(filepath, lambda f: json.dump(data, f, indent=indent, ensure_ascii=False), backup=backup)
+
+
+def atomic_write_text(filepath, text: str, *, backup: bool = True):
+    """Write *text* exactly as given, as durably as atomic_write_json.
+
+    For the batch URL file, which is edited by hand. newline="" turns off
+    line-ending translation, so a file kept in CRLF is written back in CRLF
+    and an LF one stays LF: only the lines the caller removed differ.
+    """
+    _atomic_write(filepath, lambda f: f.write(text), backup=backup, newline="")
+
+
+def _atomic_write(filepath, write, *, backup: bool, newline: str | None = None):
+    """The write behind atomic_write_json and atomic_write_text; see atomic_write_json."""
     dirpath = os.path.dirname(filepath) or "."
     os.makedirs(dirpath, exist_ok=True)
     filename = os.path.basename(filepath)
@@ -214,8 +229,8 @@ def atomic_write_json(filepath, data, *, indent: int | None = 2, backup: bool = 
     fd, tmp_path = tempfile.mkstemp(dir=dirpath, prefix=f".{filename}.", suffix=".tmp")
     pending = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=indent, ensure_ascii=False)
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+            write(f)
             f.flush()
             os.fsync(f.fileno())
         if backup and os.path.exists(filepath):
