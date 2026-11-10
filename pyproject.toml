@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.2.0", "ruff>=0.17.3", "pyright>=1.1.414"]
+dev = ["pytest>=9.2.0", "ruff>=0.17.4", "pyright>=1.1.414"]
 
 [project.scripts]
 aniworld-scraper = "main:_run_cli"
