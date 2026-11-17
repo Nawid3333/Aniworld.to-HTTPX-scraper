@@ -95,6 +95,12 @@ jobs:
       contents: read
     with:
       python-versions: ${{ format('["{0}"]', needs.detect.outputs.version) }}
+      # lxml has no wheel for a Python this new, so ci.yml builds it (see
+      # STATICBUILD there) against lxml's prebuilt libxml2. Those libraries are
+      # built on windows-2022 with link-time code generation, which only the
+      # same compiler can link: windows-latest's newer one fails with C1047.
+      # lxml builds its own Windows wheels on windows-2022 for the same reason.
+      windows-runner: windows-2022
 
   # Only after a green run, so a pre-release is never recorded as tested while it fails.
   record:
