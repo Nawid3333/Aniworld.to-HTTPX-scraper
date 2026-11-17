@@ -96,6 +96,17 @@ jobs:
 
       - name: Install
         run: uv pip install --system -r requirements.txt ".[dev]"
+        env:
+          # Only on python-next.yml's pre-release: lxml publishes Windows
+          # wheels for a new Python months after its first alpha, and its
+          # source build finds no libxml2 on the runner. STATICBUILD makes that
+          # build fetch lxml's own prebuilt libxml2 (github.com/lxml/libxml2-
+          # win-binaries) and link it in, as lxml's own wheel builds do, so the
+          # pre-release run tests this code instead of failing at Install.
+          # python-next.yml runs it on windows-2022 so that the link works.
+          # Empty everywhere else, which lxml reads as off; 3.11 and 3.x
+          # install lxml's wheel and never build it.
+          STATICBUILD: ${{ inputs.python-versions && 'true' || '' }}
 
       - name: Lint
         run: python -m ruff check .
